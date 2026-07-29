@@ -308,8 +308,9 @@ std::expected<void, Error> SqliConnection::executeCommand(const std::string& sql
                 auto bigSerial = sock_.readExactN(8);
                 if (!bigSerial) return std::unexpected(bigSerial.error());
                 ByteReader r(*bigSerial);
-                lastBigSerialInserted_ = static_cast<std::int64_t>(
-                    (static_cast<std::uint64_t>(r.u32()) << 32) | r.u32());
+                std::uint32_t hi = r.u32();
+                std::uint32_t lo = r.u32();
+                lastBigSerialInserted_ = static_cast<std::int64_t>((static_cast<std::uint64_t>(hi) << 32) | lo);
                 break;
             }
             default:
