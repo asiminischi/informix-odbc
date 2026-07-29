@@ -1,5 +1,6 @@
 add_executable(sqli_tests
   test_version.cpp
+  test_handshake_encode.cpp
 )
 target_link_libraries(sqli_tests PRIVATE ifx_sqli doctest::doctest)
 
