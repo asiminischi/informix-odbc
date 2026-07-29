@@ -68,8 +68,8 @@ std::vector<std::byte> encodeConnectBlob(const ConnectParams& params) {
     w.u16(kTagApplType);
     w.fixed(kApplType, 12);
 
-    w.lenPrefixedString("0.1.0");        // client version (informational)
-    w.lenPrefixedString("IFXODBC#0000"); // client serial (informational)
+    w.lenPrefixedString("0.1.0");
+    w.lenPrefixedString("IFXODBC#0000");
     w.lenPrefixedString(kApplId);
 
     w.u32(kProtocolVersion);

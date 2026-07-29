@@ -1,6 +1,9 @@
 #include "sqli/connection.h"
 
 #include "sqli/byte_io.h"
+#include "sqli/protocol.h"
+
+#include <optional>
 
 namespace ifxsqli {
 
@@ -9,6 +12,146 @@ constexpr std::uint16_t kSqExit = 56;
 constexpr std::uint16_t kSqEot = 12;
 constexpr std::uint16_t kSqXactStat = 99;
 constexpr std::uint16_t kOpSelectDatabase = 36;
+
+// The exact 8-byte client capability offer the real driver sends in
+// SQ_PROTOCOLS (confirmed byte-for-byte against tests/fixtures/
+// handshake_capture_ids14.10.txt); the server ANDs it against its own
+// supported set and echoes back the intersection. Byte[6] bit 0x20 (bit 50
+// overall) is the one this driver currently cares about: whether DESCRIBE
+// responses use 4-byte (vs 2-byte) offset/length fields. See
+// docs/protocol-notes.md.
+constexpr std::uint8_t kClientProtocols[8] = {0xFF, 0xFC, 0x7F, 0xFC, 0x3C, 0x8C, 0xAA, 0x97};
+
+std::expected<std::uint16_t, Error> readU16(TcpSocket& sock) {
+    auto b = sock.readExactN(2);
+    if (!b) return std::unexpected(b.error());
+    ByteReader r(*b);
+    return r.u16();
+}
+
+std::expected<std::uint32_t, Error> readU32(TcpSocket& sock) {
+    auto b = sock.readExactN(4);
+    if (!b) return std::unexpected(b.error());
+    ByteReader r(*b);
+    return r.u32();
+}
+
+// Statement-protocol "char" field: u16 length (no NUL) + bytes + a pad byte
+// consumed iff the length is odd (see ByteWriter::ifxChar2).
+std::expected<std::string, Error> readIfxChar2(TcpSocket& sock) {
+    auto lenR = readU16(sock);
+    if (!lenR) return std::unexpected(lenR.error());
+    std::uint16_t n = *lenR;
+    std::string s;
+    if (n > 0) {
+        auto data = sock.readExactN(n);
+        if (!data) return std::unexpected(data.error());
+        s.assign(reinterpret_cast<const char*>(data->data()), n);
+    }
+    if (n & 1) {
+        auto pad = sock.readExactN(1);
+        if (!pad) return std::unexpected(pad.error());
+    }
+    return s;
+}
+
+// Reads a SQ_ERROR(13) payload (sqlcode/isamcode/offset/message) for
+// surfacing in an Error. Assumes the tag itself has already been consumed.
+std::expected<Error, Error> readErrorRecord(TcpSocket& sock) {
+    auto sqlcodeRaw = readU16(sock);
+    if (!sqlcodeRaw) return std::unexpected(sqlcodeRaw.error());
+    auto sqlcode = static_cast<std::int16_t>(*sqlcodeRaw);
+    if (!readU16(sock)) return std::unexpected(Error{ErrorKind::Transport, "read failed (isamcode)"});
+    if (!readU32(sock)) return std::unexpected(Error{ErrorKind::Transport, "read failed (offset)"});
+    std::string message;
+    if (sqlcode != -368) {
+        auto msg = readIfxChar2(sock);
+        if (!msg) return std::unexpected(msg.error());
+        message = *msg;
+    }
+    return Error{ErrorKind::Server, "sqlcode " + std::to_string(sqlcode) + ": " + message};
+}
+
+// Sends SQ_PROTOCOLS(126) right after the handshake, per decompiled
+// IfxSqliConnect.enhancedProtocolMechanism()/IfxSqli.{send,receive}Protocols,
+// cross-checked against the golden capture. Unlike most send* helpers here,
+// this one is NOT self-terminated by the SQ_PROTOCOLS payload alone: the real
+// driver follows it with a bare SQ_EOT as a separate write, and the server's
+// reply is the protocols response immediately followed by its own SQ_EOT in
+// the same message. Omitting that trailing EOT leaves the server waiting for
+// more input forever - it never replies at all.
+std::expected<bool, Error> negotiateProtocols(TcpSocket& sock) {
+    ByteWriter w;
+    w.u16(opcode::kProtocols);
+    w.u16(static_cast<std::uint16_t>(sizeof(kClientProtocols)));
+    for (auto b : kClientProtocols) w.u8(b);
+    w.u16(kSqEot);
+    if (auto r = sock.writeAll(w.view()); !r) return std::unexpected(r.error());
+
+    auto tag = readU16(sock);
+    if (!tag) return std::unexpected(tag.error());
+    if (*tag != opcode::kProtocols) {
+        return std::unexpected(Error{ErrorKind::Protocol, "unexpected reply tag to SQ_PROTOCOLS"});
+    }
+
+    auto len = readU16(sock);
+    if (!len) return std::unexpected(len.error());
+    auto data = sock.readExactN(*len);
+    if (!data) return std::unexpected(data.error());
+    if (*len & 1) {
+        auto pad = sock.readExactN(1);
+        if (!pad) return std::unexpected(pad.error());
+    }
+
+    auto eot = readU16(sock);
+    if (!eot) return std::unexpected(eot.error());
+    if (*eot != kSqEot) {
+        return std::unexpected(Error{ErrorKind::Protocol, "missing SQ_EOT after SQ_PROTOCOLS reply"});
+    }
+
+    // Bit 50 overall (byte[6] bit 0x20): whether the server uses 4-byte (vs
+    // 2-byte) offset/length fields in DESCRIBE/TUPLE/etc - see
+    // docs/protocol-notes.md for the full field-by-field breakdown.
+    bool has4ByteOffsets = data->size() > 6 &&
+                           (std::to_integer<unsigned char>((*data)[6]) & 0x20) != 0;
+    return has4ByteOffsets;
+}
+
+// Sends SQ_INFO(81)/INFO_ENV(6) right after protocol negotiation, per
+// decompiled IfxSqli.sendEnv() and confirmed against the golden capture. The
+// server rejects an empty env set outright (sqlcode -208), so this sends the
+// same DBTEMP/SUBQCACHESZ pair the real driver sends when no connInfo
+// properties override them. The server replies with a bare SQ_EOT.
+std::expected<void, Error> sendEnv(TcpSocket& sock) {
+    constexpr std::uint16_t kOpInfo = 81;
+    constexpr std::uint16_t kInfoEnv = 6;
+    ByteWriter w;
+    w.u16(kOpInfo);
+    w.u16(kInfoEnv);
+    w.u16(38); // total length (see docs/protocol-notes.md for the formula)
+    w.u16(12); // longest name length ("SUBQCACHESZ", padded to even)
+    w.u16(4);  // longest value length ("/tmp")
+    w.ifxChar2("DBTEMP");
+    w.ifxChar2("/tmp");
+    w.ifxChar2("SUBQCACHESZ");
+    w.ifxChar2("10");
+    w.u16(0); // INFO_DONE terminator: name length 0
+    w.u16(0); // INFO_DONE terminator: value length 0
+    w.u16(kSqEot);
+    if (auto r = sock.writeAll(w.view()); !r) return r;
+
+    auto tag = readU16(sock);
+    if (!tag) return std::unexpected(tag.error());
+    if (*tag == opcode::kError) {
+        auto err = readErrorRecord(sock);
+        if (!err) return std::unexpected(err.error());
+        return std::unexpected(*err);
+    }
+    if (*tag != kSqEot) {
+        return std::unexpected(Error{ErrorKind::Protocol, "missing SQ_EOT after SQ_INFO/INFO_ENV reply"});
+    }
+    return {};
+}
 
 // Sends the "select database" message observed immediately after a
 // successful handshake in the live capture (docs/protocol-notes.md). The
@@ -31,11 +174,118 @@ std::expected<void, Error> selectDatabase(TcpSocket& sock, const std::string& da
         auto b = sock.readExactN(2);
         if (!b) return std::unexpected(b.error());
         ByteReader r(*b);
-        if (r.u16() == kSqEot) return {};
+        auto v = r.u16();
+        if (v == kSqEot) return {};
     }
     return std::unexpected(Error{ErrorKind::Protocol, "select-database reply never terminated"});
 }
+
 } // namespace
+
+std::expected<void, Error> SqliConnection::executeCommand(const std::string& sql) {
+    ByteWriter w;
+    w.u16(opcode::kCommand);
+    // "# of values": decompiled IfxSqli.sendCommand shows writeSmallInt(0)
+    // (u16), but the golden capture proves this field is u32 on connections
+    // that negotiated wide offsets - the same narrow/wide toggle as every
+    // other reserved/length field in this protocol (see
+    // docs/protocol-notes.md). Trust the capture over the decompiled source.
+    if (has4ByteOffsets_) {
+        w.u32(0);
+    } else {
+        w.u16(0);
+    }
+    w.ifxChar2(sql);
+    w.u16(opcode::kNonCursorDescribe);
+    w.u16(opcode::kExecute);
+    w.u16(opcode::kRelease);
+    w.u16(opcode::kEot);
+    if (auto r = sock_.writeAll(w.view()); !r) return r;
+
+    std::optional<Error> pendingError;
+    for (;;) {
+        auto tag = readU16(sock_);
+        if (!tag) return std::unexpected(tag.error());
+        if (*tag == opcode::kEot) break;
+
+        switch (*tag) {
+            case opcode::kDescribe: {
+                if (!readU16(sock_)) return std::unexpected(Error{ErrorKind::Transport, "read failed (statementType)"});
+                if (!readU16(sock_)) return std::unexpected(Error{ErrorKind::Transport, "read failed (statementId)"});
+                if (!readU32(sock_)) return std::unexpected(Error{ErrorKind::Transport, "read failed (estCost)"});
+                if (!readU16(sock_)) return std::unexpected(Error{ErrorKind::Transport, "read failed (tupleSize)"});
+                auto nfields = readU16(sock_);
+                if (!nfields) return std::unexpected(nfields.error());
+
+                std::uint32_t stringTableSize;
+                if (has4ByteOffsets_) {
+                    auto v = readU32(sock_);
+                    if (!v) return std::unexpected(v.error());
+                    stringTableSize = *v;
+                } else {
+                    auto v = readU16(sock_);
+                    if (!v) return std::unexpected(v.error());
+                    stringTableSize = *v;
+                }
+
+                for (std::uint16_t i = 0; i < *nfields; ++i) {
+                    if (has4ByteOffsets_) {
+                        if (!readU32(sock_)) return std::unexpected(Error{ErrorKind::Transport, "read failed (field index)"});
+                    } else {
+                        if (!readU16(sock_)) return std::unexpected(Error{ErrorKind::Transport, "read failed (field index)"});
+                    }
+                    if (has4ByteOffsets_) {
+                        if (!readU32(sock_)) return std::unexpected(Error{ErrorKind::Transport, "read failed (column start)"});
+                    } else {
+                        if (!readU16(sock_)) return std::unexpected(Error{ErrorKind::Transport, "read failed (column start)"});
+                    }
+                    if (!readU16(sock_)) return std::unexpected(Error{ErrorKind::Transport, "read failed (colType)"});
+                    if (has4ByteOffsets_) {
+                        if (!readU32(sock_)) return std::unexpected(Error{ErrorKind::Transport, "read failed (extId)"});
+                        if (auto owner = readIfxChar2(sock_); !owner) return std::unexpected(owner.error());
+                        if (auto extName = readIfxChar2(sock_); !extName) return std::unexpected(extName.error());
+                        if (!readU16(sock_) || !readU16(sock_)) {
+                            return std::unexpected(Error{ErrorKind::Transport, "read failed (reference/alignment)"});
+                        }
+                        if (!readU32(sock_) || !readU32(sock_)) {
+                            return std::unexpected(Error{ErrorKind::Transport, "read failed (sourceType/encLen)"});
+                        }
+                    } else {
+                        if (!readU16(sock_)) return std::unexpected(Error{ErrorKind::Transport, "read failed (encLen)"});
+                    }
+                }
+                if (stringTableSize > 0) {
+                    auto strtab = sock_.readExactN(stringTableSize);
+                    if (!strtab) return std::unexpected(strtab.error());
+                }
+                break;
+            }
+            case opcode::kDone: {
+                if (!readU16(sock_)) return std::unexpected(Error{ErrorKind::Transport, "read failed (warnings)"});
+                if (!readU32(sock_) || !readU32(sock_) || !readU32(sock_)) {
+                    return std::unexpected(Error{ErrorKind::Transport, "read failed (done fields)"});
+                }
+                break;
+            }
+            case opcode::kCost: {
+                auto b = sock_.readExactN(8);
+                if (!b) return std::unexpected(b.error());
+                break;
+            }
+            case opcode::kError: {
+                auto err = readErrorRecord(sock_);
+                if (!err) return std::unexpected(err.error());
+                pendingError = *err;
+                break;
+            }
+            default:
+                return std::unexpected(Error{ErrorKind::Protocol, "unrecognized tag in executeCommand response"});
+        }
+    }
+
+    if (pendingError) return std::unexpected(*pendingError);
+    return {};
+}
 
 std::expected<SqliConnection, Error> SqliConnection::connect(const std::string& host, int port,
                                                                const ConnectParams& params) {
@@ -45,11 +295,16 @@ std::expected<SqliConnection, Error> SqliConnection::connect(const std::string& 
     auto info = performHandshake(*sock, params);
     if (!info) return std::unexpected(info.error());
 
+    auto has4ByteOffsets = negotiateProtocols(*sock);
+    if (!has4ByteOffsets) return std::unexpected(has4ByteOffsets.error());
+
+    if (auto r = sendEnv(*sock); !r) return std::unexpected(r.error());
+
     if (!params.database.empty()) {
         if (auto r = selectDatabase(*sock, params.database); !r) return std::unexpected(r.error());
     }
 
-    return SqliConnection(std::move(*sock), std::move(*info));
+    return SqliConnection(std::move(*sock), std::move(*info), *has4ByteOffsets);
 }
 
 std::expected<void, Error> SqliConnection::disconnectOrderly() {

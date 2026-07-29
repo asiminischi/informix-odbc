@@ -62,6 +62,25 @@ public:
     // field (e.g. password, database name) is absent.
     void emptyLenPrefixed() { u16(0); }
 
+    // The statement protocol's "char" field shape (distinct from the
+    // handshake blob's lenPrefixedString above): a length prefix that does
+    // NOT include a NUL, the raw bytes, then a single zero pad byte if and
+    // only if the string length is odd (2-byte wire alignment - confirmed
+    // against a live capture, see docs/protocol-notes.md). ifxChar2 uses a
+    // u16 length (e.g. SQ_COMMAND text, database/cursor names); ifxChar4
+    // uses a u32 length (e.g. SQ_PREPARE's SQL text).
+    void ifxChar2(std::string_view s) {
+        u16(static_cast<std::uint16_t>(s.size()));
+        raw(s);
+        if (s.size() & 1) u8(0);
+    }
+
+    void ifxChar4(std::string_view s) {
+        u32(static_cast<std::uint32_t>(s.size()));
+        raw(s);
+        if (s.size() & 1) u8(0);
+    }
+
     [[nodiscard]] std::span<const std::byte> view() const { return buf_; }
     [[nodiscard]] std::size_t size() const { return buf_.size(); }
 
@@ -129,6 +148,18 @@ public:
     [[nodiscard]] std::string lenPrefixedString() {
         std::uint16_t n = u16();
         return cstring(n);
+    }
+
+    // Statement-protocol "char" field: u16 length (no NUL), that many raw
+    // bytes, then a pad byte skipped if the length was odd. Mirrors
+    // ByteWriter::ifxChar2 - see its comment for the confirmed padding rule.
+    [[nodiscard]] std::string ifxChar2() {
+        std::uint16_t n = u16();
+        auto b = bytes(n);
+        std::string s(n, '\0');
+        if (n > 0) std::memcpy(s.data(), b.data(), n);
+        if (n & 1) skip(1);
+        return s;
     }
 
     [[nodiscard]] std::size_t remaining() const { return data_.size() - pos_; }

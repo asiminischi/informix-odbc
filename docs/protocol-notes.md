@@ -85,6 +85,79 @@ tag: `127` = success (confirmed), `102`/`103` reserved for error/redirect detail
 (not yet exercised — implement per the same length-prefixed-then-skip pattern
 and revisit if/when a real error response is captured).
 
+**Important, non-obvious**: the server version string this Docker image returns
+is literally `"Informix Dynamic Server Version 9.59.FC7W1"` — **this is not a
+parse bug**. Confirmed byte-for-byte against the golden capture (the real JDBC
+driver receives the exact same string from the exact same server). `onstat -V`
+inside the container reports the real product version, `14.10.FC7W1DE` — the
+two are simply different fields with different purposes (a wire/compatibility
+version stamp vs. the actual product build). Don't "fix" this if it recurs;
+verify against a capture first, as was done here, before assuming a parsing
+offset error.
+
+**SQ_PROTOCOLS negotiation** (confirmed): immediately after the handshake, send
+opcode `126` (`SQ_PROTOCOLS`) — `u16(126)`, `u16(8)` (payload length), then this
+exact 8-byte client capability offer (matches the real driver byte-for-byte):
+`FF FC 7F FC 3C 8C AA 97`. **Critically, this is followed by a separate bare
+`u16(12)` (`SQ_EOT`) write** — omitting it leaves the server waiting forever for
+more input with zero reply (confirmed live: this is what an earlier, EOT-less
+version of this exchange did). The server replies with `u16(126)` echoed back,
+`u16 len` (observed `9`, odd), `len` bytes of capability response (padded with
+one `0x00` byte since `len` is odd — the same even-alignment padding used
+throughout this protocol, see below), then its own `u16(12)` EOT in the same
+message. Bit 50 overall (byte index 6, bit `0x20`) is the one this driver reads:
+whether the server uses **4-byte** (vs 2-byte) offset/length fields in
+DESCRIBE/TUPLE/etc — see "Narrow vs. wide framing" below. This bit was `1`
+(wide) against the Docker 14.10 engine.
+
+**SQ_INFO / INFO_ENV** (confirmed): immediately after SQ_PROTOCOLS, send opcode
+`81` (`SQ_INFO`), subtype `u16(6)` (`INFO_ENV`), `u16 totalLen`, `u16 longestNameLen`,
+`u16 longestValueLen`, then `ifxChar2(name)`/`ifxChar2(value)` pairs (see the
+statement-protocol "char" field shape below), terminated by `u16(0)`/`u16(0)`,
+then a trailing `u16(12)` EOT (same omit-and-hang trap as SQ_PROTOCOLS). **The
+server rejects an empty env set outright** — `SQ_ERROR` sqlcode `-208` — so at
+least one entry is required. This driver sends the same `DBTEMP=/tmp`,
+`SUBQCACHESZ=10` pair the real driver sends when no connInfo properties
+override them (arbitrary stand-in values; not verified to matter beyond
+satisfying the non-empty requirement). `totalLen` follows the formula
+`4 + Σ(paddedNameLen + paddedValueLen + 4) + 2` — for these two entries, `38`.
+Server replies with a bare `u16(12)` EOT on success.
+
+**Narrow vs. wide framing**: multiple otherwise-fixed-shape fields toggle
+between a 2-byte and 4-byte wire form depending on the negotiated SQ_PROTOCOLS
+capability (`SqliConnection::has4ByteOffsets()` in this codebase — see that
+accessor's doc comment for the important caveat that it's really a *proxy* for
+several capability bits that happen to co-occur, not a single verified bit).
+Confirmed affected fields, all toggling together on this server:
+- DESCRIBE's `stringTableSize` and per-field `fieldIndex`.
+- DESCRIBE's per-field extended metadata block (`extId`/`owner`/`extName`/
+  `reference`/`alignment`/`sourceType`/`encLen`) — present at all only when wide;
+  narrow mode has just a 2-byte `encLen` and nothing else after `colType`.
+- TUPLE's `size` field.
+- SQ_NFETCH's tuple-buffer-size field, **plus a trailing `u16(0)` "fetch array
+  size" field that only exists in wide mode** (narrow mode omits it entirely).
+- SQ_COMMAND's and SQ_PREPARE's "# of values"/"numqmarks" reserved field. The
+  decompiled JDBC source shows `writeSmallInt(0)` (2 bytes) unconditionally
+  here with no visible conditional — **the golden capture proves this is
+  wrong** for a wide connection, where it's genuinely 4 bytes. Trust the
+  capture over the decompiled source when they conflict (this was a real,
+  confirmed discrepancy, not a misreading on our part) — CFR-decompiled
+  bytecode can misresolve overloaded integer-widening calls.
+
+Getting any of these wrong doesn't error cleanly — it silently desyncs the byte
+stream, and depending on which field is wrong, the effect can range from
+"reads garbage values" to "server or client blocks forever waiting for bytes
+that were already consumed/never coming" (`onstat -g ses` shows the stuck side
+in `cond wait netnorm`). When a message hangs after a previously-working step,
+suspect a field-width mismatch first and re-derive it from a fresh capture
+rather than guessing.
+
+`columnStart`'s width (u16 vs u32) in DESCRIBE is separately gated by isUSVER,
+which — per the decompiled source — is unconditionally true whenever the
+server echoes a nonzero protocol level (our case, always). It has always been
+true in practice, so it's folded into the same `has4ByteOffsets()` proxy above
+rather than tracked as an independent flag.
+
 **Auth for MVP**: plain username/password sent in this handshake, as above. No
 SSL, no PAM, in the first pass — see Phase 5.
 
@@ -126,72 +199,145 @@ fields in between.
 
 ## Statement protocol
 
-After the handshake, both sides exchange a stream of *tagged records*: a `u16`
-opcode tag followed by an opcode-specific payload. The client buffers one or more
-tagged records and flushes them together, terminated by an `EOT` (end-of-transmission)
-tag. The server replies with its own stream of tagged records, terminated by `EOT`
-(or session-exit).
+**Status: verified** — a full prepare→describe→execute→fetch(single- and
+multi-row)→close→release cycle round-trips correctly against the live Docker
+server (`sqli/statement.cpp`, `sqli/connection.cpp`), confirmed against
+`select tabid, tabname from systables where tabid = 1` (1 row) and `... where
+tabid <= 5` (5 rows, exercising multi-tuple fetch and cursor exhaustion).
 
-Known opcodes (values to be confirmed empirically, listed here as the working set
-the implementation targets):
+After the handshake (+ SQ_PROTOCOLS + SQ_INFO/ENV + database-select, see
+above), both sides exchange a stream of *tagged records*: a `u16` opcode tag
+followed by an opcode-specific payload. The client buffers one or more tagged
+records and flushes them together, terminated by an `EOT` (`u16(12)`) tag. The
+server replies with its own stream of tagged records, terminated by `EOT`.
 
-| Meaning | Direction |
-|---|---|
-| PREPARE (SQL text + placeholder count) | C→S |
-| DESCRIBE (result column metadata request) | C→S |
-| BIND (parameter values for a prepared statement) | C→S |
-| EXECUTE | C→S |
-| FETCH (buffered, driven by a client-supplied byte budget) | C→S |
-| CLOSE (cursor/statement) | C→S |
-| RELEASE (free prepared statement) | C→S |
-| BEGIN / COMMIT / ROLLBACK (transaction control — dedicated opcodes, not SQL text) | C→S |
-| EOT (flush marker) | C→S, S→C |
-| DESCRIBE reply (column count + per-column type/length/name) | S→C |
-| TUPLE (one batch of row bytes) | S→C |
-| DONE (end of result set / rows-affected count / warnings bitmask) | S→C |
-| ERROR (sqlcode, secondary/ISAM code, message text) | S→C |
+Confirmed opcodes (see `sqli/protocol.h`):
 
-Fetch is **batched**: a single FETCH request can return many TUPLE records up to a
-client-specified byte budget; the client keeps issuing FETCH until the server
-signals no more rows are available (observed as a CLOSE-equivalent condition rather
-than a per-row flag).
+| Meaning | Value | Direction |
+|---|---|---|
+| SQ_COMMAND (resultless SQL text, e.g. `SET ISOLATION`) | 1 | C→S |
+| SQ_PREPARE (SQL text + placeholder count) | 2 | C→S |
+| SQ_CURSOR_NAME | 3 | C→S |
+| SQ_ID (selects which prepared statement subsequent messages target) | 4 | C→S |
+| SQ_BIND | 5 | C→S (unused — no bind params in Phase 2 scope) |
+| SQ_OPEN (opens a cursor for a prepared SELECT) | 6 | C→S |
+| SQ_EXECUTE | 7 | C→S |
+| SQ_DESCRIBE | 8 | S→C |
+| SQ_FETCH (a.k.a. NFETCH; buffered, driven by a byte budget) | 9 | C→S |
+| SQ_CLOSE | 10 | C→S |
+| SQ_RELEASE | 11 | C→S |
+| SQ_EOT | 12 | C→S, S→C |
+| SQ_ERROR | 13 | S→C |
+| SQ_TUPLE (one row's bytes) | 14 | S→C |
+| SQ_DONE | 15 | S→C |
+| SQ_NON_CURSOR_DESCRIBE (requests a DESCRIBE even for non-SELECT) | 22 | C→S |
+| SQ_RETURN_TYPE (tells the server how to render each fetched column) | 100 | C→S |
+| SQ_WANT_DONE | 49 | C→S |
+| SQ_COST | 55 | S→C |
+| SQ_EXIT | 56 | C→S |
+| SQ_PROTOCOLS | 126 | C→S, S→C |
 
-Errors surface as a dedicated ERROR record carrying a primary SQL error code, a
-secondary code, and a message string; these get mapped to ODBC SQLSTATE values in
-`sqli/error.*`. Non-fatal warnings ride along in the DONE record's bitmask rather
-than a separate opcode.
+**Statement-protocol "char" field** (`ByteWriter::ifxChar2`/`ByteReader::ifxChar2`,
+distinct from the handshake's NUL-terminated length-prefixed strings): `u16`
+length **not including** any terminator, that many raw bytes, then a single
+`0x00` pad byte **if and only if** the length is odd (2-byte wire alignment).
+This same even-alignment rule applies to **TUPLE row data too** — confirmed
+live: a 1-row fetch with a 14-byte tuple needed no pad, but a 15-byte tuple in
+a multi-row fetch did; omitting the pad byte desyncs every subsequent read in
+the batch. Always check `size & 1` after reading any length-prefixed blob.
 
-Status: **unverified against live server** — implement in Phase 2, verify with a
-trivial `SELECT` round trip, then fill in confirmed opcode values/offsets.
+**SQ_COMMAND** (executed via `SqliConnection::executeCommand`, confirmed for
+`SET ISOLATION ...`): `u16(1)`, reserved field (u16 or u32 — see "Narrow vs.
+wide framing" above), `ifxChar2(sql)`, `u16(22)` (SQ_NON_CURSOR_DESCRIBE),
+`u16(7)` (SQ_EXECUTE), `u16(11)` (SQ_RELEASE), `u16(12)` (EOT). Server replies
+with a DESCRIBE (nfields=0 for a non-SELECT), then DONE, then EOT.
+
+**SQ_PREPARE** (`SqliStatement::prepare`): `u16(2)`, numqmarks (u16 or u32 —
+same toggle), `ifxChar2(sql)`, `u16(22)` (SQ_NON_CURSOR_DESCRIBE), `u16(49)`
+(SQ_WANT_DONE), `u16(12)` (EOT). Server replies with a DESCRIBE carrying real
+column metadata, then EOT (statementId comes back inside the DESCRIBE record).
+
+**SQ_DESCRIBE reply** (S→C, read generically in both `executeCommand` and
+`SqliStatement::processResponseBatch`): `statementType`(u16), `statementId`(u16),
+`estCost`(u32, unused), `tupleSize`(u16, unused), `nfields`(u16), then
+`stringTableSize` (u16/u32 toggle), then `nfields` × per-field records (layout
+depends on the same toggle — see above), then `stringTableSize` bytes of a
+NUL-separated column-name table (one name per field, in order). `colType`'s raw
+u16 value packs the base Informix type code in the low byte and a `NOT NULL`
+flag in bit `0x100` (`columns_[i].ifxType = colType & 0xFF`,
+`notNull = colType & 0x100`).
+
+**SQ_ID / SQ_CURSOR_NAME / SQ_OPEN** (`SqliStatement::execute`, opens a
+cursor): `u16(4)`, `statementId`(**always u16** — confirmed, not subject to the
+narrow/wide toggle), `u16(3)`, `ifxChar2(cursorName)`, `u16(6)`, `u16(12)`
+(EOT). Cursor names in this codebase are `"_odbc" + 13-digit zero-padded
+counter`; the real driver uses `"_ifxc" + 11-digit counter` — either scheme
+seems to be accepted, the server doesn't appear to validate the format. Server
+replies with a bare EOT on success (no DESCRIBE/DONE for a plain open).
+
+**SQ_RETURN_TYPE + SQ_FETCH** (`SqliStatement::fetchNextBatch`): `u16(4)`,
+`statementId`(u16), then — **only on the first fetch for a given cursor** —
+`u16(100)` (SQ_RETURN_TYPE), `u16(1)` (direction: fetch), `u16(nfields)`, then
+per-column `ifxType`(u16) + `encodedLength`(**always u32**, not gated by the
+toggle) pairs. Then unconditionally: `u16(9)` (SQ_FETCH), tuple-buffer-size
+(u16 or u32 toggle; `4096` observed), **a trailing `u16(0)` "fetch array size"
+field present only in wide mode**, `u16(12)` (EOT). Server replies with zero
+or more SQ_TUPLE records (one per fetched row, terminated within the batch by
+a DONE-then-EOT once the cursor is exhausted for this fetch call, or by an EOT
+alone if more rows remain for a subsequent fetch) — this driver treats "no
+TUPLE seen in a fetch batch" as cursor exhaustion (`fetchNextBatch` sets
+`exhausted_` when `processResponseBatch` reports no tuple).
+
+**SQ_TUPLE** (S→C): `warning`(u16), `size` (u16/u32 toggle), then `size` raw
+bytes of row data (all columns concatenated in column order, no per-column
+framing beyond what each scalar type's own encoding implies — see below),
+padded per the even-alignment rule above.
+
+**SQ_CLOSE / SQ_RELEASE** (`SqliStatement::close`/`release`): `u16(4)`,
+`statementId`(u16), `u16(10)`/`u16(11)`, `u16(12)` (EOT). Server replies with
+DESCRIBE/DONE/EOT (close) matching the generic batch reader.
+
+Errors surface as a dedicated `SQ_ERROR`(13) record: `sqlcode`(u16, signed),
+then (unless `sqlcode == -368`, a special case with no message) `isamcode`(u16),
+`offset`(u32), message (`ifxChar2`). A `sqlcode == -619` is a special "resync"
+marker (per the decompiled `receiveError`) with a slightly different trailing
+shape — this driver drains it and surfaces it as a distinct error rather than
+trying to auto-resync.
 
 ## Scalar type wire encodings (MVP set)
 
-Working hypotheses to implement and verify in Phase 3:
+Two of these got incidental live confirmation in Phase 2 (`sqli/statement.cpp`'s
+`splitRow`, exercised against real `systables` rows); the rest remain
+hypotheses for Phase 3 to verify properly (including NULL handling, which
+Phase 2's queries never exercised — `systables.tabid`/`tabname` are never
+NULL):
 
-| Type | Wire form (hypothesis) | NULL sentinel (hypothesis) |
-|---|---|---|
-| SMALLINT | 2 bytes, fixed | reserved bit pattern (`INT16_MIN`) |
-| INTEGER | 4 bytes, fixed | reserved bit pattern (`INT32_MIN`) |
-| BIGINT | 8 bytes, fixed | reserved bit pattern (`INT64_MIN`) |
-| CHAR(n) | fixed width, space-padded | leading `0x00` byte |
-| VARCHAR(n) | 1-byte length prefix + data | **unconfirmed — verify empirically** |
-| DECIMAL(p,s) | 1 exponent/sign byte (base-100 floating point, bias-64) + 1-8 mantissa bytes, each a base-100 digit; negative values 100's-complemented with sign bit cleared | leading two zero bytes |
-| DATE | 4 bytes, signed day count from a fixed epoch | reserved bit pattern (`INT32_MIN`) |
-| DATETIME | same packed base-100 machinery as DECIMAL, fields selected by a start/end qualifier byte pair | leading two zero bytes |
+| Type | Wire form | NULL sentinel | Status |
+|---|---|---|---|
+| SMALLINT | 2 bytes, fixed | reserved bit pattern (`INT16_MIN`) | hypothesis |
+| INTEGER / **SERIAL** | 4 bytes, fixed, big-endian | reserved bit pattern (`INT32_MIN`) | **confirmed for SERIAL** (`systables.tabid`, e.g. `00 00 00 01` = 1) |
+| BIGINT | 8 bytes, fixed | reserved bit pattern (`INT64_MIN`) | hypothesis |
+| CHAR(n) | fixed width, space-padded | leading `0x00` byte | hypothesis |
+| **VARCHAR(n)** | **1-byte length prefix + that many raw bytes (no NUL)** | **unconfirmed** | **confirmed shape** (`systables.tabname`, e.g. `09 73 79 73 74 61 62 6c 65 73` = length 9 + `"systables"`); NULL convention still unverified |
+| DECIMAL(p,s) | 1 exponent/sign byte (base-100 floating point, bias-64) + 1-8 mantissa bytes, each a base-100 digit; negative values 100's-complemented with sign bit cleared | leading two zero bytes | hypothesis |
+| DATE | 4 bytes, signed day count from a fixed epoch | reserved bit pattern (`INT32_MIN`) | hypothesis |
+| DATETIME | same packed base-100 machinery as DECIMAL, fields selected by a start/end qualifier byte pair | leading two zero bytes | hypothesis |
 
 Column metadata (from a DESCRIBE reply) packs the base type code and nullability/
 distinct/etc. flags into a single 16-bit word (low byte = base type, high bits =
-flags); precision/scale for DECIMAL/DATETIME travel in a separate length/qualifier
-field per column.
+flags — **confirmed**: bit `0x100` = NOT NULL); precision/scale for DECIMAL/
+DATETIME travel in a separate length/qualifier field per column (unverified).
 
-Status: **unverified** — each type gets a round-trip unit test plus a live-query
-test against a populated test table (including NULLs) before being considered done.
+Status: each remaining type gets a round-trip unit test plus a live-query test
+against a populated test table (including NULLs) before being considered done.
 This table gets updated in place with confirmed layouts as Phase 3 lands.
 
 ## Open questions / risks
 
-- VARCHAR NULL convention on the wire (length-prefix sentinel vs. something else).
-- Exact DESCRIBE reply field ordering/offsets in practice.
-- Whether the Docker test server's protocol version negotiates down to an older
-  format than a fully current on-prem server would use (matters for anyone using
-  this against production instances later).
+- VARCHAR NULL convention on the wire (length-prefix sentinel vs. something else) —
+  not yet exercised by any Phase 2 query.
+- Whether `has4ByteOffsets()`'s constituent capability bits (see "Narrow vs. wide
+  framing" above) ever diverge on a real server — only tested against one engine
+  (Docker `ibmcom/informix-developer-database`, IDS 14.10.FC7W1DE) where they all
+  happen to co-occur as true. Revisit if a server is found where DESCRIBE and
+  TUPLE/FETCH negotiate differently.

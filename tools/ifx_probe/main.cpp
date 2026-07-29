@@ -1,16 +1,52 @@
 #include "sqli/connection.h"
+#include "sqli/statement.h"
 #include "sqli/version.h"
 
 #include <cstdio>
 #include <cstdlib>
+#include <span>
 #include <string>
+
+namespace {
+
+// Cosmetic-only decode for the probe's own output, not part of the library:
+// full type decoding is Phase 3. Prints what it recognizes, hex otherwise.
+void printColumnValue(const ifxsqli::ColumnDesc& col, std::span<const std::byte> bytes) {
+    switch (col.ifxType) {
+        case 2:  // INTEGER
+        case 6: { // SERIAL
+            if (bytes.size() == 4) {
+                std::uint32_t v = 0;
+                for (auto b : bytes) v = (v << 8) | std::to_integer<unsigned char>(b);
+                std::printf("%d", static_cast<std::int32_t>(v));
+                return;
+            }
+            break;
+        }
+        case 13: // VARCHAR
+        case 16: // NVARCHAR
+            if (!bytes.empty()) {
+                auto len = std::to_integer<unsigned char>(bytes[0]);
+                std::printf("\"%.*s\"", static_cast<int>(len),
+                            reinterpret_cast<const char*>(bytes.data() + 1));
+                return;
+            }
+            break;
+        default:
+            break;
+    }
+    std::printf("0x");
+    for (auto b : bytes) std::printf("%02x", std::to_integer<unsigned char>(b));
+}
+
+} // namespace
 
 int main(int argc, char** argv) {
     const auto v = ifxsqli::version();
     std::printf("ifx_probe (ifx_sqli %d.%d.%d)\n", v.major, v.minor, v.patch);
 
     if (argc < 5) {
-        std::printf("usage: ifx_probe <host> <port> <username> <password> [servername] [database]\n");
+        std::printf("usage: ifx_probe <host> <port> <username> <password> [servername] [database] [sql]\n");
         return argc == 1 ? 0 : 1;
     }
 
@@ -20,6 +56,7 @@ int main(int argc, char** argv) {
     std::string password = argv[4];
     std::string serverName = argc > 5 ? argv[5] : "informix";
     std::string database = argc > 6 ? argv[6] : "";
+    std::string sql = argc > 7 ? argv[7] : "";
 
     ifxsqli::ConnectParams params;
     params.username = username;
@@ -42,6 +79,59 @@ int main(int argc, char** argv) {
     std::printf("  serial number  : %s\n", info.serialNumber.c_str());
     std::printf("  application id : %s\n", info.applicationId.c_str());
     std::printf("  capabilities   : %u %u %u\n", info.cap1, info.cap2, info.cap3);
+
+    if (!sql.empty()) {
+        if (auto r = conn->executeCommand("set isolation to dirty read"); !r) {
+            std::fprintf(stderr, "set isolation failed: %s\n", r.error().message.c_str());
+            return 1;
+        }
+        std::printf("set isolation ok.\n");
+        std::printf("preparing: %s\n", sql.c_str());
+        auto stmt = ifxsqli::SqliStatement::prepare(*conn, sql);
+        if (!stmt) {
+            std::fprintf(stderr, "prepare failed: %s\n", stmt.error().message.c_str());
+            return 1;
+        }
+
+        std::printf("columns:\n");
+        for (const auto& col : stmt->columns()) {
+            std::printf("  %-20s type=%d%s encodedLength=%u\n", col.name.c_str(), col.ifxType,
+                        col.notNull ? " NOT NULL" : "", col.encodedLength);
+        }
+
+        if (auto r = stmt->execute(); !r) {
+            std::fprintf(stderr, "execute failed: %s\n", r.error().message.c_str());
+            return 1;
+        }
+
+        int rowNum = 0;
+        for (;;) {
+            auto row = stmt->fetchRow();
+            if (!row) {
+                std::fprintf(stderr, "fetch failed: %s\n", row.error().message.c_str());
+                return 1;
+            }
+            if (!*row) break;
+            ++rowNum;
+            std::printf("row %d: ", rowNum);
+            const auto& cols = stmt->columns();
+            for (std::size_t i = 0; i < (*row)->size(); ++i) {
+                if (i > 0) std::printf(", ");
+                printColumnValue(cols[i], (**row)[i]);
+            }
+            std::printf("\n");
+        }
+        std::printf("%d row(s)\n", rowNum);
+
+        if (auto r = stmt->close(); !r) {
+            std::fprintf(stderr, "close failed: %s\n", r.error().message.c_str());
+            return 1;
+        }
+        if (auto r = stmt->release(); !r) {
+            std::fprintf(stderr, "release failed: %s\n", r.error().message.c_str());
+            return 1;
+        }
+    }
 
     auto disc = conn->disconnectOrderly();
     if (!disc) {

@@ -3,6 +3,7 @@ add_library(ifx_sqli STATIC
   transport.cpp
   handshake.cpp
   connection.cpp
+  statement.cpp
 )
 
 target_include_directories(ifx_sqli PUBLIC ${CMAKE_SOURCE_DIR})
