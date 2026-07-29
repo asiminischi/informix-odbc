@@ -1,0 +1,21 @@
+services:
+  informix:
+    image: ibmcom/informix-developer-database:latest
+    container_name: ifxodbc_dev
+    privileged: true
+    environment:
+      LICENSE: accept
+    ports:
+      - "9088:9088" # onsoctcp - the port this driver targets
+      - "9089:9089" # SSL variant, Phase 5
+    volumes:
+      - informix_data:/opt/ibm/data
+    healthcheck:
+      test: ["CMD", "onstat", "-", "-"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+volumes:
+  informix_data:

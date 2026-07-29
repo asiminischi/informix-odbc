@@ -1,0 +1,22 @@
+# Reference material only - never commit IBM's jar or decompiled output
+jdbc-4.50.10.jar
+/decompiled/
+/scratch_jar/
+
+# Build outputs
+/build/
+/out/
+*.obj
+*.o
+*.exe
+*.dll
+*.so
+*.pdb
+*.ilk
+
+# Editors / OS
+.vs/
+.vscode/
+*.user
+Thumbs.db
+.DS_Store
