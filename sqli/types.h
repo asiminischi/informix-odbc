@@ -1,0 +1,102 @@
+#pragma once
+
+#include "sqli/error.h"
+
+#include <cstddef>
+#include <cstdint>
+#include <expected>
+#include <optional>
+#include <span>
+#include <string>
+
+namespace ifxsqli {
+
+// Named Informix base type codes for the MVP scalar set, confirmed against a
+// live server (DESCRIBE's ifxType field, flag bits already masked off by the
+// caller). Other codes exist in the wire protocol but aren't part of this
+// set and aren't handled by the decoders below.
+namespace ifxtype {
+inline constexpr int kChar = 0;
+inline constexpr int kSmallInt = 1;
+inline constexpr int kInteger = 2;
+inline constexpr int kDecimal = 5;
+inline constexpr int kSerial = 6;
+inline constexpr int kDate = 7;
+inline constexpr int kDatetime = 10;
+inline constexpr int kVarchar = 13;
+inline constexpr int kNVarchar = 16;
+inline constexpr int kBigInt = 52;
+inline constexpr int kBigSerial = 53;
+} // namespace ifxtype
+
+// A decoded calendar DATETIME value. Only whole-second qualifiers (some
+// contiguous span within YEAR..SECOND) are supported - see decodeDatetime.
+struct DatetimeValue {
+    int year = 0;    // 0 if the qualifier doesn't include YEAR
+    int month = 0;   // 1-12, 0 if not included
+    int day = 0;     // 1-31, 0 if not included
+    int hour = 0;
+    int minute = 0;
+    int second = 0;
+};
+
+// Decodes a fixed-width big-endian two's-complement integer. NULL is the
+// type's MIN_VALUE bit pattern (confirmed live: 0x8000/0x80000000/INT64_MIN).
+[[nodiscard]] std::expected<std::optional<std::int16_t>, Error> decodeSmallInt(std::span<const std::byte> raw);
+[[nodiscard]] std::expected<std::optional<std::int32_t>, Error> decodeInteger(std::span<const std::byte> raw);
+[[nodiscard]] std::expected<std::optional<std::int64_t>, Error> decodeBigInt(std::span<const std::byte> raw);
+
+// Fixed-width space-padded CHAR(n). NULL is a leading 0x00 byte (confirmed
+// live); the rest of the buffer is not meaningful in that case. Non-NULL
+// values are returned exactly as stored on the wire (space-padded to the
+// declared width, not trimmed).
+[[nodiscard]] std::expected<std::optional<std::string>, Error> decodeChar(std::span<const std::byte> raw);
+
+// VARCHAR/NVARCHAR: raw must be the 1-byte length prefix followed by that
+// many data bytes (i.e. exactly the slice splitRow already extracts). NULL
+// is the sentinel length=1/data=0x00 (confirmed live; distinct from a real
+// empty string, which is length=0).
+[[nodiscard]] std::expected<std::optional<std::string>, Error> decodeVarchar(std::span<const std::byte> raw);
+
+// 4-byte big-endian signed day count from epoch 1899-12-31 (confirmed
+// live). NULL is INT32_MIN, same sentinel as INTEGER. Returns the day count
+// relative to the Unix epoch (1970-01-01) for the caller to format however
+// it likes (e.g. via std::chrono::sys_days).
+[[nodiscard]] std::expected<std::optional<std::int32_t>, Error> decodeDateUnixDays(std::span<const std::byte> raw);
+
+// Informix packed-decimal DECIMAL(precision,scale): 1 exponent byte + N
+// mantissa bytes (N = ceil(precision/2)), each mantissa byte a base-100
+// digit pair. Confirmed live for both positive and negative values (four
+// independent negative test points): the exponent's sign bit (0x80) plus a
+// biased 7-bit magnitude for positive values; for negative values the low 7
+// bits of the exponent byte are bitwise-complemented (0x7F - x) and the
+// mantissa is the "hundred's complement" (base-100 analog of two's
+// complement: 99-complement each digit, then +1 with carry from the right)
+// of what the positive encoding would have been - an involution, so
+// decoding re-applies the same transform. NULL is all-zero bytes (including
+// the exponent byte, which is otherwise never 0 for a real value); the
+// literal value 0 is distinguished by exponent byte 0x80 with an all-zero
+// mantissa (confirmed live), handled as a special case since its magnitude
+// exponent isn't a meaningful digit-placement value. Returns an exact
+// decimal string (no floating-point rounding).
+[[nodiscard]] std::expected<std::optional<std::string>, Error> decodeDecimal(std::span<const std::byte> raw,
+                                                                               unsigned precision, unsigned scale);
+
+// Informix DATETIME(qualifier): same packed base-100-digit-pair mantissa
+// machinery as DECIMAL (always positive/no complement - datetimes aren't
+// signed), where the digit sequence is just the calendar fields
+// concatenated (YEAR as 4 decimal digits/2 mantissa bytes if present, each
+// other field as 2 decimal digits/1 mantissa byte). `encodedLength` is the
+// DESCRIBE-reported value, packed as (totalDigits << 8) | qualifierByte
+// where qualifierByte's nibbles are the standard Informix TU_* start/end
+// codes (Year=0, Month=2, Day=4, Hour=6, Minute=8, Second=10). Confirmed
+// live only for the YEAR TO SECOND qualifier (0x0A, encodedLength 0x0E0A);
+// other whole-second sub-ranges within YEAR..SECOND follow the same
+// confirmed mechanism but aren't independently live-tested. FRACTION
+// qualifiers (end nibble 11-15) are not yet supported - the sub-second
+// byte layout hasn't been observed against a live server. NULL is all-zero
+// bytes, matching DECIMAL's convention.
+[[nodiscard]] std::expected<std::optional<DatetimeValue>, Error> decodeDatetime(std::span<const std::byte> raw,
+                                                                                  std::uint32_t encodedLength);
+
+} // namespace ifxsqli

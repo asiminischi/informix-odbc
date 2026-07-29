@@ -162,9 +162,12 @@ std::expected<void, Error> sendEnv(TcpSocket& sock) {
 std::expected<void, Error> selectDatabase(TcpSocket& sock, const std::string& database) {
     ByteWriter w;
     w.u16(kOpSelectDatabase);
-    w.u16(static_cast<std::uint16_t>(database.size()));
-    w.raw(database);
-    w.u8(0);
+    // Database name is the standard statement-protocol "char" field
+    // (u16 length + raw bytes + pad-if-odd) - confirmed live: an unconditional
+    // trailing NUL byte (this driver's original assumption, based on only ever
+    // testing with the odd-length "sysmaster") breaks alignment for any
+    // even-length database name.
+    w.ifxChar2(database);
     w.u16(0);
     w.u16(kSqEot);
     if (auto r = sock.writeAll(w.view()); !r) return r;
@@ -257,6 +260,10 @@ std::expected<void, Error> SqliConnection::executeCommand(const std::string& sql
                 if (stringTableSize > 0) {
                     auto strtab = sock_.readExactN(stringTableSize);
                     if (!strtab) return std::unexpected(strtab.error());
+                    if (stringTableSize & 1) {
+                        auto pad = sock_.readExactN(1);
+                        if (!pad) return std::unexpected(pad.error());
+                    }
                 }
                 break;
             }

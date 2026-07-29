@@ -1,5 +1,6 @@
 #include "sqli/connection.h"
 #include "sqli/statement.h"
+#include "sqli/types.h"
 #include "sqli/version.h"
 
 #include <cstdio>
@@ -9,29 +10,74 @@
 
 namespace {
 
-// Cosmetic-only decode for the probe's own output, not part of the library:
-// full type decoding is Phase 3. Prints what it recognizes, hex otherwise.
+// Decodes and prints one column's value using the sqli/types.h codecs,
+// exercising them against whatever the live server actually sends (rather
+// than just the frozen bytes the unit tests use).
 void printColumnValue(const ifxsqli::ColumnDesc& col, std::span<const std::byte> bytes) {
+    using namespace ifxsqli;
     switch (col.ifxType) {
-        case 2:  // INTEGER
-        case 6: { // SERIAL
-            if (bytes.size() == 4) {
-                std::uint32_t v = 0;
-                for (auto b : bytes) v = (v << 8) | std::to_integer<unsigned char>(b);
-                std::printf("%d", static_cast<std::int32_t>(v));
-                return;
-            }
-            break;
+        case ifxtype::kSmallInt: {
+            auto v = decodeSmallInt(bytes);
+            if (!v) { std::printf("<error: %s>", v.error().message.c_str()); return; }
+            if (!*v) { std::printf("NULL"); return; }
+            std::printf("%d", **v);
+            return;
         }
-        case 13: // VARCHAR
-        case 16: // NVARCHAR
-            if (!bytes.empty()) {
-                auto len = std::to_integer<unsigned char>(bytes[0]);
-                std::printf("\"%.*s\"", static_cast<int>(len),
-                            reinterpret_cast<const char*>(bytes.data() + 1));
-                return;
-            }
-            break;
+        case ifxtype::kInteger:
+        case ifxtype::kSerial: {
+            auto v = decodeInteger(bytes);
+            if (!v) { std::printf("<error: %s>", v.error().message.c_str()); return; }
+            if (!*v) { std::printf("NULL"); return; }
+            std::printf("%d", **v);
+            return;
+        }
+        case ifxtype::kBigInt:
+        case ifxtype::kBigSerial: {
+            auto v = decodeBigInt(bytes);
+            if (!v) { std::printf("<error: %s>", v.error().message.c_str()); return; }
+            if (!*v) { std::printf("NULL"); return; }
+            std::printf("%lld", static_cast<long long>(**v));
+            return;
+        }
+        case ifxtype::kChar: {
+            auto v = decodeChar(bytes);
+            if (!v) { std::printf("<error: %s>", v.error().message.c_str()); return; }
+            if (!*v) { std::printf("NULL"); return; }
+            std::printf("\"%s\"", (*v)->c_str());
+            return;
+        }
+        case ifxtype::kVarchar:
+        case ifxtype::kNVarchar: {
+            auto v = decodeVarchar(bytes);
+            if (!v) { std::printf("<error: %s>", v.error().message.c_str()); return; }
+            if (!*v) { std::printf("NULL"); return; }
+            std::printf("\"%s\"", (*v)->c_str());
+            return;
+        }
+        case ifxtype::kDate: {
+            auto v = decodeDateUnixDays(bytes);
+            if (!v) { std::printf("<error: %s>", v.error().message.c_str()); return; }
+            if (!*v) { std::printf("NULL"); return; }
+            std::printf("<%d unix days>", **v);
+            return;
+        }
+        case ifxtype::kDecimal: {
+            unsigned precision = (col.encodedLength >> 8) & 0xFF;
+            unsigned scale = col.encodedLength & 0xFF;
+            auto v = decodeDecimal(bytes, precision, scale);
+            if (!v) { std::printf("<error: %s>", v.error().message.c_str()); return; }
+            if (!*v) { std::printf("NULL"); return; }
+            std::printf("%s", (*v)->c_str());
+            return;
+        }
+        case ifxtype::kDatetime: {
+            auto v = decodeDatetime(bytes, col.encodedLength);
+            if (!v) { std::printf("<error: %s>", v.error().message.c_str()); return; }
+            if (!*v) { std::printf("NULL"); return; }
+            std::printf("%04d-%02d-%02d %02d:%02d:%02d", (*v)->year, (*v)->month, (*v)->day, (*v)->hour,
+                        (*v)->minute, (*v)->second);
+            return;
+        }
         default:
             break;
     }

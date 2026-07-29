@@ -2,6 +2,7 @@
 
 #include "sqli/byte_io.h"
 #include "sqli/protocol.h"
+#include "sqli/types.h"
 
 #include <atomic>
 #include <cstdio>
@@ -55,27 +56,37 @@ std::expected<std::vector<std::vector<std::byte>>, Error> splitRow(std::span<con
     for (const auto& col : columns) {
         std::size_t width = 0;
         switch (col.ifxType) {
-            case 0:                  // CHAR(n): fixed width
+            case ifxtype::kChar:               // CHAR(n): fixed width
                 width = col.encodedLength;
                 break;
-            case 1:                  // SMALLINT
+            case ifxtype::kSmallInt:
                 width = 2;
                 break;
-            case 2:                  // INTEGER
-            case 6:                  // SERIAL
-            case 7:                  // DATE
+            case ifxtype::kInteger:
+            case ifxtype::kSerial:
+            case ifxtype::kDate:
                 width = 4;
                 break;
-            case 52:                 // BIGINT
-            case 53:                 // BIGSERIAL
+            case ifxtype::kBigInt:
+            case ifxtype::kBigSerial:
                 width = 8;
                 break;
-            case 13:                 // VARCHAR
-            case 16: {                // NVARCHAR
+            case ifxtype::kVarchar:
+            case ifxtype::kNVarchar: {
                 if (offset >= row.size()) {
                     return std::unexpected(Error{ErrorKind::Protocol, "row truncated reading varchar length byte"});
                 }
                 width = 1 + static_cast<std::size_t>(std::to_integer<unsigned char>(row[offset]));
+                break;
+            }
+            case ifxtype::kDecimal: {  // 1 exponent byte + ceil(precision/2) mantissa bytes
+                unsigned precision = (col.encodedLength >> 8) & 0xFF;
+                width = 1 + (precision + 1) / 2;
+                break;
+            }
+            case ifxtype::kDatetime: {  // 1 exponent byte + ceil(totalDigits/2) mantissa bytes
+                unsigned totalDigits = (col.encodedLength >> 8) & 0xFF;
+                width = 1 + (totalDigits + 1) / 2;
                 break;
             }
             default:
@@ -310,6 +321,10 @@ std::expected<bool, Error> SqliStatement::processResponseBatch() {
                 if (stringTableSize > 0) {
                     auto strtab = sock.readExactN(stringTableSize);
                     if (!strtab) return std::unexpected(strtab.error());
+                    if (stringTableSize & 1) {
+                        auto pad = sock.readExactN(1);
+                        if (!pad) return std::unexpected(pad.error());
+                    }
                     std::size_t start = 0;
                     for (std::uint16_t i = 0; i < *nfields && start < strtab->size(); ++i) {
                         std::size_t end = start;

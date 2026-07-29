@@ -185,17 +185,22 @@ successful disconnect, not an error** — confirmed necessary by hitting this
 live (see `tests/fixtures/probe_db_select_and_exit.txt`).
 
 **Database selection** (confirmed): immediately after a successful handshake,
-send opcode `36` (`0x24`) — `u16(36)`, `u16(len)` (the database name's raw
-byte length, **no +1**), the name's raw bytes (**no NUL**), `u8(0)` (an
-explicit NUL byte, separate from the length count), `u16(0)` (unclear
-purpose — sent as 0, untested otherwise), `u16(12)` (`SQ_EOT`). Confirmed
-byte-for-byte identical between our implementation and the JDBC golden
-capture. The server's ack starts with `u16(15)` (`SQ_DONE`) and is
-variable-length (28 bytes in the JDBC capture, 18 bytes in ours) — its
-internal shape is genuine Phase 2 (statement protocol) territory we don't
-parse yet; for now we just scan forward reading `u16`s until one equals
-`SQ_EOT`(12), which reliably finds the end without needing to understand the
-fields in between.
+send opcode `36` (`0x24`) — `u16(36)`, then the database name as an
+`ifxChar2` field (**not** a raw length + unconditional trailing `u8(0)` — an
+earlier version of this driver wrote `u16(len)` + raw bytes + an
+unconditional `u8(0)`, which happens to be byte-identical to `ifxChar2` for
+any *odd*-length name but leaves a stray extra byte for an *even*-length one.
+This went unnoticed through all of Phase 2 because the only database name
+ever tested was `sysmaster`, 9 characters. It surfaced as a hang connecting
+to `ifxodbc_test`, 12 characters, in Phase 3 — same failure shape as every
+other pad-byte bug here: something that happened to work for the specific
+test input used so far.), then `u16(0)` (unclear purpose — sent as 0,
+untested otherwise), `u16(12)` (`SQ_EOT`). The server's ack starts with
+`u16(15)` (`SQ_DONE`) and is variable-length (28 bytes in the JDBC capture,
+18 bytes in ours) — its internal shape is genuine Phase 2 (statement
+protocol) territory we don't parse yet; for now we just scan forward reading
+`u16`s until one equals `SQ_EOT`(12), which reliably finds the end without
+needing to understand the fields in between.
 
 ## Statement protocol
 
@@ -244,7 +249,15 @@ length **not including** any terminator, that many raw bytes, then a single
 This same even-alignment rule applies to **TUPLE row data too** — confirmed
 live: a 1-row fetch with a 14-byte tuple needed no pad, but a 15-byte tuple in
 a multi-row fetch did; omitting the pad byte desyncs every subsequent read in
-the batch. Always check `size & 1` after reading any length-prefixed blob.
+the batch. It also applies to **DESCRIBE's `stringTableSize` bytes** —
+confirmed live: a 9-column query's 94-byte (even) string table masked this
+for all of Phase 2, until a 3-column query with a 25-byte (odd) string table
+hung on the very next read. Always check `size & 1` after reading any
+length-prefixed blob in this protocol — this has now bitten every
+variable-length field encountered so far (SQ_COMMAND/SQ_PREPARE text,
+database name, string table, tuple row data), always masked by test data
+that happened to avoid the odd case until a differently-shaped query came
+along.
 
 **SQ_COMMAND** (executed via `SqliConnection::executeCommand`, confirmed for
 `SET ISOLATION ...`): `u16(1)`, reserved field (u16 or u32 — see "Narrow vs.
@@ -306,38 +319,116 @@ trying to auto-resync.
 
 ## Scalar type wire encodings (MVP set)
 
-Two of these got incidental live confirmation in Phase 2 (`sqli/statement.cpp`'s
-`splitRow`, exercised against real `systables` rows); the rest remain
-hypotheses for Phase 3 to verify properly (including NULL handling, which
-Phase 2's queries never exercised — `systables.tabid`/`tabname` are never
-NULL):
+**Status: verified** — all eight MVP types (`sqli/types.h`/`types.cpp`) confirmed
+live against a dedicated test table (`ifxodbc_test.type_probe`: one row of
+positive values, one row of negative values, one all-NULL row, plus a handful
+of extra DECIMAL rows used only to pin down the negative encoding), with
+round-trip unit tests in `tests/sqli/test_types.cpp` reproducing the exact
+captured bytes for each case.
 
-| Type | Wire form | NULL sentinel | Status |
-|---|---|---|---|
-| SMALLINT | 2 bytes, fixed | reserved bit pattern (`INT16_MIN`) | hypothesis |
-| INTEGER / **SERIAL** | 4 bytes, fixed, big-endian | reserved bit pattern (`INT32_MIN`) | **confirmed for SERIAL** (`systables.tabid`, e.g. `00 00 00 01` = 1) |
-| BIGINT | 8 bytes, fixed | reserved bit pattern (`INT64_MIN`) | hypothesis |
-| CHAR(n) | fixed width, space-padded | leading `0x00` byte | hypothesis |
-| **VARCHAR(n)** | **1-byte length prefix + that many raw bytes (no NUL)** | **unconfirmed** | **confirmed shape** (`systables.tabname`, e.g. `09 73 79 73 74 61 62 6c 65 73` = length 9 + `"systables"`); NULL convention still unverified |
-| DECIMAL(p,s) | 1 exponent/sign byte (base-100 floating point, bias-64) + 1-8 mantissa bytes, each a base-100 digit; negative values 100's-complemented with sign bit cleared | leading two zero bytes | hypothesis |
-| DATE | 4 bytes, signed day count from a fixed epoch | reserved bit pattern (`INT32_MIN`) | hypothesis |
-| DATETIME | same packed base-100 machinery as DECIMAL, fields selected by a start/end qualifier byte pair | leading two zero bytes | hypothesis |
+Column metadata (from a DESCRIBE reply) packs the base type code and
+nullability/distinct/etc. flags into a single 16-bit word (low byte = base
+type, high bits = flags — **confirmed**: bit `0x100` = NOT NULL). The
+`encodedLength` field (always a plain `u32`, not gated by the narrow/wide
+toggle) is itself a packed pair for the two variable-shape types — confirmed
+live: `(byteA << 8) | byteB` where for DECIMAL, byteA=precision and
+byteB=scale (e.g. `DECIMAL(10,2)` → `encodedLength = 0x0A02 = 2562`); for
+DATETIME, byteA=total decimal digit count and byteB is the standard Informix
+TU qualifier byte, `(startField << 4) | endField` (e.g. `YEAR TO SECOND` →
+`0x0A`, `encodedLength = 0x0E0A = 3594` since YEAR..SECOND is 14 digits).
 
-Column metadata (from a DESCRIBE reply) packs the base type code and nullability/
-distinct/etc. flags into a single 16-bit word (low byte = base type, high bits =
-flags — **confirmed**: bit `0x100` = NOT NULL); precision/scale for DECIMAL/
-DATETIME travel in a separate length/qualifier field per column (unverified).
+| Type | Wire form | NULL sentinel |
+|---|---|---|
+| SMALLINT | 2 bytes, big-endian two's complement | `INT16_MIN` (`0x8000`) |
+| INTEGER / SERIAL | 4 bytes, big-endian two's complement | `INT32_MIN` (`0x80000000`) |
+| BIGINT / BIGSERIAL | 8 bytes, big-endian two's complement | `INT64_MIN` |
+| CHAR(n) | fixed width `n`, space-padded, no NUL | leading `0x00` byte (rest of the buffer not meaningful) |
+| VARCHAR(n) / NVARCHAR(n) | 1-byte length prefix + that many raw bytes (no NUL) | length=1, single data byte `0x00` (distinct from a real empty string, length=0) |
+| DATE | 4 bytes, big-endian signed day count, epoch **1899-12-31** | `INT32_MIN`, same sentinel as INTEGER |
+| DECIMAL(p,s) | see below | all bytes zero (including the exponent byte — see below) |
+| DATETIME(qualifier) | see below | all bytes zero |
 
-Status: each remaining type gets a round-trip unit test plus a live-query test
-against a populated test table (including NULLs) before being considered done.
-This table gets updated in place with confirmed layouts as Phase 3 lands.
+**DECIMAL(p,s)** — 1 exponent byte + `ceil(p/2)` mantissa bytes, each mantissa
+byte a base-100 digit (0-99). Confirmed with `precision=10` (6 total bytes)
+across four independent negative test values plus positive/zero/NULL cases:
+
+- Exponent byte: bit `0x80` is the sign (1 = positive). For positive values,
+  the low 7 bits are `64 + trueExp` where `trueExp` is such that
+  `value = Σ digit[i] * 100^(trueExp-1-i)` over the mantissa digits (i.e.
+  `trueExp` is the power-of-100 place value of the *first* mantissa digit,
+  matching the classic biased-exponent floating-point idea but base 100).
+  Confirmed: `12345.67` → exponent `0xC3` (low7 `0x43=67` → trueExp `3`),
+  mantissa `01 17 2d 43 00` = digits `[1,23,45,67,0]` (the trailing `0` is
+  padding out to the fixed 5-mantissa-byte width implied by precision 10,
+  not a meaningful digit).
+- For **negative** values, the low 7 bits of the exponent byte are
+  bitwise-complemented relative to what the positive encoding would have
+  been (`storedLow7 = 0x7F - positiveLow7`), and the mantissa is the
+  **"hundred's complement"** of what the positive mantissa would have been —
+  the base-100 analog of two's complement: 99-complement every digit
+  (`99 - digit`), then add 1 to the rightmost digit, propagating carry
+  leftward. This transform is its own inverse (applying it twice restores
+  the original digits), so decoding negative mantissas just re-applies the
+  same transform. Confirmed against four independent values sharing no
+  bytes in common: `-99.99` (mantissa `[0,1,0,0,0]` decomplements to
+  `[99,99,0,0,0]`), `-12345.67` (the exact negation of the positive example
+  above — `[98,76,54,33,0]` decomplements to `[1,23,45,67,0]`, matching the
+  positive digits exactly), `-0.01`, and `-100`.
+- **Zero is not all-zero-bytes** — it has its own canonical encoding,
+  exponent byte `0x80` (sign bit set, magnitude 0) with an all-zero mantissa,
+  confirmed live. This is what distinguishes a real `0` from NULL (exponent
+  byte `0x00`, sign bit *clear*, which never occurs for any real value).
+- Value reconstruction avoids floating point entirely: concatenate the
+  mantissa digits as 2-decimal-digit groups into one digit string, place
+  the decimal point `2*trueExp` characters in from the left, then take
+  exactly `scale` digits after the point (the fixed mantissa width often
+  has trailing padding digits beyond the declared scale). Confirmed via
+  `sqli/types.cpp`'s `decodeDecimal`, tested in `test_types.cpp`.
+
+**DATETIME(qualifier)** — reuses the exact same packed base-100-digit
+mantissa machinery as DECIMAL (this was not obvious going in; it fell out of
+decoding the raw bytes and noticing the digit sequence was just the calendar
+fields concatenated), but is never negative (no complement step) and the
+digit sequence has a fixed, qualifier-derived meaning rather than a
+floating decimal point:
+- The qualifier byte's nibbles are the standard Informix TU_* constants:
+  `YEAR=0, MONTH=2, DAY=4, HOUR=6, MINUTE=8, SECOND=10` (fraction = 11-15,
+  **not yet supported** — no live capture with fractional seconds exists
+  yet, so the sub-second byte layout is unconfirmed; `decodeDatetime`
+  rejects these cleanly rather than guessing).
+- Each field from `start` to `end` contributes to the mantissa in order:
+  YEAR contributes 2 mantissa bytes (4 decimal digits, e.g. `2026` → bytes
+  `20, 26`), every other field contributes 1 mantissa byte (2 decimal
+  digits, e.g. month `07` → byte `07`). The exponent byte's biased value
+  always equals the total mantissa byte count (e.g. `YEAR TO SECOND` = 7
+  mantissa bytes → exponent `0xC7`, confirmed live for both test rows).
+- Confirmed live for `YEAR TO SECOND` (qualifier `0x0A`) with two full
+  round-trip values: `2026-07-29 12:34:56` (bytes `c7 14 1a 07 1d 0c 22 38`)
+  and `2000-01-01 00:00:00` (bytes `c7 14 00 01 01 00 00 00`). Other
+  whole-second sub-ranges within YEAR..SECOND (e.g. `MONTH TO DAY`) follow
+  the same confirmed mechanism but aren't independently live-tested.
+
+Both algorithms are implemented in `sqli/types.cpp` (`decodeDecimal`,
+`decodeDatetime`), with round-trip unit tests in `tests/sqli/test_types.cpp`
+reproducing the exact captured bytes above, and exercised live end-to-end via
+`tools/ifx_probe` against the full `type_probe` table (including the
+all-NULL row).
 
 ## Open questions / risks
 
-- VARCHAR NULL convention on the wire (length-prefix sentinel vs. something else) —
-  not yet exercised by any Phase 2 query.
 - Whether `has4ByteOffsets()`'s constituent capability bits (see "Narrow vs. wide
   framing" above) ever diverge on a real server — only tested against one engine
   (Docker `ibmcom/informix-developer-database`, IDS 14.10.FC7W1DE) where they all
   happen to co-occur as true. Revisit if a server is found where DESCRIBE and
   TUPLE/FETCH negotiate differently.
+- DATETIME qualifiers including FRACTION (sub-second precision) are not
+  supported — `decodeDatetime` rejects them cleanly rather than guessing the
+  byte layout, since no live capture with fractional seconds has been taken.
+  Same open question applies to INTERVAL, which reuses DECIMAL/DATETIME-style
+  packed digits but *can* be negative (unlike DATETIME) — entirely unverified,
+  out of MVP scope.
+- DECIMAL/DATETIME qualifiers outside what's been directly tested (precision
+  other than 10, qualifiers other than YEAR TO SECOND) are handled by a
+  general formula derived from - and consistent with - the tested cases, but
+  aren't independently confirmed against a live capture for those specific
+  parameter values.
