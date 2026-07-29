@@ -116,12 +116,32 @@ DESCRIBE/TUPLE/etc — see "Narrow vs. wide framing" below. This bit was `1`
 statement-protocol "char" field shape below), terminated by `u16(0)`/`u16(0)`,
 then a trailing `u16(12)` EOT (same omit-and-hang trap as SQ_PROTOCOLS). **The
 server rejects an empty env set outright** — `SQ_ERROR` sqlcode `-208` — so at
-least one entry is required. This driver sends the same `DBTEMP=/tmp`,
-`SUBQCACHESZ=10` pair the real driver sends when no connInfo properties
-override them (arbitrary stand-in values; not verified to matter beyond
-satisfying the non-empty requirement). `totalLen` follows the formula
-`4 + Σ(paddedNameLen + paddedValueLen + 4) + 2` — for these two entries, `38`.
-Server replies with a bare `u16(12)` EOT on success.
+least one entry is required. This driver sends `DBTEMP=/tmp`, `SUBQCACHESZ=10`
+(arbitrary stand-in values matching what the real driver sends when no
+connInfo properties override them) plus **`DBDATE=Y4MD-`** (added in Phase 3
+— see the "Database DML and DBDATE" note below for why). `totalLen` doesn't
+appear to be strictly validated byte-for-byte against the actual payload —
+this driver sends `54` for these three entries without having derived an
+exact formula for it (an earlier, hand-derived guess didn't match the
+working `38` used for the original two-entry set either); treat this field
+as "large enough," not as a checksum, until proven otherwise. Server replies
+with a bare `u16(12)` EOT on success.
+
+**Database DML and DBDATE** (confirmed live, Phase 3): a session that
+doesn't send a `DBDATE` env var still parses date string literals (e.g.
+`DATE('2026-07-29')`) successfully, but under a locale that turned out to be
+ISO year-month-day order — *not* the MM/DD/YYYY order the Docker image's
+`dbaccess` shell environment defaults to. This was surprising and cost real
+debugging time: the same literal that works fine via `dbaccess` (which has
+its own locale env vars set at the shell level) failed with sqlcode `-1218`
+over this driver's own connection, and switching the literal to ISO order
+made it work *before* `DBDATE` was even being sent — meaning the two
+sessions had two different, independently-defaulted locales. Rather than
+depend on whichever default the server happens to pick, this driver now
+sends `DBDATE=Y4MD-` explicitly (ISO year-month-day, dash separator) so date
+parsing is deterministic and documented rather than incidental. Any SQL this
+driver constructs internally (and, later, the ODBC layer's date literal
+translation) should assume this format.
 
 **Narrow vs. wide framing**: multiple otherwise-fixed-shape fields toggle
 between a 2-byte and 4-byte wire form depending on the negotiated SQ_PROTOCOLS
@@ -209,6 +229,9 @@ multi-row)→close→release cycle round-trips correctly against the live Docker
 server (`sqli/statement.cpp`, `sqli/connection.cpp`), confirmed against
 `select tabid, tabname from systables where tabid = 1` (1 row) and `... where
 tabid <= 5` (5 rows, exercising multi-tuple fetch and cursor exhaustion).
+DDL/DML (`CREATE TABLE`, `INSERT`) via `executeCommand` is also confirmed
+live (`tests/integration/test_type_probe.cpp` recreates its whole fixture
+table this way on every run).
 
 After the handshake (+ SQ_PROTOCOLS + SQ_INFO/ENV + database-select, see
 above), both sides exchange a stream of *tagged records*: a `u16` opcode tag
@@ -235,6 +258,7 @@ Confirmed opcodes (see `sqli/protocol.h`):
 | SQ_ERROR | 13 | S→C |
 | SQ_TUPLE (one row's bytes) | 14 | S→C |
 | SQ_DONE | 15 | S→C |
+| SQ_INSERTDONE (generated-key report after INSERT) | 94 | S→C |
 | SQ_NON_CURSOR_DESCRIBE (requests a DESCRIBE even for non-SELECT) | 22 | C→S |
 | SQ_RETURN_TYPE (tells the server how to render each fetched column) | 100 | C→S |
 | SQ_WANT_DONE | 49 | C→S |
@@ -310,6 +334,40 @@ padded per the even-alignment rule above.
 `statementId`(u16), `u16(10)`/`u16(11)`, `u16(12)` (EOT). Server replies with
 DESCRIBE/DONE/EOT (close) matching the generic batch reader.
 
+**SQ_INSERTDONE** (S→C, discovered in Phase 3 while wiring up a DML-based
+integration test - not part of the Phase 2 opcode set, since Phase 2 never
+exercised `INSERT`): sent after every `INSERT`'s DESCRIBE, unconditionally,
+regardless of whether the target table has a SERIAL column. Confirmed live,
+18 bytes total:
+- 10 bytes: `serial8Inserted`, a legacy dual-32-bit "long int" format (not
+  the plain 8-byte BIGINT column encoding): `u16 sign` (`0` = no value,
+  `1` = positive, `-1`/`0xFFFF` = negative), then the 8 magnitude bytes
+  stored as [byte 6,7,8,9][byte 2,3,4,5] relative to the 10-byte buffer
+  (i.e. the upper 4 bytes of the 64-bit value come *after* the lower 4 bytes
+  on the wire) — reassembled high-then-low and negated if the sign was `-1`.
+  Implemented as `decodeLegacyLongInt` in `sqli/byte_io.h`.
+- 8 bytes: `bigSerialInserted`, a plain big-endian 8-byte value, no sign
+  field.
+
+**Important caveat, confirmed live**: for a plain `INSERT` (the only kind
+this driver sends so far), both values reliably decode to `0`/sign-`1`,
+*not* the row's actual generated SERIAL value (confirmed against a table
+with an actual `SERIAL` column generating `1`, then `2` — the wire bytes
+were byte-for-byte identical both times). Per the decompiled JDBC source,
+a real value only shows up when the statement additionally sends a
+`sendSGKPrepare` request (JDBC's `Statement.RETURN_GENERATED_KEYS`
+mechanism) before executing — this driver doesn't implement that yet
+(tracked as a Phase 5+ feature; see the roadmap). Getting the actual
+generated identity today requires a `SELECT` (e.g. against
+`sysmaster:sysdual` or a `RETURNING`-style clause if the engine supports
+one) rather than relying on this field. `SqliConnection::lastSerialInserted()`
+/ `SqliStatement::lastSerialInserted()` decode and expose this field
+correctly per the confirmed byte layout above, but callers should not treat
+the *value* as meaningful yet — only the byte-consumption behavior (which
+was the actual bug this fixed: an unhandled `94` tag previously desynced
+the stream and surfaced as `"unrecognized tag in executeCommand response"`
+on any `INSERT`) is currently trustworthy.
+
 Errors surface as a dedicated `SQ_ERROR`(13) record: `sqlcode`(u16, signed),
 then (unless `sqlcode == -368`, a special case with no message) `isamcode`(u16),
 `offset`(u32), message (`ifxChar2`). A `sqlcode == -619` is a special "resync"
@@ -324,7 +382,15 @@ live against a dedicated test table (`ifxodbc_test.type_probe`: one row of
 positive values, one row of negative values, one all-NULL row, plus a handful
 of extra DECIMAL rows used only to pin down the negative encoding), with
 round-trip unit tests in `tests/sqli/test_types.cpp` reproducing the exact
-captured bytes for each case.
+captured bytes for each case, **plus** a repeatable live-server integration
+test (`tests/integration/test_type_probe.cpp`, gated behind the
+`IFX_ENABLE_INTEGRATION_TESTS` CMake option since it needs a running Informix
+server) that creates the fixture table itself via `executeCommand`, inserts
+the same three rows, fetches them back through the real
+prepare→execute→fetch→`splitRow`→decode path, and asserts every decoded
+value — this is what actually exercises `splitRow`'s column-slicing logic,
+which the unit tests bypass by calling the decoders directly on captured
+bytes.
 
 Column metadata (from a DESCRIBE reply) packs the base type code and
 nullability/distinct/etc. flags into a single 16-bit word (low byte = base

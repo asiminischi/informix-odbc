@@ -23,6 +23,7 @@ inline constexpr std::uint16_t kEot = 12;
 inline constexpr std::uint16_t kError = 13;
 inline constexpr std::uint16_t kTuple = 14;
 inline constexpr std::uint16_t kDone = 15;
+inline constexpr std::uint16_t kInsertDone = 94;
 inline constexpr std::uint16_t kNonCursorDescribe = 22;
 inline constexpr std::uint16_t kReturnType = 100;
 inline constexpr std::uint16_t kWantDone = 49;

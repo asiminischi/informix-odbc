@@ -31,6 +31,12 @@ public:
     [[nodiscard]] const std::vector<ColumnDesc>& columns() const { return columns_; }
     [[nodiscard]] int statementType() const { return statementType_; }
 
+    // See SqliConnection::lastSerialInserted's doc comment for the same
+    // caveat (confirmed live to read back as 0 for a plain INSERT; only
+    // meaningful with the SGK mechanism this driver doesn't send yet).
+    [[nodiscard]] std::optional<std::int64_t> lastSerialInserted() const { return lastSerialInserted_; }
+    [[nodiscard]] std::optional<std::int64_t> lastBigSerialInserted() const { return lastBigSerialInserted_; }
+
     // Opens the cursor for a SELECT-shaped prepared statement.
     [[nodiscard]] std::expected<void, Error> execute();
 
@@ -57,6 +63,8 @@ private:
     bool typeSent_ = false;
     bool exhausted_ = false;
     std::vector<std::vector<std::vector<std::byte>>> pendingRows_;
+    std::optional<std::int64_t> lastSerialInserted_;
+    std::optional<std::int64_t> lastBigSerialInserted_;
 };
 
 } // namespace ifxsqli

@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -175,5 +176,29 @@ private:
     std::span<const std::byte> data_;
     std::size_t pos_ = 0;
 };
+
+// Decodes the legacy "long int" 10-byte format used by SQ_INSERTDONE's
+// serial8Inserted field (confirmed live - see docs/protocol-notes.md): a
+// u16 sign (0 = no value/sentinel, 1 = positive, -1 = negative) followed by
+// two 4-byte halves stored in an unusual order (bytes [6..9] then [2..5]
+// relative to the 10-byte buffer's start) that get reassembled high-half-
+// first into a plain 64-bit value, then negated if the sign was -1. Distinct
+// from the plain 8-byte big-endian BIGINT column encoding - this format is
+// only used for this one legacy field.
+[[nodiscard]] inline std::optional<std::int64_t> decodeLegacyLongInt(std::span<const std::byte> b) {
+    auto byte = [&](std::size_t i) { return std::to_integer<std::uint64_t>(b[i]); };
+    std::int16_t sign = static_cast<std::int16_t>((byte(0) << 8) | byte(1));
+    if (sign == 0) return std::nullopt;
+    std::uint64_t v = byte(6);
+    v = (v << 8) | byte(7);
+    v = (v << 8) | byte(8);
+    v = (v << 8) | byte(9);
+    v = (v << 8) | byte(2);
+    v = (v << 8) | byte(3);
+    v = (v << 8) | byte(4);
+    v = (v << 8) | byte(5);
+    auto result = static_cast<std::int64_t>(v);
+    return sign < 0 ? -result : result;
+}
 
 } // namespace ifxsqli

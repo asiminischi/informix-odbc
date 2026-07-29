@@ -3,6 +3,7 @@
 #include "sqli/byte_io.h"
 #include "sqli/protocol.h"
 
+#include <cstdio>
 #include <optional>
 
 namespace ifxsqli {
@@ -121,20 +122,28 @@ std::expected<bool, Error> negotiateProtocols(TcpSocket& sock) {
 // decompiled IfxSqli.sendEnv() and confirmed against the golden capture. The
 // server rejects an empty env set outright (sqlcode -208), so this sends the
 // same DBTEMP/SUBQCACHESZ pair the real driver sends when no connInfo
-// properties override them. The server replies with a bare SQ_EOT.
+// properties override them, plus an explicit DBDATE - confirmed live that
+// without it, date string literals (e.g. `DATE('07/29/2026')`) are parsed
+// against whatever locale the server defaults to (which turned out to be
+// ISO-ish, not the Docker image's shell-level DBDATE used by dbaccess),
+// which is surprising and not something a driver should leave to chance.
+// `Y4MD-` pins it to an unambiguous ISO year-month-day order regardless of
+// server default. The server replies with a bare SQ_EOT.
 std::expected<void, Error> sendEnv(TcpSocket& sock) {
     constexpr std::uint16_t kOpInfo = 81;
     constexpr std::uint16_t kInfoEnv = 6;
     ByteWriter w;
     w.u16(kOpInfo);
     w.u16(kInfoEnv);
-    w.u16(38); // total length (see docs/protocol-notes.md for the formula)
+    w.u16(54); // total length (see docs/protocol-notes.md for the formula)
     w.u16(12); // longest name length ("SUBQCACHESZ", padded to even)
-    w.u16(4);  // longest value length ("/tmp")
+    w.u16(6);  // longest value length ("Y4MD-", padded to even)
     w.ifxChar2("DBTEMP");
     w.ifxChar2("/tmp");
     w.ifxChar2("SUBQCACHESZ");
     w.ifxChar2("10");
+    w.ifxChar2("DBDATE");
+    w.ifxChar2("Y4MD-");
     w.u16(0); // INFO_DONE terminator: name length 0
     w.u16(0); // INFO_DONE terminator: value length 0
     w.u16(kSqEot);
@@ -204,6 +213,9 @@ std::expected<void, Error> SqliConnection::executeCommand(const std::string& sql
     w.u16(opcode::kRelease);
     w.u16(opcode::kEot);
     if (auto r = sock_.writeAll(w.view()); !r) return r;
+
+    lastSerialInserted_.reset();
+    lastBigSerialInserted_.reset();
 
     std::optional<Error> pendingError;
     for (;;) {
@@ -283,6 +295,21 @@ std::expected<void, Error> SqliConnection::executeCommand(const std::string& sql
                 auto err = readErrorRecord(sock_);
                 if (!err) return std::unexpected(err.error());
                 pendingError = *err;
+                break;
+            }
+            case opcode::kInsertDone: {
+                // Confirmed live (18 bytes total): a 10-byte legacy "long
+                // int" serial8Inserted field, then a plain 8-byte big-endian
+                // bigSerialInserted field - see docs/protocol-notes.md.
+                auto serial8 = sock_.readExactN(10);
+                if (!serial8) return std::unexpected(serial8.error());
+                lastSerialInserted_ = decodeLegacyLongInt(*serial8);
+
+                auto bigSerial = sock_.readExactN(8);
+                if (!bigSerial) return std::unexpected(bigSerial.error());
+                ByteReader r(*bigSerial);
+                lastBigSerialInserted_ = static_cast<std::int64_t>(
+                    (static_cast<std::uint64_t>(r.u32()) << 32) | r.u32());
                 break;
             }
             default:

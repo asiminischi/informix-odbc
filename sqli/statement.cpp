@@ -373,6 +373,21 @@ std::expected<bool, Error> SqliStatement::processResponseBatch() {
                 }
                 break;
             }
+            case opcode::kInsertDone: {
+                // See SqliConnection::executeCommand's handling of the same
+                // tag - confirmed live 18-byte layout (10-byte legacy "long
+                // int" serial8 + plain 8-byte big-endian bigserial).
+                auto serial8 = sock.readExactN(10);
+                if (!serial8) return std::unexpected(serial8.error());
+                lastSerialInserted_ = decodeLegacyLongInt(*serial8);
+
+                auto bigSerial = sock.readExactN(8);
+                if (!bigSerial) return std::unexpected(bigSerial.error());
+                ByteReader r(*bigSerial);
+                lastBigSerialInserted_ =
+                    static_cast<std::int64_t>((static_cast<std::uint64_t>(r.u32()) << 32) | r.u32());
+                break;
+            }
             case opcode::kError: {
                 auto sqlcodeRaw = readU16(sock);
                 if (!sqlcodeRaw) return std::unexpected(sqlcodeRaw.error());

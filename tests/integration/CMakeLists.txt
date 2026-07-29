@@ -1,0 +1,5 @@
+add_executable(type_probe_integration_test test_type_probe.cpp)
+target_link_libraries(type_probe_integration_test PRIVATE ifx_sqli)
+
+add_test(NAME type_probe_integration COMMAND type_probe_integration_test)
+set_tests_properties(type_probe_integration PROPERTIES LABELS "integration")

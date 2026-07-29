@@ -10,3 +10,9 @@ FetchContent_MakeAvailable(doctest)
 unset(CMAKE_POLICY_VERSION_MINIMUM)
 
 add_subdirectory(sqli)
+
+option(IFX_ENABLE_INTEGRATION_TESTS
+       "Build/run tests that require a live Informix server (see tests/integration)" OFF)
+if(IFX_ENABLE_INTEGRATION_TESTS)
+  add_subdirectory(integration)
+endif()
