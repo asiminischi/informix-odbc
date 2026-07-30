@@ -17,7 +17,9 @@ endif()
 option(IFXODBC_BUILD_TESTS "Build unit/integration tests" ON)
 
 add_subdirectory(sqli)
+add_subdirectory(driver)
 add_subdirectory(tools/ifx_probe)
+add_subdirectory(tools/odbc_dm_probe)
 
 if(IFXODBC_BUILD_TESTS)
   enable_testing()
