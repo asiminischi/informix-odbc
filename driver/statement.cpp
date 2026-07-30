@@ -232,7 +232,21 @@ SQLRETURN doColAttribute(OdbcStatement* s, SQLUSMALLINT ColumnNumber, SQLUSMALLI
 
     switch (FieldIdentifier) {
         case SQL_DESC_NAME:
-        case SQL_COLUMN_NAME: {
+        case SQL_COLUMN_NAME:
+        // SQL_DESC_LABEL is #defined as SQL_COLUMN_LABEL (same numeric value,
+        // 18) on this SDK, so only one case label is listed here (a second
+        // would be a duplicate-case error, same situation as
+        // SQL_DESC_DISPLAY_SIZE/SQL_COLUMN_DISPLAY_SIZE above). This is the
+        // display label a client uses for a column header (distinct from
+        // SQL_DESC_NAME when a query uses an alias/expression - we don't
+        // track aliases separately yet, so the base column name is a
+        // correct answer either way). Added because isql's tabular header
+        // printer was showing blank headers despite SQLDescribeCol/
+        // SQL_DESC_NAME both returning the correct name when called
+        // directly - the most likely explanation is isql asks for this
+        // field instead, which previously fell through to the unsupported-
+        // field default (SQL_ERROR/HYC00).
+        case SQL_COLUMN_LABEL: {
             auto len = static_cast<SQLSMALLINT>(col.name.size());
             auto toCopy =
                 std::min<SQLSMALLINT>(len, static_cast<SQLSMALLINT>(BufferLength > 0 ? BufferLength - 1 : 0));
