@@ -1,11 +1,13 @@
 #pragma once
 
 // Maps sqli/error.h's (ErrorKind, message) shape onto ODBC SQLSTATEs and
-// posts the result to a handle's diagnostic queue. This is deliberately
-// coarse for Phase 4 slice 1 (the plan's slice 4 owns a full, correct
-// sqlcode -> SQLSTATE table) - the goal here is just that every failure
-// path produces a *valid, well-formed* SQLSTATE a caller can branch on via
-// SQLGetDiagRec, never a crash or an empty diag queue.
+// posts the result to a handle's diagnostic queue. Server errors get a
+// specific SQLSTATE for the sqlcodes covered by error_map.cpp's mapping
+// table (Phase 4 slice 4); anything not in that table still gets a valid,
+// well-formed fallback (HY000) rather than a crash or an empty diag queue -
+// the table's coverage is necessarily partial (there is no complete public
+// sqlcode/SQLSTATE spec to implement against), not a promise every sqlcode
+// has a precise answer.
 
 #include "driver/handles.h"
 #include "sqli/error.h"

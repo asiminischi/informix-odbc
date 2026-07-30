@@ -194,6 +194,92 @@ bool runNativeTypeTest(SQLHDBC dbc) {
     return ok;
 }
 
+// Verifies Phase 4 slice 4 (see the plan): a malformed query surfaces a
+// sane, specific SQLSTATE (not just a blanket HY000) via SQLGetDiagRec, and
+// out-of-sequence calls (SQLFetch/SQLExecute with no prior SQLPrepare/
+// SQLExecDirect) return a diagnostic instead of crashing - both through the
+// real Driver Manager.
+bool runDiagnosticsTest(SQLHDBC dbc) {
+    bool ok = true;
+    auto expectEq = [&ok](const char* label, bool cond) {
+        std::printf("  [%s] %s\n", cond ? "ok" : "FAIL", label);
+        if (!cond) ok = false;
+    };
+
+    // Malformed query #1: syntax error.
+    {
+        SQLHSTMT stmt = SQL_NULL_HSTMT;
+        SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt);
+        const char* sql = "seelct 1 from systables";
+        SQLRETURN rc = SQLExecDirect(stmt, reinterpret_cast<SQLCHAR*>(const_cast<char*>(sql)), SQL_NTS);
+        expectEq("syntax error returns SQL_ERROR", rc == SQL_ERROR);
+        SQLCHAR sqlState[6] = {};
+        SQLINTEGER nativeError = 0;
+        SQLCHAR message[512] = {};
+        SQLSMALLINT textLength = 0;
+        SQLRETURN diagRc =
+            SQLGetDiagRec(SQL_HANDLE_STMT, stmt, 1, sqlState, &nativeError, message, sizeof(message), &textLength);
+        expectEq("syntax error has a diag record", diagRc == SQL_SUCCESS);
+        std::printf("  syntax error: SQLSTATE=%s native=%d\n", sqlState, static_cast<int>(nativeError));
+        expectEq("syntax error SQLSTATE == 42000", std::strcmp(reinterpret_cast<char*>(sqlState), "42000") == 0);
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+    }
+
+    // Malformed query #2: table not found.
+    {
+        SQLHSTMT stmt = SQL_NULL_HSTMT;
+        SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt);
+        const char* sql = "select 1 from no_such_table_xyz";
+        SQLRETURN rc = SQLExecDirect(stmt, reinterpret_cast<SQLCHAR*>(const_cast<char*>(sql)), SQL_NTS);
+        expectEq("table-not-found returns SQL_ERROR", rc == SQL_ERROR);
+        SQLCHAR sqlState[6] = {};
+        SQLINTEGER nativeError = 0;
+        SQLCHAR message[512] = {};
+        SQLSMALLINT textLength = 0;
+        SQLGetDiagRec(SQL_HANDLE_STMT, stmt, 1, sqlState, &nativeError, message, sizeof(message), &textLength);
+        std::printf("  table not found: SQLSTATE=%s native=%d\n", sqlState, static_cast<int>(nativeError));
+        expectEq("table-not-found SQLSTATE == 42S02", std::strcmp(reinterpret_cast<char*>(sqlState), "42S02") == 0);
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+    }
+
+    // Out-of-sequence: SQLFetch with no prior SQLPrepare/SQLExecute at all.
+    {
+        SQLHSTMT stmt = SQL_NULL_HSTMT;
+        SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt);
+        SQLRETURN rc = SQLFetch(stmt);
+        expectEq("SQLFetch with no prior execute returns SQL_ERROR (not a crash)", rc == SQL_ERROR);
+        SQLCHAR sqlState[6] = {};
+        SQLINTEGER nativeError = 0;
+        SQLCHAR message[512] = {};
+        SQLSMALLINT textLength = 0;
+        SQLRETURN diagRc =
+            SQLGetDiagRec(SQL_HANDLE_STMT, stmt, 1, sqlState, &nativeError, message, sizeof(message), &textLength);
+        expectEq("out-of-sequence SQLFetch has a diag record", diagRc == SQL_SUCCESS);
+        std::printf("  out-of-sequence SQLFetch: SQLSTATE=%s: %s\n", sqlState, message);
+        expectEq("out-of-sequence SQLFetch SQLSTATE == HY010", std::strcmp(reinterpret_cast<char*>(sqlState), "HY010") == 0);
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+    }
+
+    // Out-of-sequence: SQLExecute with no prior SQLPrepare.
+    {
+        SQLHSTMT stmt = SQL_NULL_HSTMT;
+        SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt);
+        SQLRETURN rc = SQLExecute(stmt);
+        expectEq("SQLExecute with no prior prepare returns SQL_ERROR (not a crash)", rc == SQL_ERROR);
+        SQLCHAR sqlState[6] = {};
+        SQLINTEGER nativeError = 0;
+        SQLCHAR message[512] = {};
+        SQLSMALLINT textLength = 0;
+        SQLRETURN diagRc =
+            SQLGetDiagRec(SQL_HANDLE_STMT, stmt, 1, sqlState, &nativeError, message, sizeof(message), &textLength);
+        expectEq("out-of-sequence SQLExecute has a diag record", diagRc == SQL_SUCCESS);
+        expectEq("out-of-sequence SQLExecute SQLSTATE == HY010", std::strcmp(reinterpret_cast<char*>(sqlState), "HY010") == 0);
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+    }
+
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -300,6 +386,10 @@ int main(int argc, char** argv) {
     bool nativeOk = runNativeTypeTest(dbc);
     std::printf("native-type test: %s\n", nativeOk ? "PASS" : "FAIL");
 
+    std::printf("--- Phase 4 slice 4: diagnostics/SQLSTATE hardening ---\n");
+    bool diagOk = runDiagnosticsTest(dbc);
+    std::printf("diagnostics test: %s\n", diagOk ? "PASS" : "FAIL");
+
     rc = SQLDisconnect(dbc);
     std::printf("SQLDisconnect rc=%d\n", static_cast<int>(rc));
     printDiag(SQL_HANDLE_DBC, dbc, "dbc");
@@ -308,5 +398,5 @@ int main(int argc, char** argv) {
     SQLFreeHandle(SQL_HANDLE_ENV, env);
     std::printf("done.\n");
     bool disconnectOk = (rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
-    return (disconnectOk && nativeOk) ? 0 : 1;
+    return (disconnectOk && nativeOk && diagOk) ? 0 : 1;
 }
