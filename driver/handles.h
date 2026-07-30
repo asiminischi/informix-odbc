@@ -114,6 +114,19 @@ struct BoundColumn {
     SQLLEN* strLenOrIndPtr = nullptr;
 };
 
+// One SQLBindParameter() binding for a "?" input parameter. Unlike
+// BoundColumn (an output binding read *from* a fetched row), this is read
+// at SQLExecute time from ParameterValuePtr/StrLenOrIndPtr to build a
+// sqli::BindParam - see driver/convert_native.h's encode-direction
+// helpers.
+struct ParamBinding {
+    SQLSMALLINT valueType = SQL_C_DEFAULT;    // SQL_C_* - how to interpret ParameterValuePtr
+    SQLSMALLINT parameterType = SQL_INTEGER;  // SQL_* - the target Informix wire type
+    SQLPOINTER parameterValuePtr = nullptr;
+    SQLLEN bufferLength = 0;
+    SQLLEN* strLenOrIndPtr = nullptr;
+};
+
 struct OdbcStatement {
     explicit OdbcStatement(OdbcConnection* c) : conn(c) {}
 
@@ -137,6 +150,7 @@ struct OdbcStatement {
 
     StmtState state = StmtState::kUnprepared;
     std::map<SQLUSMALLINT, BoundColumn> boundColumns;
+    std::map<SQLUSMALLINT, ParamBinding> paramBindings;
     // The most recently fetched row's raw per-column byte buffers (as
     // returned by SqliStatement::fetchRow), consulted by SQLGetData for
     // columns that weren't bound via SQLBindCol.

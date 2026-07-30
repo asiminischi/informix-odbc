@@ -4,6 +4,7 @@
 // plan for why native C-type conversions (SQL_C_SLONG, SQL_DATE_STRUCT,
 // etc.) are deliberately deferred to slice 3.
 
+#include "driver/bind_encode.h"
 #include "driver/convert.h"
 #include "driver/convert_native.h"
 #include "driver/error_map.h"
@@ -161,12 +162,58 @@ SQLRETURN doPrepare(OdbcStatement* s, const std::string& sql) {
     return SQL_SUCCESS;
 }
 
+// Reads each bound parameter's current value (from wherever
+// SQLBindParameter pointed - the application may have changed the pointed-
+// to value between binding and this SQLExecute call, which is expected)
+// and encodes it into a sqli::BindParam list ready for SqliStatement::
+// execute(). Returns SQL_ERROR (with a diagnostic already posted) on a
+// count mismatch or an unsupported ValueType/ParameterType pairing.
+std::optional<std::vector<ifxsqli::BindParam>> buildBindParams(OdbcStatement* s) {
+    const std::size_t expected = s->stmt->paramCount();
+    if (expected == 0) return std::vector<ifxsqli::BindParam>{};
+    if (s->paramBindings.size() != expected) {
+        postDriverError(s->diag, "07002",
+                        "COUNT field incorrect: statement has " + std::to_string(expected) +
+                            " parameter marker(s), " + std::to_string(s->paramBindings.size()) + " bound");
+        return std::nullopt;
+    }
+
+    std::vector<ifxsqli::BindParam> params;
+    params.reserve(expected);
+    for (std::size_t i = 1; i <= expected; ++i) {
+        auto it = s->paramBindings.find(static_cast<SQLUSMALLINT>(i));
+        if (it == s->paramBindings.end()) {
+            postDriverError(s->diag, "07002", "parameter #" + std::to_string(i) + " was never bound");
+            return std::nullopt;
+        }
+        const auto& binding = it->second;
+        bool isNull = binding.strLenOrIndPtr && *binding.strLenOrIndPtr == SQL_NULL_DATA;
+        if (isNull) {
+            ifxsqli::BindParam p;
+            p.isNull = true;
+            params.push_back(std::move(p));
+            continue;
+        }
+        auto encoded = encodeBindParam(binding.valueType, binding.parameterType, binding.parameterValuePtr);
+        if (encoded.status != BindEncodeStatus::kOk) {
+            postDriverError(s->diag, "HYC00",
+                            "SQLBindParameter: unsupported ValueType/ParameterType combination for parameter #" +
+                                std::to_string(i));
+            return std::nullopt;
+        }
+        params.push_back(std::move(encoded.param));
+    }
+    return params;
+}
+
 SQLRETURN doExecute(OdbcStatement* s) {
     if (s->state == StmtState::kUnprepared || !s->stmt) {
         postDriverError(s->diag, "HY010", "function sequence error: statement is not prepared");
         return SQL_ERROR;
     }
-    auto result = s->stmt->execute();
+    auto params = buildBindParams(s);
+    if (!params) return SQL_ERROR;
+    auto result = s->stmt->execute(*params);
     if (!result) {
         postSqliError(s->diag, result.error());
         return SQL_ERROR;
@@ -353,6 +400,32 @@ IFXODBC_EXPORT SQLRETURN SQL_API SQLColAttributes(SQLHSTMT hstmt, SQLUSMALLINT i
     return doColAttribute(s, icol, fDescType, rgbDesc, cbDescMax, pcbDesc, pfDesc);
 }
 
+// Phase 5, first slice: only SQL_INTEGER "?" parameters bound as
+// SQL_C_SLONG/SQL_C_LONG/SQL_C_DEFAULT are supported so far - see
+// driver/bind_encode.h for why (proving the SQ_BIND wire plumbing on one
+// type before widening). Values aren't read here at all: SQLBindParameter
+// only records where to read from later (ParameterValuePtr/
+// StrLen_or_IndPtr), matching ODBC's late-binding semantics (the
+// application may change the pointed-to value any number of times before
+// SQLExecute actually reads it) - the same pattern SQLBindCol already uses
+// for output columns.
+IFXODBC_EXPORT SQLRETURN SQL_API SQLBindParameter(SQLHSTMT StatementHandle, SQLUSMALLINT ParameterNumber,
+                                    SQLSMALLINT /*InputOutputType*/, SQLSMALLINT ValueType, SQLSMALLINT ParameterType,
+                                    SQLULEN /*ColumnSize*/, SQLSMALLINT /*DecimalDigits*/, SQLPOINTER ParameterValuePtr,
+                                    SQLLEN /*BufferLength*/, SQLLEN* StrLen_or_IndPtr) {
+    auto* s = static_cast<OdbcStatement*>(StatementHandle);
+    if (!s) return SQL_INVALID_HANDLE;
+    s->diag.clear();
+
+    if (!ParameterValuePtr) {
+        s->paramBindings.erase(ParameterNumber);
+        return SQL_SUCCESS;
+    }
+    s->paramBindings[ParameterNumber] =
+        ParamBinding{ValueType, ParameterType, ParameterValuePtr, 0, StrLen_or_IndPtr};
+    return SQL_SUCCESS;
+}
+
 IFXODBC_EXPORT SQLRETURN SQL_API SQLBindCol(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNumber, SQLSMALLINT TargetType,
                               SQLPOINTER TargetValuePtr, SQLLEN BufferLength, SQLLEN* StrLen_or_IndPtr) {
     auto* s = static_cast<OdbcStatement*>(StatementHandle);
@@ -447,7 +520,8 @@ IFXODBC_EXPORT SQLRETURN SQL_API SQLFreeStmt(SQLHSTMT StatementHandle, SQLUSMALL
             s->boundColumns.clear();
             return SQL_SUCCESS;
         case SQL_RESET_PARAMS:
-            return SQL_SUCCESS; // no bind parameters yet (Phase 5)
+            s->paramBindings.clear();
+            return SQL_SUCCESS;
         case SQL_DROP:
             delete s; // equivalent to SQLFreeHandle(SQL_HANDLE_STMT, ...) per spec
             return SQL_SUCCESS;

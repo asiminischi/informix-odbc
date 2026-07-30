@@ -27,6 +27,18 @@ Int readBigEndian(std::span<const std::byte> raw) {
     return static_cast<Int>(u);
 }
 
+template <class Int>
+std::vector<std::byte> writeBigEndian(Int v) {
+    using Unsigned = std::make_unsigned_t<Int>;
+    auto u = static_cast<Unsigned>(v);
+    std::vector<std::byte> out(sizeof(Int));
+    for (std::size_t i = sizeof(Int); i-- > 0;) {
+        out[i] = static_cast<std::byte>(u & 0xFF);
+        u = static_cast<Unsigned>(u >> 8);
+    }
+    return out;
+}
+
 // The "hundred's complement" transform used for negative DECIMAL mantissas:
 // 99-complement every digit, then add 1 to the rightmost digit, propagating
 // carry leftwards. This is an involution (applying it twice restores the
@@ -54,6 +66,8 @@ std::expected<std::optional<std::int32_t>, Error> decodeInteger(std::span<const 
     if (v == std::numeric_limits<std::int32_t>::min()) return std::nullopt;
     return v;
 }
+
+std::vector<std::byte> encodeInteger(std::int32_t v) { return writeBigEndian<std::int32_t>(v); }
 
 std::expected<std::optional<std::int64_t>, Error> decodeBigInt(std::span<const std::byte> raw) {
     if (raw.size() != 8) return std::unexpected(Error{ErrorKind::Protocol, "BIGINT: expected 8 bytes"});

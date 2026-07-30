@@ -280,6 +280,103 @@ bool runDiagnosticsTest(SQLHDBC dbc) {
     return ok;
 }
 
+// Verifies Phase 5's first slice (see the plan): a single bound SQL_INTEGER
+// "?" parameter round-trips through SQ_BIND, for both the DML branch
+// (INSERT, no cursor) and the SELECT branch (cursor-based) of
+// SqliStatement::execute() - proving the wire plumbing on one type before
+// widening to the rest of the MVP scalar types. Also exercises NULL (via
+// SQL_NULL_DATA) and rebinding the same parameter to a new value between
+// executes (proving SQLBindParameter's late-binding semantics - the value
+// is read fresh from ParameterValuePtr at each SQLExecute, not captured at
+// bind time).
+bool runBindParamTest(SQLHDBC dbc) {
+    bool ok = true;
+    auto expectEq = [&ok](const char* label, bool cond) {
+        std::printf("  [%s] %s\n", cond ? "ok" : "FAIL", label);
+        if (!cond) ok = false;
+    };
+
+    ok &= execDirect(dbc, "drop table if exists bind_probe");
+    ok &= execDirect(dbc, "create table bind_probe (id serial not null, col_integer integer)");
+    if (!ok) {
+        std::printf("[bind] fixture setup failed, aborting bind-parameter test\n");
+        return false;
+    }
+
+    // INSERT with a bound INTEGER parameter (the DML/no-cursor execute()
+    // branch), executed three times with three different bound values -
+    // including a rebind between executes and a NULL - via one prepared
+    // statement handle.
+    SQLHSTMT insStmt = SQL_NULL_HSTMT;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &insStmt);
+    const char* insSql = "insert into bind_probe (col_integer) values (?)";
+    SQLRETURN rc =
+        SQLPrepare(insStmt, reinterpret_cast<SQLCHAR*>(const_cast<char*>(insSql)), SQL_NTS);
+    expectEq("SQLPrepare(insert ... values (?)) succeeds", rc == SQL_SUCCESS);
+
+    SQLINTEGER boundValue = 0;
+    SQLLEN boundInd = 0;
+    rc = SQLBindParameter(insStmt, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &boundValue, 0, &boundInd);
+    expectEq("SQLBindParameter(1, SQL_C_SLONG, SQL_INTEGER) succeeds", rc == SQL_SUCCESS);
+
+    boundValue = 42;
+    boundInd = 0;
+    rc = SQLExecute(insStmt);
+    expectEq("SQLExecute #1 (value=42) succeeds", rc == SQL_SUCCESS);
+    if (rc != SQL_SUCCESS) printDiag(SQL_HANDLE_STMT, insStmt, "insStmt");
+
+    boundValue = -7;
+    boundInd = 0;
+    rc = SQLExecute(insStmt);
+    expectEq("SQLExecute #2 (rebind to -7) succeeds", rc == SQL_SUCCESS);
+
+    boundInd = SQL_NULL_DATA;
+    rc = SQLExecute(insStmt);
+    expectEq("SQLExecute #3 (NULL) succeeds", rc == SQL_SUCCESS);
+
+    SQLFreeHandle(SQL_HANDLE_STMT, insStmt);
+
+    // SELECT with a bound INTEGER parameter in a WHERE clause (the cursor-
+    // based execute() branch), verifying the three rows above round-tripped
+    // correctly.
+    SQLHSTMT selStmt = SQL_NULL_HSTMT;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &selStmt);
+    const char* selSql = "select col_integer from bind_probe where col_integer = ?";
+    rc = SQLPrepare(selStmt, reinterpret_cast<SQLCHAR*>(const_cast<char*>(selSql)), SQL_NTS);
+    expectEq("SQLPrepare(select ... where col_integer = ?) succeeds", rc == SQL_SUCCESS);
+
+    SQLINTEGER whereValue = 42;
+    SQLLEN whereInd = 0;
+    SQLBindParameter(selStmt, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &whereValue, 0, &whereInd);
+
+    SQLINTEGER fetchedValue = 0;
+    SQLLEN fetchedInd = 0;
+    SQLBindCol(selStmt, 1, SQL_C_SLONG, &fetchedValue, 0, &fetchedInd);
+
+    rc = SQLExecute(selStmt);
+    expectEq("SQLExecute(select where col_integer = 42) succeeds", rc == SQL_SUCCESS);
+    rc = SQLFetch(selStmt);
+    expectEq("row found for col_integer = 42", rc == SQL_SUCCESS);
+    expectEq("fetched value == 42", fetchedInd != SQL_NULL_DATA && fetchedValue == 42);
+    rc = SQLFetch(selStmt);
+    expectEq("exactly one row for col_integer = 42", rc == SQL_NO_DATA);
+
+    // Rebind the same parameter to a different value and re-execute the
+    // same prepared statement - proves SQLBindParameter's late-binding
+    // semantics (a fresh SQ_BIND is sent from the pointer's *current*
+    // value, not whatever it held at bind time).
+    whereValue = -7;
+    rc = SQLExecute(selStmt);
+    expectEq("SQLExecute(select where col_integer = -7) succeeds after rebind", rc == SQL_SUCCESS);
+    rc = SQLFetch(selStmt);
+    expectEq("row found for col_integer = -7", rc == SQL_SUCCESS);
+    expectEq("fetched value == -7", fetchedInd != SQL_NULL_DATA && fetchedValue == -7);
+
+    SQLFreeHandle(SQL_HANDLE_STMT, selStmt);
+    execDirect(dbc, "drop table if exists bind_probe");
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -390,6 +487,10 @@ int main(int argc, char** argv) {
     bool diagOk = runDiagnosticsTest(dbc);
     std::printf("diagnostics test: %s\n", diagOk ? "PASS" : "FAIL");
 
+    std::printf("--- Phase 5 slice 1: bind parameters (SQL_INTEGER) ---\n");
+    bool bindOk = runBindParamTest(dbc);
+    std::printf("bind-parameter test: %s\n", bindOk ? "PASS" : "FAIL");
+
     rc = SQLDisconnect(dbc);
     std::printf("SQLDisconnect rc=%d\n", static_cast<int>(rc));
     printDiag(SQL_HANDLE_DBC, dbc, "dbc");
@@ -398,5 +499,5 @@ int main(int argc, char** argv) {
     SQLFreeHandle(SQL_HANDLE_ENV, env);
     std::printf("done.\n");
     bool disconnectOk = (rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
-    return (disconnectOk && nativeOk && diagOk) ? 0 : 1;
+    return (disconnectOk && nativeOk && diagOk && bindOk) ? 0 : 1;
 }

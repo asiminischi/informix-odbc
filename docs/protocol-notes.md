@@ -289,10 +289,24 @@ wide framing" above), `ifxChar2(sql)`, `u16(22)` (SQ_NON_CURSOR_DESCRIBE),
 `u16(7)` (SQ_EXECUTE), `u16(11)` (SQ_RELEASE), `u16(12)` (EOT). Server replies
 with a DESCRIBE (nfields=0 for a non-SELECT), then DONE, then EOT.
 
-**SQ_PREPARE** (`SqliStatement::prepare`): `u16(2)`, numqmarks (u16 or u32 —
-same toggle), `ifxChar2(sql)`, `u16(22)` (SQ_NON_CURSOR_DESCRIBE), `u16(49)`
-(SQ_WANT_DONE), `u16(12)` (EOT). Server replies with a DESCRIBE carrying real
-column metadata, then EOT (statementId comes back inside the DESCRIBE record).
+**SQ_PREPARE** (`SqliStatement::prepare`): `u16(2)`, numqmarks, `ifxChar2(sql)`,
+`u16(22)` (SQ_NON_CURSOR_DESCRIBE), `u16(49)` (SQ_WANT_DONE), `u16(12)` (EOT).
+Server replies with a DESCRIBE carrying metadata, then EOT (statementId comes
+back inside the DESCRIBE record). **numqmarks's exact layout, corrected in
+Phase 5's first bind-parameter slice**: in wide mode this is **two separate
+`u16`s — the real "?" count, then an unused/reserved `u16`** — not one `u32`
+as every earlier phase assumed. Every capture before Phase 5 only ever carried
+numqmarks=0, where "one big-endian u32 zero" (`00 00 00 00`) and "two u16
+zeros" are byte-identical, so the two layouts were indistinguishable until a
+live nonzero count actually exercised the field. Confirmed live: sending
+`u32(1)` (`00 00 00 01`) makes the server read count=0/reserved=1 and then
+block forever waiting for the rest of a message it considers incomplete (no
+error, no EOT — `ss`/`onstat -g ses` on the container showed both sides idle
+with empty send/recv queues, i.e. a true framing-desync deadlock, not a
+crash). Narrow mode is a single `u16`, unaffected. Because a DESCRIBE reply
+for a statement with "?" markers reports those markers back as if they were
+`nfields` (see the next section), this bug was invisible for four phases:
+nothing before Phase 5 ever prepared a statement with a nonzero qmark count.
 
 **SQ_DESCRIBE reply** (S→C, read generically in both `executeCommand` and
 `SqliStatement::processResponseBatch`): `statementType`(u16), `statementId`(u16),
@@ -304,6 +318,23 @@ u16 value packs the base Informix type code in the low byte and a `NOT NULL`
 flag in bit `0x100` (`columns_[i].ifxType = colType & 0xFF`,
 `notNull = colType & 0x100`).
 
+**Important, confirmed live in Phase 5's first bind-parameter slice**:
+`nfields`/the per-field records describe **input parameter placeholders**,
+not output columns, whenever the prepared statement has "?" markers and
+isn't a SELECT (e.g. `insert into t (col) values (?)` reports `nfields=1`,
+matching its one placeholder, even though an INSERT has zero output
+columns). `statementType` is the only reliable discriminator between the
+two meanings — confirmed against the decompiled JDBC driver's
+`IfxStatementTypes` constants (`SQ_SELECT=2`, `SQ_INSERT=6`,
+`SQ_CRETAB=14`, `SQ_DRPTAB=15`, `SQ_UPDATE=4`, all observed live matching
+these values) and its own `statementType == 2` branch in
+`executeStatementQuery`/`executeBatch`. `SqliStatement::columns()` hides
+this internal reuse from every ODBC-facing caller by returning empty
+unless `hasResultSet()` (`statementType == 2`) is true — before this was
+understood, `columns_.empty()` was (wrongly, if only by coincidence -
+nothing before Phase 5 ever prepared a non-SELECT statement with
+parameters) used as the "does this statement have a result set" check.
+
 **SQ_ID / SQ_CURSOR_NAME / SQ_OPEN** (`SqliStatement::execute`, opens a
 cursor — **only for statements with output columns**; see below): `u16(4)`,
 `statementId`(**always u16** — confirmed, not subject to the narrow/wide
@@ -314,17 +345,49 @@ accepted, the server doesn't appear to validate the format. Server replies
 with a bare EOT on success (no DESCRIBE/DONE for a plain open).
 
 **SQ_ID / SQ_EXECUTE, no cursor** (`SqliStatement::execute`'s other branch —
-confirmed live in Phase 4 slice 3): for a prepared statement with *no* output
-columns (DDL/DML — `columns_.empty()` after the DESCRIBE reply), opening a
-cursor at all is wrong, not just unnecessary: `SQ_CURSORNAME`+`SQ_OPEN`
-against a `CREATE`/`DROP TABLE` fails live with sqlcode -363. Send `u16(4)`,
-`statementId`(u16), `u16(7)` (SQ_EXECUTE), `u16(12)` (EOT) instead — no
-cursor name, no open. Server replies with `SQ_DONE` (row count) then EOT.
-Matches the decompiled JDBC driver's own branch in
-`IfxSqli.executeStatementQuery`: only `statementType == 2` (has a result
-set) goes through the cursor-based query path; everything else is a plain
-`SQ_EXECUTE`. `SqliStatement::close()` is correspondingly a no-op when no
-cursor was ever opened this way (there's nothing for `SQ_CLOSE` to close).
+confirmed live in Phase 4 slice 3, corrected in Phase 5): for a prepared
+statement with no result set (`!hasResultSet()`, i.e. `statementType != 2` —
+**not** `columns_.empty()`, see the SQ_DESCRIBE note above for why that's
+wrong once bind parameters are involved), opening a cursor at all is wrong,
+not just unnecessary: `SQ_CURSORNAME`+`SQ_OPEN` against a `CREATE`/`DROP
+TABLE` fails live with sqlcode -363, and against an `INSERT` with a bound
+parameter fails live with a confusing sqlcode -255 ("Not in transaction").
+Send `u16(4)`, `statementId`(u16), then **SQ_BIND if there are parameters**
+(see below), then `u16(7)` (SQ_EXECUTE), `u16(12)` (EOT) — no cursor name,
+no open. Server replies with `SQ_DONE` (row count) then EOT. Matches the
+decompiled JDBC driver's own branch in `IfxSqli.executeStatementQuery`: only
+`statementType == 2` (has a result set) goes through the cursor-based query
+path; everything else is a plain `SQ_EXECUTE`. `SqliStatement::close()` is
+correspondingly a no-op when no cursor was ever opened this way (there's
+nothing for `SQ_CLOSE` to close).
+
+**SQ_BIND** (`SqliStatement::execute`, sent - for both the cursor and
+no-cursor branches - right after `statementId`, only when the statement has
+bound parameters; confirmed live for `SQL_INTEGER`, Phase 5's first slice):
+`u16(5)`, `u16(count)`, then per parameter: `ifxType`(u16), `indicator`(u16:
+`0xFFFF`/-1 for NULL, `0` for a real value). **Only when non-NULL**:
+`precisionField`(u16) then the encoded value bytes, padded to even length
+(same even-alignment rule as every other variable-length field in this
+protocol). A NULL parameter sends nothing beyond the indicator — no
+precision field, no data bytes at all. `precisionField`'s meaning is
+type-specific metadata, **not a byte count** (the byte count is either
+implicit from the fixed type width, or self-embedded in the value's own
+encoding - see below): for INTEGER it's the constant `0x0A00` (confirmed via
+the decompiled JDBC driver's `IfxInteger.getEncodedLength()` - a hardcoded
+`(precision << 8) | 0` value, `10` being INTEGER's max decimal digit count,
+the same `(precision << 8 | scale)`-shaped metadata DESCRIBE uses elsewhere);
+SMALLINT/BIGINT have their own analogous constants (`0x0500`/`0x1300`, not
+yet used live); for DECIMAL it's the value's scale alone (not
+precision-shifted); for DATETIME it's the qualifier (same packed
+`(totalDigits << 8) | qualifierByte` DESCRIBE already uses). Value encoding
+for a non-NULL parameter is **not always the same bytes as the TUPLE-format
+decoders in `sqli/types.h`** — confirmed for INTEGER (identical: plain
+big-endian, fixed 4 bytes) but DECIMAL/DATETIME's BIND encoding additionally
+prepends a 2-byte length (`dec_ndgts + 1`) that the TUPLE format doesn't
+have (per the decompiled `IfxDecimal.convIfx`'s `prependLength` parameter -
+not yet implemented or live-tested, since this slice deliberately proved the
+wire plumbing on INTEGER alone first before widening to the rest of the MVP
+scalar types).
 
 **SQ_RETURN_TYPE + SQ_FETCH** (`SqliStatement::fetchNextBatch`): `u16(4)`,
 `statementId`(u16), then — **only on the first fetch for a given cursor** —

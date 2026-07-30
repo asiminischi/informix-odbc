@@ -104,21 +104,78 @@ std::expected<std::vector<std::vector<std::byte>>, Error> splitRow(std::span<con
     return result;
 }
 
+// SQ_BIND: u16(5), u16(count), then per parameter: u16(ifxType),
+// u16(indicator: -1 = NULL, 0 = has a value), and - only when non-NULL -
+// u16(precisionField) followed by the pre-encoded value bytes (padded to
+// even length, matching every other variable-length field in this
+// protocol). Confirmed against the decompiled JDBC driver's IfxSqli.
+// sendBind: for a NULL parameter, no precision/data fields are sent at
+// all (the indicator alone conveys NULL - encodeInteger et al. are never
+// even asked to produce a "NULL value").
+void writeBindBlock(ByteWriter& w, const std::vector<BindParam>& params) {
+    w.u16(opcode::kBind);
+    w.u16(static_cast<std::uint16_t>(params.size()));
+    for (const auto& p : params) {
+        w.u16(static_cast<std::uint16_t>(p.ifxType));
+        if (p.isNull) {
+            w.u16(static_cast<std::uint16_t>(-1));
+            continue;
+        }
+        w.u16(0);
+        w.u16(p.precisionField);
+        w.bytes(p.data);
+        if (p.data.size() & 1) w.u8(0);
+    }
+}
+
+// Counts "?" parameter markers in `sql`, skipping anything inside single- or
+// double-quoted string literals (so a literal like '?' or a column named
+// "?" - however unlikely - doesn't get miscounted as a bind parameter).
+// Reimplemented from scratch against the documented behavior of the
+// decompiled JDBC driver's own qmark-counting scan (a simple 3-state
+// scanner: normal / single-quoted / double-quoted), not copied from it.
+std::size_t countParamMarkers(const std::string& sql) {
+    std::size_t count = 0;
+    char quote = '\0'; // '\0' = not inside a quoted literal
+    for (char c : sql) {
+        if (quote != '\0') {
+            if (c == quote) quote = '\0';
+            continue;
+        }
+        if (c == '\'' || c == '"') {
+            quote = c;
+        } else if (c == '?') {
+            ++count;
+        }
+    }
+    return count;
+}
+
 } // namespace
 
 std::expected<SqliStatement, Error> SqliStatement::prepare(SqliConnection& conn, const std::string& sql) {
     SqliStatement stmt(conn);
+    stmt.paramCount_ = countParamMarkers(sql);
     auto& sock = conn.transport();
 
     ByteWriter w;
     w.u16(opcode::kPrepare);
-    // numqmarks - Phase 2 MVP has no bind parameters. Width (u16 vs u32)
-    // follows the same negotiated narrow/wide toggle as everywhere else
-    // (confirmed against the golden capture's SQ_PREPARE request).
+    // numqmarks: the real "?" count (confirmed correct via a live bind-
+    // parameter round trip - Phase 5). This field is two separate u16s in
+    // wide mode (count, then a reserved/unused u16), NOT one u32 as
+    // earlier phases assumed - every prior capture only ever carried
+    // numqmarks=0, where "one u32 zero" and "two u16 zeros" are
+    // byte-identical, so the two layouts were indistinguishable until a
+    // live nonzero count actually exercised this field. Confirmed live:
+    // treating it as one u32(1) sends `00 00 00 01`, which the server
+    // reads as count=0/reserved=1 and then blocks forever waiting for the
+    // rest of a message it considers incomplete (see docs/protocol-notes.md's
+    // SQ_BIND section). In narrow mode there's no reserved half at all.
     if (conn.has4ByteOffsets()) {
-        w.u32(0);
-    } else {
+        w.u16(static_cast<std::uint16_t>(stmt.paramCount_));
         w.u16(0);
+    } else {
+        w.u16(static_cast<std::uint16_t>(stmt.paramCount_));
     }
     w.ifxChar2(sql);
     w.u16(opcode::kNonCursorDescribe);
@@ -132,23 +189,28 @@ std::expected<SqliStatement, Error> SqliStatement::prepare(SqliConnection& conn,
     return stmt;
 }
 
-std::expected<void, Error> SqliStatement::execute() {
+std::expected<void, Error> SqliStatement::execute(const std::vector<BindParam>& params) {
     auto& sock = conn_->transport();
 
-    if (columns_.empty()) {
+    if (!hasResultSet()) {
         // Non-SELECT (DDL/DML) prepared statement: no result set means no
-        // cursor to open. Confirmed live: this path previously always sent
-        // SQ_CURSORNAME+SQ_OPEN unconditionally (fine for SELECT, where it's
-        // the only path ever exercised before slice 3's native-type test
-        // added the first DDL/DML round trip through SqliStatement::prepare/
-        // execute rather than SqliConnection::executeCommand) - against a
-        // real server, opening a cursor on a CREATE/DROP TABLE statement
-        // fails (sqlcode -363). Matches the decompiled JDBC driver's own
-        // statementType-based branch: a statement with a result set opens a
-        // cursor, one without just gets SQ_EXECUTE directly.
+        // cursor to open. Confirmed live: this path previously used
+        // columns_.empty() as the discriminator, which is wrong once bind
+        // parameters are involved - DESCRIBE's nfields/per-field records
+        // describe *input parameter* placeholders instead of output
+        // columns for a non-SELECT statement with "?" markers (confirmed
+        // live: a 1-parameter INSERT reports nfields=1), so columns_ is
+        // non-empty here even though there's still no result set. Opening
+        // a cursor on a CREATE/DROP TABLE or INSERT statement fails live
+        // (sqlcode -363, or a confusing "-255 not in transaction" once a
+        // bind parameter is involved) - see hasResultSet()'s doc comment.
+        // Matches the decompiled JDBC driver's own statementType-based
+        // branch: a statement with a result set opens a cursor, one
+        // without just gets SQ_EXECUTE directly.
         ByteWriter w;
         w.u16(opcode::kId);
         w.u16(statementId_);
+        if (!params.empty()) writeBindBlock(w, params);
         w.u16(opcode::kExecute);
         w.u16(opcode::kEot);
         if (auto r = sock.writeAll(w.view()); !r) return std::unexpected(r.error());
@@ -169,6 +231,7 @@ std::expected<void, Error> SqliStatement::execute() {
     ByteWriter w;
     w.u16(opcode::kId);
     w.u16(statementId_);
+    if (!params.empty()) writeBindBlock(w, params);
     w.u16(opcode::kCursorName);
     w.ifxChar2(cursorName_);
     w.u16(opcode::kOpen);

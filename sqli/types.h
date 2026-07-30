@@ -8,6 +8,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace ifxsqli {
 
@@ -45,6 +46,24 @@ struct DatetimeValue {
 [[nodiscard]] std::expected<std::optional<std::int16_t>, Error> decodeSmallInt(std::span<const std::byte> raw);
 [[nodiscard]] std::expected<std::optional<std::int32_t>, Error> decodeInteger(std::span<const std::byte> raw);
 [[nodiscard]] std::expected<std::optional<std::int64_t>, Error> decodeBigInt(std::span<const std::byte> raw);
+
+// Encodes a value for SQ_BIND (a prepared statement's "?" parameters) -
+// confirmed via the decompiled JDBC driver's IfxInteger.toIfx()/
+// JavaToIfxInt: the same plain big-endian two's-complement bytes as the
+// TUPLE-format decoder above (INTEGER is fixed-width either way, unlike
+// DECIMAL/DATETIME - see the SQ_BIND wire notes in docs/protocol-notes.md
+// once added). Unlike decodeInteger's NULL sentinel, SQ_BIND signals NULL
+// via the bind record's own indicator field, never by encoding a value at
+// all - so there's no NULL case here for the caller to handle.
+[[nodiscard]] std::vector<std::byte> encodeInteger(std::int32_t v);
+
+// SQ_BIND's per-parameter "precision" field for INTEGER (confirmed via the
+// decompiled JDBC driver's IfxInteger.getEncodedLength(), a hardcoded
+// constant, not a byte count - see docs/protocol-notes.md's SQ_BIND notes).
+// 0x0A00 = (10 << 8) | 0, i.e. INTEGER's max decimal digit count in the
+// high byte, matching the same (precision << 8 | scale)-shaped metadata
+// DESCRIBE uses elsewhere in this protocol.
+inline constexpr std::uint16_t kIntegerBindPrecision = 0x0A00;
 
 // Fixed-width space-padded CHAR(n). NULL is a leading 0x00 byte (confirmed
 // live); the rest of the buffer is not meaningful in that case. Non-NULL

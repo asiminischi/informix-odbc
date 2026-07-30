@@ -18,6 +18,20 @@ struct ColumnDesc {
     std::uint32_t encodedLength = 0;
 };
 
+// One "?" parameter's already-encoded value, ready for SQ_BIND. Building
+// this (choosing ifxType, encoding `data`, picking `precisionField`) is the
+// driver layer's job (driver/convert_native.h's mirror-image encoder,
+// analogous to formatCellAsText's decode direction) - SqliStatement::execute
+// just serializes whatever it's given. `data` is empty and unused when
+// `isNull` (SQ_BIND signals NULL via the indicator field alone - see
+// encodeInteger's doc comment in sqli/types.h).
+struct BindParam {
+    int ifxType = 0;
+    bool isNull = false;
+    std::vector<std::byte> data;
+    std::uint16_t precisionField = 0;
+};
+
 // One prepared statement's cursor lifecycle: prepare -> execute (opens a
 // cursor) -> repeated fetchRow() -> close -> release. Phase 2 scope: no bind
 // parameters, forward-only cursor, and only the scalar types needed to prove
@@ -28,8 +42,36 @@ class SqliStatement {
 public:
     [[nodiscard]] static std::expected<SqliStatement, Error> prepare(SqliConnection& conn, const std::string& sql);
 
-    [[nodiscard]] const std::vector<ColumnDesc>& columns() const { return columns_; }
+    // Real output columns, for a SELECT-shaped statement only. Confirmed
+    // live (Phase 5, first bind-parameter slice): DESCRIBE's "nfields"/
+    // per-field records describe *input parameter* placeholders instead of
+    // output columns whenever the statement has "?" markers and isn't a
+    // SELECT (e.g. a 1-parameter INSERT reports nfields=1) - so
+    // columns_.empty() alone is not a reliable way to detect "no result
+    // set" once bind parameters are in play (that was true only by
+    // coincidence before this slice, when no non-SELECT statement ever had
+    // parameters to report). This accessor hides that internal storage
+    // reuse from every caller (SQLNumResultCols/SQLDescribeCol/
+    // SQLColAttribute/SQLRowCount) by returning empty unless
+    // hasResultSet().
+    [[nodiscard]] const std::vector<ColumnDesc>& columns() const {
+        static const std::vector<ColumnDesc> kEmpty;
+        return hasResultSet() ? columns_ : kEmpty;
+    }
     [[nodiscard]] int statementType() const { return statementType_; }
+
+    // True for a SELECT (SQ_SELECT, confirmed via the decompiled JDBC
+    // driver's IfxStatementTypes constants against a live DESCRIBE
+    // response) - the only statement shape this driver treats as having a
+    // real result set. See columns()'s doc comment for why this can't be
+    // inferred from columns_.empty() once parameters are involved.
+    [[nodiscard]] bool hasResultSet() const { return statementType_ == 2; }
+
+    // Count of "?" markers found in the SQL text at prepare() time (outside
+    // quoted string literals) - sent as SQ_PREPARE's numqmarks field, and
+    // what the driver layer validates SQLBindParameter/SQLExecute calls
+    // against.
+    [[nodiscard]] std::size_t paramCount() const { return paramCount_; }
 
     // See SqliConnection::lastSerialInserted's doc comment for the same
     // caveat (confirmed live to read back as 0 for a plain INSERT; only
@@ -45,8 +87,11 @@ public:
     // distinction between "has a result set" and "has an update count").
     [[nodiscard]] std::uint32_t rowCount() const { return rowCount_; }
 
-    // Opens the cursor for a SELECT-shaped prepared statement.
-    [[nodiscard]] std::expected<void, Error> execute();
+    // Binds `params` (must match paramCount() in size - the caller, not
+    // this function, is responsible for validating that) via SQ_BIND, then
+    // opens the cursor (SELECT-shaped statements) or runs SQ_EXECUTE
+    // directly (everything else - see the columns_.empty() branch below).
+    [[nodiscard]] std::expected<void, Error> execute(const std::vector<BindParam>& params = {});
 
     // Returns the next row (one raw byte buffer per column, in column
     // order), or nullopt once the cursor is exhausted. Fetches a fresh
@@ -65,6 +110,7 @@ private:
     SqliConnection* conn_;
     int statementType_ = 0;
     std::uint16_t statementId_ = 0;
+    std::size_t paramCount_ = 0;
     std::vector<ColumnDesc> columns_;
     std::string cursorName_;
     bool cursorOpen_ = false;
