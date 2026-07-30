@@ -305,12 +305,26 @@ flag in bit `0x100` (`columns_[i].ifxType = colType & 0xFF`,
 `notNull = colType & 0x100`).
 
 **SQ_ID / SQ_CURSOR_NAME / SQ_OPEN** (`SqliStatement::execute`, opens a
-cursor): `u16(4)`, `statementId`(**always u16** — confirmed, not subject to the
-narrow/wide toggle), `u16(3)`, `ifxChar2(cursorName)`, `u16(6)`, `u16(12)`
-(EOT). Cursor names in this codebase are `"_odbc" + 13-digit zero-padded
-counter`; the real driver uses `"_ifxc" + 11-digit counter` — either scheme
-seems to be accepted, the server doesn't appear to validate the format. Server
-replies with a bare EOT on success (no DESCRIBE/DONE for a plain open).
+cursor — **only for statements with output columns**; see below): `u16(4)`,
+`statementId`(**always u16** — confirmed, not subject to the narrow/wide
+toggle), `u16(3)`, `ifxChar2(cursorName)`, `u16(6)`, `u16(12)` (EOT). Cursor
+names in this codebase are `"_odbc" + 13-digit zero-padded counter`; the real
+driver uses `"_ifxc" + 11-digit counter` — either scheme seems to be
+accepted, the server doesn't appear to validate the format. Server replies
+with a bare EOT on success (no DESCRIBE/DONE for a plain open).
+
+**SQ_ID / SQ_EXECUTE, no cursor** (`SqliStatement::execute`'s other branch —
+confirmed live in Phase 4 slice 3): for a prepared statement with *no* output
+columns (DDL/DML — `columns_.empty()` after the DESCRIBE reply), opening a
+cursor at all is wrong, not just unnecessary: `SQ_CURSORNAME`+`SQ_OPEN`
+against a `CREATE`/`DROP TABLE` fails live with sqlcode -363. Send `u16(4)`,
+`statementId`(u16), `u16(7)` (SQ_EXECUTE), `u16(12)` (EOT) instead — no
+cursor name, no open. Server replies with `SQ_DONE` (row count) then EOT.
+Matches the decompiled JDBC driver's own branch in
+`IfxSqli.executeStatementQuery`: only `statementType == 2` (has a result
+set) goes through the cursor-based query path; everything else is a plain
+`SQ_EXECUTE`. `SqliStatement::close()` is correspondingly a no-op when no
+cursor was ever opened this way (there's nothing for `SQ_CLOSE` to close).
 
 **SQ_RETURN_TYPE + SQ_FETCH** (`SqliStatement::fetchNextBatch`): `u16(4)`,
 `statementId`(u16), then — **only on the first fetch for a given cursor** —

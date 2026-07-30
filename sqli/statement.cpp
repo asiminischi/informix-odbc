@@ -133,13 +133,39 @@ std::expected<SqliStatement, Error> SqliStatement::prepare(SqliConnection& conn,
 }
 
 std::expected<void, Error> SqliStatement::execute() {
+    auto& sock = conn_->transport();
+
+    if (columns_.empty()) {
+        // Non-SELECT (DDL/DML) prepared statement: no result set means no
+        // cursor to open. Confirmed live: this path previously always sent
+        // SQ_CURSORNAME+SQ_OPEN unconditionally (fine for SELECT, where it's
+        // the only path ever exercised before slice 3's native-type test
+        // added the first DDL/DML round trip through SqliStatement::prepare/
+        // execute rather than SqliConnection::executeCommand) - against a
+        // real server, opening a cursor on a CREATE/DROP TABLE statement
+        // fails (sqlcode -363). Matches the decompiled JDBC driver's own
+        // statementType-based branch: a statement with a result set opens a
+        // cursor, one without just gets SQ_EXECUTE directly.
+        ByteWriter w;
+        w.u16(opcode::kId);
+        w.u16(statementId_);
+        w.u16(opcode::kExecute);
+        w.u16(opcode::kEot);
+        if (auto r = sock.writeAll(w.view()); !r) return std::unexpected(r.error());
+
+        auto batch = processResponseBatch();
+        if (!batch) return std::unexpected(batch.error());
+
+        cursorOpen_ = false;
+        return {};
+    }
+
     static std::atomic<std::uint64_t> counter{1};
     std::uint64_t n = counter.fetch_add(1);
     char buf[24];
     std::snprintf(buf, sizeof(buf), "_odbc%013llu", static_cast<unsigned long long>(n));
     cursorName_ = buf;
 
-    auto& sock = conn_->transport();
     ByteWriter w;
     w.u16(opcode::kId);
     w.u16(statementId_);
@@ -210,6 +236,11 @@ std::expected<std::optional<std::vector<std::vector<std::byte>>>, Error> SqliSta
 }
 
 std::expected<void, Error> SqliStatement::close() {
+    // A non-SELECT execute() never opens a cursor (see execute()'s
+    // columns_.empty() branch) - SQ_CLOSE with no matching SQ_OPEN has
+    // nothing to do here and isn't worth a round trip to the server.
+    if (!cursorOpen_) return {};
+
     auto& sock = conn_->transport();
     ByteWriter w;
     w.u16(opcode::kId);
@@ -337,7 +368,9 @@ std::expected<bool, Error> SqliStatement::processResponseBatch() {
             }
             case opcode::kDone: {
                 if (!readU16(sock)) return std::unexpected(Error{ErrorKind::Transport, "read failed (warnings)"});
-                if (!readU32(sock)) return std::unexpected(Error{ErrorKind::Transport, "read failed (row count)"});
+                auto rowCount = readU32(sock);
+                if (!rowCount) return std::unexpected(Error{ErrorKind::Transport, "read failed (row count)"});
+                rowCount_ = *rowCount;
                 if (!readU32(sock)) return std::unexpected(Error{ErrorKind::Transport, "read failed (rowid)"});
                 if (!readU32(sock)) return std::unexpected(Error{ErrorKind::Transport, "read failed (serial id)"});
                 break;

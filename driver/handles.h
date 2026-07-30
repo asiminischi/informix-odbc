@@ -117,6 +117,20 @@ struct BoundColumn {
 struct OdbcStatement {
     explicit OdbcStatement(OdbcConnection* c) : conn(c) {}
 
+    // Releases the server-side statement (SQ_RELEASE) when this handle is
+    // torn down (SQLFreeHandle(SQL_HANDLE_STMT, ...) and
+    // SQLFreeStmt(..., SQL_DROP) both just `delete` this object - neither
+    // called SqliStatement::release() before this destructor existed,
+    // silently leaking every prepared statement's server-side resources
+    // for the lifetime of the connection). Best-effort: a destructor can't
+    // propagate an error, and if the connection has already dropped there
+    // is nothing meaningful left to release anyway.
+    ~OdbcStatement() {
+        if (stmt && conn && conn->connected) {
+            (void)stmt->release();
+        }
+    }
+
     OdbcConnection* conn;
     DiagQueue diag;
     std::optional<ifxsqli::SqliStatement> stmt;

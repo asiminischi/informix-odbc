@@ -37,6 +37,14 @@ public:
     [[nodiscard]] std::optional<std::int64_t> lastSerialInserted() const { return lastSerialInserted_; }
     [[nodiscard]] std::optional<std::int64_t> lastBigSerialInserted() const { return lastBigSerialInserted_; }
 
+    // SQ_DONE's row-count field, refreshed by execute(). Only meaningful for
+    // statements with no output columns (INSERT/UPDATE/DELETE) - for a
+    // SELECT-shaped statement (columns() non-empty), the server's DONE here
+    // is the cursor-open acknowledgement, not a real affected-row count
+    // (mirrors the decompiled JDBC driver's own statementType-based
+    // distinction between "has a result set" and "has an update count").
+    [[nodiscard]] std::uint32_t rowCount() const { return rowCount_; }
+
     // Opens the cursor for a SELECT-shaped prepared statement.
     [[nodiscard]] std::expected<void, Error> execute();
 
@@ -65,6 +73,7 @@ private:
     std::vector<std::vector<std::vector<std::byte>>> pendingRows_;
     std::optional<std::int64_t> lastSerialInserted_;
     std::optional<std::int64_t> lastBigSerialInserted_;
+    std::uint32_t rowCount_ = 0;
 };
 
 } // namespace ifxsqli

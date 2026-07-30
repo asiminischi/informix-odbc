@@ -7,6 +7,7 @@ add_library(ifxodbc SHARED
   info.cpp
   error_map.cpp
   convert.cpp
+  convert_native.cpp
   statement.cpp
   stmt_attr.cpp
 )

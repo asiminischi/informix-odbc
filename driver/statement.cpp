@@ -5,6 +5,7 @@
 // etc.) are deliberately deferred to slice 3.
 
 #include "driver/convert.h"
+#include "driver/convert_native.h"
 #include "driver/error_map.h"
 #include "driver/handles.h"
 #include "sqli/types.h"
@@ -84,6 +85,48 @@ SQLULEN columnSizeFor(const ifxsqli::ColumnDesc& col) {
 
 SQLSMALLINT decimalDigitsFor(const ifxsqli::ColumnDesc& col) {
     return (col.ifxType == ifxsqli::ifxtype::kDecimal) ? static_cast<SQLSMALLINT>(col.encodedLength & 0xFF) : 0;
+}
+
+// Shared by SQLFetch's bound-column loop and SQLGetData: writes one cell to
+// an application buffer per the requested C type, posting whichever
+// diagnostic fits the outcome. SQL_C_CHAR/SQL_C_DEFAULT stays on the
+// existing text path (driver/convert.h); every other supported C type
+// (slice 3) goes through driver/convert_native.h.
+SQLRETURN writeColumnValue(OdbcStatement* s, const ifxsqli::ColumnDesc& col, std::span<const std::byte> raw,
+                           SQLSMALLINT targetType, SQLPOINTER targetValuePtr, SQLLEN bufferLength,
+                           SQLLEN* strLenOrIndPtr) {
+    if (targetType == SQL_C_CHAR || targetType == SQL_C_DEFAULT) {
+        auto cell = formatCellAsText(col, raw);
+        if (!cell) {
+            postSqliError(s->diag, cell.error());
+            return SQL_ERROR;
+        }
+        if (writeCharResult(*cell, targetValuePtr, bufferLength, strLenOrIndPtr)) {
+            postDriverError(s->diag, "01004", "string data, right-truncated");
+            return SQL_SUCCESS_WITH_INFO;
+        }
+        return SQL_SUCCESS;
+    }
+    if (isNativeTargetType(targetType)) {
+        auto r = writeNativeCell(col, raw, targetType, targetValuePtr, bufferLength, strLenOrIndPtr);
+        if (!r) {
+            postSqliError(s->diag, r.error());
+            return SQL_ERROR;
+        }
+        switch (r->status) {
+            case NativeConvertStatus::kOk:
+            case NativeConvertStatus::kNull:
+                return SQL_SUCCESS;
+            case NativeConvertStatus::kOverflow:
+                postDriverError(s->diag, "22003", "numeric value out of range");
+                return SQL_ERROR;
+            case NativeConvertStatus::kUnsupported:
+                postDriverError(s->diag, "07006", "restricted data type attribute violation");
+                return SQL_ERROR;
+        }
+    }
+    postDriverError(s->diag, "HYC00", "unsupported SQLBindCol/SQLGetData C target type");
+    return SQL_ERROR;
 }
 
 } // namespace
@@ -320,11 +363,11 @@ IFXODBC_EXPORT SQLRETURN SQL_API SQLBindCol(SQLHSTMT StatementHandle, SQLUSMALLI
         s->boundColumns.erase(ColumnNumber);
         return SQL_SUCCESS;
     }
-    if (TargetType != SQL_C_CHAR && TargetType != SQL_C_DEFAULT) {
-        postDriverError(s->diag, "HYC00", "SQLBindCol: only SQL_C_CHAR is supported so far (Phase 4 slice 2)");
+    if (TargetType != SQL_C_CHAR && TargetType != SQL_C_DEFAULT && !isNativeTargetType(TargetType)) {
+        postDriverError(s->diag, "HYC00", "SQLBindCol: unsupported C target type");
         return SQL_ERROR;
     }
-    s->boundColumns[ColumnNumber] = BoundColumn{SQL_C_CHAR, TargetValuePtr, BufferLength, StrLen_or_IndPtr};
+    s->boundColumns[ColumnNumber] = BoundColumn{TargetType, TargetValuePtr, BufferLength, StrLen_or_IndPtr};
     return SQL_SUCCESS;
 }
 
@@ -348,24 +391,16 @@ IFXODBC_EXPORT SQLRETURN SQL_API SQLFetch(SQLHSTMT StatementHandle) {
     }
     s->currentRow = std::move(*row);
 
-    bool anyTruncated = false;
+    bool anyInfo = false;
     const auto& cols = s->stmt->columns();
     for (auto& [colNumber, binding] : s->boundColumns) {
         if (colNumber < 1 || colNumber > cols.size()) continue;
-        auto cell = formatCellAsText(cols[colNumber - 1], (*s->currentRow)[colNumber - 1]);
-        if (!cell) {
-            postSqliError(s->diag, cell.error());
-            return SQL_ERROR;
-        }
-        if (writeCharResult(*cell, binding.targetValuePtr, binding.bufferLength, binding.strLenOrIndPtr)) {
-            anyTruncated = true;
-        }
+        SQLRETURN rc = writeColumnValue(s, cols[colNumber - 1], (*s->currentRow)[colNumber - 1], binding.targetType,
+                                         binding.targetValuePtr, binding.bufferLength, binding.strLenOrIndPtr);
+        if (rc == SQL_ERROR) return SQL_ERROR;
+        if (rc == SQL_SUCCESS_WITH_INFO) anyInfo = true;
     }
-    if (anyTruncated) {
-        postDriverError(s->diag, "01004", "string data, right-truncated");
-        return SQL_SUCCESS_WITH_INFO;
-    }
-    return SQL_SUCCESS;
+    return anyInfo ? SQL_SUCCESS_WITH_INFO : SQL_SUCCESS;
 }
 
 IFXODBC_EXPORT SQLRETURN SQL_API SQLGetData(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNumber, SQLSMALLINT TargetType,
@@ -377,8 +412,8 @@ IFXODBC_EXPORT SQLRETURN SQL_API SQLGetData(SQLHSTMT StatementHandle, SQLUSMALLI
         postDriverError(s->diag, "HY010", "function sequence error: no current row (call SQLFetch first)");
         return SQL_ERROR;
     }
-    if (TargetType != SQL_C_CHAR && TargetType != SQL_C_DEFAULT) {
-        postDriverError(s->diag, "HYC00", "SQLGetData: only SQL_C_CHAR is supported so far (Phase 4 slice 2)");
+    if (TargetType != SQL_C_CHAR && TargetType != SQL_C_DEFAULT && !isNativeTargetType(TargetType)) {
+        postDriverError(s->diag, "HYC00", "SQLGetData: unsupported C target type");
         return SQL_ERROR;
     }
     const auto& cols = s->stmt->columns();
@@ -387,16 +422,8 @@ IFXODBC_EXPORT SQLRETURN SQL_API SQLGetData(SQLHSTMT StatementHandle, SQLUSMALLI
         return SQL_ERROR;
     }
 
-    auto cell = formatCellAsText(cols[ColumnNumber - 1], (*s->currentRow)[ColumnNumber - 1]);
-    if (!cell) {
-        postSqliError(s->diag, cell.error());
-        return SQL_ERROR;
-    }
-    if (writeCharResult(*cell, TargetValuePtr, BufferLength, StrLen_or_IndPtr)) {
-        postDriverError(s->diag, "01004", "string data, right-truncated");
-        return SQL_SUCCESS_WITH_INFO;
-    }
-    return SQL_SUCCESS;
+    return writeColumnValue(s, cols[ColumnNumber - 1], (*s->currentRow)[ColumnNumber - 1], TargetType, TargetValuePtr,
+                             BufferLength, StrLen_or_IndPtr);
 }
 
 IFXODBC_EXPORT SQLRETURN SQL_API SQLFreeStmt(SQLHSTMT StatementHandle, SQLUSMALLINT Option) {
@@ -434,11 +461,17 @@ IFXODBC_EXPORT SQLRETURN SQL_API SQLRowCount(SQLHSTMT StatementHandle, SQLLEN* R
     auto* s = static_cast<OdbcStatement*>(StatementHandle);
     if (!s) return SQL_INVALID_HANDLE;
     s->diag.clear();
-    // SELECT row counts aren't known ahead of a full fetch in this
-    // protocol, and DML row counts aren't wired up yet (sqli/statement.cpp
-    // reads but discards SQ_DONE's row-count field - see the plan's Phase 4
-    // slice 3). -1 ("unknown") is spec-compliant for SELECT statements.
-    if (RowCountPtr) *RowCountPtr = -1;
+    if (RowCountPtr) {
+        // A statement with output columns is SELECT-shaped: SQ_DONE's row
+        // count there is the cursor-open acknowledgement, not a real row
+        // count, and ODBC leaves SQLRowCount's value implementation-defined
+        // for SELECT anyway, so -1 ("unknown") is returned. For INSERT/
+        // UPDATE/DELETE (no output columns), sqli/statement.cpp's
+        // SqliStatement::rowCount() carries the real SQ_DONE value.
+        *RowCountPtr = (s->stmt && s->stmt->columns().empty())
+                           ? static_cast<SQLLEN>(s->stmt->rowCount())
+                           : -1;
+    }
     return SQL_SUCCESS;
 }
 

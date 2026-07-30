@@ -16,6 +16,7 @@
 #include <sql.h>
 #include <sqlext.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -34,6 +35,163 @@ void printDiag(SQLSMALLINT handleType, SQLHANDLE handle, const char* context) {
                     message);
         ++rec;
     }
+}
+
+bool execDirect(SQLHDBC dbc, const char* sql) {
+    SQLHSTMT stmt = SQL_NULL_HSTMT;
+    if (SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt) != SQL_SUCCESS) return false;
+    SQLRETURN rc = SQLExecDirect(stmt, reinterpret_cast<SQLCHAR*>(const_cast<char*>(sql)), SQL_NTS);
+    if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
+        std::printf("execDirect(\"%s\") failed rc=%d\n", sql, static_cast<int>(rc));
+        printDiag(SQL_HANDLE_STMT, stmt, "stmt");
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+        return false;
+    }
+    SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+    return true;
+}
+
+// Verifies Phase 4 slice 3 (see the plan): native SQL_C_* conversions
+// (SQL_C_SSHORT/SQL_C_SLONG/SQL_C_SBIGINT/SQL_C_DOUBLE, SQL_DATE_STRUCT,
+// SQL_TIMESTAMP_STRUCT) and real SQLRowCount for an UPDATE, all through the
+// real Driver Manager - not just unit-testing driver/convert_native.cpp in
+// isolation. Reuses the same fixture values as
+// tests/integration/test_type_probe.cpp (positive row, negative row, all-
+// NULL row) so the expected values are already independently confirmed live.
+bool runNativeTypeTest(SQLHDBC dbc) {
+    bool ok = true;
+    ok &= execDirect(dbc, "drop table if exists native_probe");
+    ok &= execDirect(dbc,
+                      "create table native_probe ("
+                      "  id serial not null, col_smallint smallint, col_integer integer,"
+                      "  col_bigint bigint, col_decimal decimal(10,2), col_date date,"
+                      "  col_datetime datetime year to second)");
+    ok &= execDirect(dbc,
+                      "insert into native_probe (col_smallint, col_integer, col_bigint,"
+                      " col_decimal, col_date, col_datetime) values (12345, 1234567890,"
+                      " 123456789012345, 12345.67, DATE('2026-07-29'),"
+                      " DATETIME(2026-07-29 12:34:56) YEAR TO SECOND)");
+    ok &= execDirect(dbc,
+                      "insert into native_probe (col_smallint, col_integer, col_bigint,"
+                      " col_decimal, col_date, col_datetime) values (-12345, -2147483000,"
+                      " -123456789012345, -99.99, DATE('2000-01-01'),"
+                      " DATETIME(2000-01-01 00:00:00) YEAR TO SECOND)");
+    ok &= execDirect(dbc,
+                      "insert into native_probe (col_smallint, col_integer, col_bigint,"
+                      " col_decimal, col_date, col_datetime) values (null, null, null,"
+                      " null, null, null)");
+    if (!ok) {
+        std::printf("[native] fixture setup failed, aborting native-type test\n");
+        return false;
+    }
+
+    SQLHSTMT stmt = SQL_NULL_HSTMT;
+    if (SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt) != SQL_SUCCESS) return false;
+
+    const char* sql =
+        "select col_smallint, col_integer, col_bigint, col_decimal, col_date, col_datetime"
+        " from native_probe order by id";
+    SQLRETURN rc = SQLExecDirect(stmt, reinterpret_cast<SQLCHAR*>(const_cast<char*>(sql)), SQL_NTS);
+    if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
+        std::printf("[native] SQLExecDirect(select) failed rc=%d\n", static_cast<int>(rc));
+        printDiag(SQL_HANDLE_STMT, stmt, "stmt");
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+        return false;
+    }
+
+    SQLSMALLINT smallintVal = 0;
+    SQLLEN smallintInd = 0;
+    SQLINTEGER integerVal = 0;
+    SQLLEN integerInd = 0;
+    SQLBIGINT bigintVal = 0;
+    SQLLEN bigintInd = 0;
+    SQLDOUBLE decimalVal = 0;
+    SQLLEN decimalInd = 0;
+    SQL_DATE_STRUCT dateVal{};
+    SQLLEN dateInd = 0;
+    SQL_TIMESTAMP_STRUCT tsVal{};
+    SQLLEN tsInd = 0;
+
+    SQLBindCol(stmt, 1, SQL_C_SSHORT, &smallintVal, 0, &smallintInd);
+    SQLBindCol(stmt, 2, SQL_C_SLONG, &integerVal, 0, &integerInd);
+    SQLBindCol(stmt, 3, SQL_C_SBIGINT, &bigintVal, 0, &bigintInd);
+    SQLBindCol(stmt, 4, SQL_C_DOUBLE, &decimalVal, 0, &decimalInd);
+    SQLBindCol(stmt, 5, SQL_C_TYPE_DATE, &dateVal, 0, &dateInd);
+    SQLBindCol(stmt, 6, SQL_C_TYPE_TIMESTAMP, &tsVal, 0, &tsInd);
+
+    auto expectEq = [&ok](const char* label, bool cond) {
+        std::printf("  [%s] %s\n", cond ? "ok" : "FAIL", label);
+        if (!cond) ok = false;
+    };
+
+    int rowNum = 0;
+    while ((rc = SQLFetch(stmt)) == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) {
+        ++rowNum;
+        std::printf("native row %d: smallint=%d integer=%d bigint=%lld decimal=%f date=%04d-%02d-%02d"
+                    " ts=%04d-%02d-%02d %02d:%02d:%02d\n",
+                    rowNum, static_cast<int>(smallintVal), static_cast<int>(integerVal),
+                    static_cast<long long>(bigintVal), decimalVal, dateVal.year, dateVal.month, dateVal.day,
+                    tsVal.year, tsVal.month, tsVal.day, tsVal.hour, tsVal.minute, tsVal.second);
+        if (rowNum == 1) {
+            expectEq("row1 smallint == 12345", smallintInd != SQL_NULL_DATA && smallintVal == 12345);
+            expectEq("row1 integer == 1234567890", integerInd != SQL_NULL_DATA && integerVal == 1234567890);
+            expectEq("row1 bigint == 123456789012345", bigintInd != SQL_NULL_DATA && bigintVal == 123456789012345LL);
+            expectEq("row1 decimal ~= 12345.67",
+                      decimalInd != SQL_NULL_DATA && decimalVal > 12345.66 && decimalVal < 12345.68);
+            expectEq("row1 date == 2026-07-29",
+                      dateInd != SQL_NULL_DATA && dateVal.year == 2026 && dateVal.month == 7 && dateVal.day == 29);
+            expectEq("row1 timestamp == 2026-07-29 12:34:56",
+                      tsInd != SQL_NULL_DATA && tsVal.year == 2026 && tsVal.month == 7 && tsVal.day == 29 &&
+                          tsVal.hour == 12 && tsVal.minute == 34 && tsVal.second == 56);
+        } else if (rowNum == 2) {
+            expectEq("row2 smallint == -12345", smallintInd != SQL_NULL_DATA && smallintVal == -12345);
+            expectEq("row2 integer == -2147483000", integerInd != SQL_NULL_DATA && integerVal == -2147483000);
+            expectEq("row2 bigint == -123456789012345",
+                      bigintInd != SQL_NULL_DATA && bigintVal == -123456789012345LL);
+            expectEq("row2 decimal ~= -99.99",
+                      decimalInd != SQL_NULL_DATA && decimalVal > -100.0 && decimalVal < -99.98);
+            expectEq("row2 date == 2000-01-01",
+                      dateInd != SQL_NULL_DATA && dateVal.year == 2000 && dateVal.month == 1 && dateVal.day == 1);
+            expectEq("row2 timestamp == 2000-01-01 00:00:00",
+                      tsInd != SQL_NULL_DATA && tsVal.year == 2000 && tsVal.month == 1 && tsVal.day == 1 &&
+                          tsVal.hour == 0 && tsVal.minute == 0 && tsVal.second == 0);
+        } else if (rowNum == 3) {
+            expectEq("row3 smallint is NULL", smallintInd == SQL_NULL_DATA);
+            expectEq("row3 integer is NULL", integerInd == SQL_NULL_DATA);
+            expectEq("row3 bigint is NULL", bigintInd == SQL_NULL_DATA);
+            expectEq("row3 decimal is NULL", decimalInd == SQL_NULL_DATA);
+            expectEq("row3 date is NULL", dateInd == SQL_NULL_DATA);
+            expectEq("row3 timestamp is NULL", tsInd == SQL_NULL_DATA);
+        } else {
+            expectEq("no unexpected 4th row", false);
+        }
+    }
+    expectEq("SQLFetch loop ended with SQL_NO_DATA", rc == SQL_NO_DATA);
+    expectEq("exactly 3 rows fetched", rowNum == 3);
+    SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+
+    // SQLRowCount: rows 1 and 2 have a non-NULL col_integer, row 3 doesn't -
+    // exactly 2 rows should be reported as updated.
+    SQLHSTMT updStmt = SQL_NULL_HSTMT;
+    if (SQLAllocHandle(SQL_HANDLE_STMT, dbc, &updStmt) == SQL_SUCCESS) {
+        const char* upd = "update native_probe set col_integer = col_integer + 1 where col_integer is not null";
+        rc = SQLExecDirect(updStmt, reinterpret_cast<SQLCHAR*>(const_cast<char*>(upd)), SQL_NTS);
+        if (rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) {
+            SQLLEN rowCount = -99;
+            SQLRowCount(updStmt, &rowCount);
+            expectEq("SQLRowCount after UPDATE == 2", rowCount == 2);
+        } else {
+            std::printf("[native] UPDATE failed rc=%d\n", static_cast<int>(rc));
+            printDiag(SQL_HANDLE_STMT, updStmt, "stmt");
+            ok = false;
+        }
+        SQLFreeHandle(SQL_HANDLE_STMT, updStmt);
+    } else {
+        ok = false;
+    }
+
+    execDirect(dbc, "drop table if exists native_probe");
+    return ok;
 }
 
 } // namespace
@@ -138,6 +296,10 @@ int main(int argc, char** argv) {
         SQLFreeHandle(SQL_HANDLE_STMT, stmt);
     }
 
+    std::printf("--- Phase 4 slice 3: native C-type conversions ---\n");
+    bool nativeOk = runNativeTypeTest(dbc);
+    std::printf("native-type test: %s\n", nativeOk ? "PASS" : "FAIL");
+
     rc = SQLDisconnect(dbc);
     std::printf("SQLDisconnect rc=%d\n", static_cast<int>(rc));
     printDiag(SQL_HANDLE_DBC, dbc, "dbc");
@@ -145,5 +307,6 @@ int main(int argc, char** argv) {
     SQLFreeHandle(SQL_HANDLE_DBC, dbc);
     SQLFreeHandle(SQL_HANDLE_ENV, env);
     std::printf("done.\n");
-    return (rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) ? 0 : 1;
+    bool disconnectOk = (rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+    return (disconnectOk && nativeOk) ? 0 : 1;
 }
