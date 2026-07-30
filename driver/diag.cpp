@@ -27,7 +27,7 @@ DiagQueue* diagQueueFor(SQLSMALLINT handleType, SQLHANDLE handle) {
 
 extern "C" {
 
-SQLRETURN SQL_API SQLGetDiagRec(SQLSMALLINT HandleType, SQLHANDLE Handle, SQLSMALLINT RecNumber, SQLCHAR* SQLState,
+IFXODBC_EXPORT SQLRETURN SQL_API SQLGetDiagRec(SQLSMALLINT HandleType, SQLHANDLE Handle, SQLSMALLINT RecNumber, SQLCHAR* SQLState,
                                  SQLINTEGER* NativeErrorPtr, SQLCHAR* MessageText, SQLSMALLINT BufferLength,
                                  SQLSMALLINT* TextLengthPtr) {
     DiagQueue* diag = diagQueueFor(HandleType, Handle);
@@ -40,7 +40,7 @@ SQLRETURN SQL_API SQLGetDiagRec(SQLSMALLINT HandleType, SQLHANDLE Handle, SQLSMA
 // per-record field support (SQL_DIAG_SQLSTATE, SQL_DIAG_MESSAGE_TEXT, etc.
 // individually rather than via SQLGetDiagRec) is deferred - most ODBC
 // clients, including isql, only use SQLGetDiagRec.
-SQLRETURN SQL_API SQLGetDiagField(SQLSMALLINT HandleType, SQLHANDLE Handle, SQLSMALLINT /*RecNumber*/,
+IFXODBC_EXPORT SQLRETURN SQL_API SQLGetDiagField(SQLSMALLINT HandleType, SQLHANDLE Handle, SQLSMALLINT /*RecNumber*/,
                                    SQLSMALLINT DiagIdentifier, SQLPOINTER DiagInfoPtr, SQLSMALLINT /*BufferLength*/,
                                    SQLSMALLINT* StringLengthPtr) {
     DiagQueue* diag = diagQueueFor(HandleType, Handle);

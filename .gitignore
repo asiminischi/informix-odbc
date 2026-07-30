@@ -5,6 +5,7 @@ jdbc-4.50.10.jar
 
 # Build outputs
 /build/
+/build-linux/
 /out/
 *.obj
 *.o

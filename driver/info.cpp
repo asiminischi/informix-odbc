@@ -42,10 +42,11 @@ void markSupported(SQLUSMALLINT* bitmap, SQLUSMALLINT functionId) {
 
 extern "C" {
 
-SQLRETURN SQL_API SQLGetInfo(SQLHDBC ConnectionHandle, SQLUSMALLINT InfoType, SQLPOINTER InfoValuePtr,
+IFXODBC_EXPORT SQLRETURN SQL_API SQLGetInfo(SQLHDBC ConnectionHandle, SQLUSMALLINT InfoType, SQLPOINTER InfoValuePtr,
                               SQLSMALLINT BufferLength, SQLSMALLINT* StringLengthPtr) {
     auto* conn = static_cast<OdbcConnection*>(ConnectionHandle);
     if (!conn) return SQL_INVALID_HANDLE;
+    conn->diag.clear();
 
     switch (InfoType) {
         case SQL_DRIVER_NAME:
@@ -93,9 +94,10 @@ SQLRETURN SQL_API SQLGetInfo(SQLHDBC ConnectionHandle, SQLUSMALLINT InfoType, SQ
     }
 }
 
-SQLRETURN SQL_API SQLGetFunctions(SQLHDBC ConnectionHandle, SQLUSMALLINT FunctionId, SQLUSMALLINT* SupportedPtr) {
+IFXODBC_EXPORT SQLRETURN SQL_API SQLGetFunctions(SQLHDBC ConnectionHandle, SQLUSMALLINT FunctionId, SQLUSMALLINT* SupportedPtr) {
     auto* conn = static_cast<OdbcConnection*>(ConnectionHandle);
     if (!conn) return SQL_INVALID_HANDLE;
+    conn->diag.clear();
     if (!SupportedPtr) return SQL_ERROR;
 
     // Functions implemented so far (Phase 4 slices 1-2: handle lifetime +
@@ -108,6 +110,7 @@ SQLRETURN SQL_API SQLGetFunctions(SQLHDBC ConnectionHandle, SQLUSMALLINT Functio
         SQL_API_SQLGETDIAGFIELD,    SQL_API_SQLGETINFO,         SQL_API_SQLGETFUNCTIONS,
         SQL_API_SQLPREPARE,         SQL_API_SQLEXECUTE,         SQL_API_SQLEXECDIRECT,
         SQL_API_SQLNUMRESULTCOLS,   SQL_API_SQLDESCRIBECOL,     SQL_API_SQLCOLATTRIBUTE,
+        SQL_API_SQLCOLATTRIBUTES,
         SQL_API_SQLBINDCOL,         SQL_API_SQLFETCH,           SQL_API_SQLGETDATA,
         SQL_API_SQLFREESTMT,        SQL_API_SQLROWCOUNT,        SQL_API_SQLSETSTMTATTR,
         SQL_API_SQLGETSTMTATTR,     SQL_API_SQLCANCEL,

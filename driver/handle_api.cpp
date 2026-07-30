@@ -9,7 +9,7 @@ using namespace ifxodbc;
 
 extern "C" {
 
-SQLRETURN SQL_API SQLAllocHandle(SQLSMALLINT HandleType, SQLHANDLE InputHandle, SQLHANDLE* OutputHandlePtr) {
+IFXODBC_EXPORT SQLRETURN SQL_API SQLAllocHandle(SQLSMALLINT HandleType, SQLHANDLE InputHandle, SQLHANDLE* OutputHandlePtr) {
     if (!OutputHandlePtr) return SQL_INVALID_HANDLE;
 
     switch (HandleType) {
@@ -35,7 +35,7 @@ SQLRETURN SQL_API SQLAllocHandle(SQLSMALLINT HandleType, SQLHANDLE InputHandle, 
     }
 }
 
-SQLRETURN SQL_API SQLFreeHandle(SQLSMALLINT HandleType, SQLHANDLE Handle) {
+IFXODBC_EXPORT SQLRETURN SQL_API SQLFreeHandle(SQLSMALLINT HandleType, SQLHANDLE Handle) {
     if (!Handle) return SQL_INVALID_HANDLE;
     switch (HandleType) {
         case SQL_HANDLE_ENV:

@@ -21,6 +21,24 @@
 #include <sql.h>
 #include <sqlext.h>
 
+// Marks the small, intentional set of ODBC entry points this driver
+// exports. Necessary (not just tidy) on both platforms: on Linux, this
+// driver is dlopen'd by a Driver Manager that is itself a shared object
+// exporting functions with the exact same names (SQLPrepare, SQLExecute,
+// etc.) - without restricting everything else to hidden visibility (set via
+// CMAKE_CXX_VISIBILITY_PRESET in driver/CMakeLists.txt), an internal
+// cross-call between two of this driver's own functions can be silently
+// interposed by the DM's same-named symbol instead of resolving locally
+// (confirmed live - see the comment on doPrepare/doExecute in
+// driver/statement.cpp for the exact failure this caused). On Windows, a
+// DLL exports nothing by default at all unless explicitly marked; without
+// this, none of these functions would be reachable via GetProcAddress.
+#ifdef _WIN32
+#define IFXODBC_EXPORT __declspec(dllexport)
+#else
+#define IFXODBC_EXPORT __attribute__((visibility("default")))
+#endif
+
 #include <cstdint>
 #include <map>
 #include <optional>

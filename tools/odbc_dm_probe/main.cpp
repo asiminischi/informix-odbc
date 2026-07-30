@@ -96,6 +96,48 @@ int main(int argc, char** argv) {
         std::printf("SQLGetInfo(SQL_DBMS_VER) = %s\n", dbmsName);
     }
 
+    SQLHSTMT stmt = SQL_NULL_HSTMT;
+    rc = SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt);
+    std::printf("SQLAllocHandle(STMT) rc=%d\n", static_cast<int>(rc));
+    if (rc == SQL_SUCCESS) {
+        const char* sql = "select tabid, tabname from systables where tabid <= 3";
+        rc = SQLExecDirect(stmt, reinterpret_cast<SQLCHAR*>(const_cast<char*>(sql)), SQL_NTS);
+        std::printf("SQLExecDirect rc=%d\n", static_cast<int>(rc));
+        printDiag(SQL_HANDLE_STMT, stmt, "stmt");
+
+        if (rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) {
+            SQLSMALLINT numCols = 0;
+            SQLNumResultCols(stmt, &numCols);
+            std::printf("SQLNumResultCols = %d\n", static_cast<int>(numCols));
+
+            for (SQLSMALLINT i = 1; i <= numCols; ++i) {
+                SQLCHAR colName[128];
+                SQLSMALLINT colNameLen = 0, dataType = 0, decimalDigits = 0, nullable = 0;
+                SQLULEN colSize = 0;
+                rc = SQLDescribeCol(stmt, static_cast<SQLUSMALLINT>(i), colName, sizeof(colName), &colNameLen,
+                                     &dataType, &colSize, &decimalDigits, &nullable);
+                std::printf("SQLDescribeCol(%d) rc=%d name=\"%s\" nameLen=%d type=%d size=%lu\n", i,
+                            static_cast<int>(rc), colName, static_cast<int>(colNameLen), static_cast<int>(dataType),
+                            static_cast<unsigned long>(colSize));
+            }
+
+            int rowNum = 0;
+            while ((rc = SQLFetch(stmt)) == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) {
+                ++rowNum;
+                std::printf("row %d:", rowNum);
+                for (SQLSMALLINT i = 1; i <= numCols; ++i) {
+                    SQLCHAR buf[256];
+                    SQLLEN ind = 0;
+                    SQLGetData(stmt, static_cast<SQLUSMALLINT>(i), SQL_C_CHAR, buf, sizeof(buf), &ind);
+                    std::printf(" [%s]", ind == SQL_NULL_DATA ? "NULL" : reinterpret_cast<char*>(buf));
+                }
+                std::printf("\n");
+            }
+            std::printf("SQLFetch loop ended rc=%d\n", static_cast<int>(rc));
+        }
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+    }
+
     rc = SQLDisconnect(dbc);
     std::printf("SQLDisconnect rc=%d\n", static_cast<int>(rc));
     printDiag(SQL_HANDLE_DBC, dbc, "dbc");

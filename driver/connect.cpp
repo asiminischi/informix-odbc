@@ -53,10 +53,11 @@ SQLRETURN connectWithAttrs(OdbcConnection& conn, const std::map<std::string, std
 
 extern "C" {
 
-SQLRETURN SQL_API SQLSetEnvAttr(SQLHENV EnvironmentHandle, SQLINTEGER Attribute, SQLPOINTER ValuePtr,
+IFXODBC_EXPORT SQLRETURN SQL_API SQLSetEnvAttr(SQLHENV EnvironmentHandle, SQLINTEGER Attribute, SQLPOINTER ValuePtr,
                                  SQLINTEGER /*StringLength*/) {
     auto* env = static_cast<OdbcEnv*>(EnvironmentHandle);
     if (!env) return SQL_INVALID_HANDLE;
+    env->diag.clear();
 
     if (Attribute == SQL_ATTR_ODBC_VERSION) {
         env->odbcVersion = static_cast<SQLINTEGER>(reinterpret_cast<std::intptr_t>(ValuePtr));
@@ -69,10 +70,11 @@ SQLRETURN SQL_API SQLSetEnvAttr(SQLHENV EnvironmentHandle, SQLINTEGER Attribute,
     return SQL_SUCCESS;
 }
 
-SQLRETURN SQL_API SQLGetEnvAttr(SQLHENV EnvironmentHandle, SQLINTEGER Attribute, SQLPOINTER ValuePtr,
+IFXODBC_EXPORT SQLRETURN SQL_API SQLGetEnvAttr(SQLHENV EnvironmentHandle, SQLINTEGER Attribute, SQLPOINTER ValuePtr,
                                  SQLINTEGER /*BufferLength*/, SQLINTEGER* StringLengthPtr) {
     auto* env = static_cast<OdbcEnv*>(EnvironmentHandle);
     if (!env) return SQL_INVALID_HANDLE;
+    env->diag.clear();
 
     if (Attribute == SQL_ATTR_ODBC_VERSION) {
         if (ValuePtr) *static_cast<SQLINTEGER*>(ValuePtr) = env->odbcVersion;
@@ -82,10 +84,11 @@ SQLRETURN SQL_API SQLGetEnvAttr(SQLHENV EnvironmentHandle, SQLINTEGER Attribute,
     return SQL_ERROR;
 }
 
-SQLRETURN SQL_API SQLSetConnectAttr(SQLHDBC ConnectionHandle, SQLINTEGER Attribute, SQLPOINTER ValuePtr,
+IFXODBC_EXPORT SQLRETURN SQL_API SQLSetConnectAttr(SQLHDBC ConnectionHandle, SQLINTEGER Attribute, SQLPOINTER ValuePtr,
                                      SQLINTEGER /*StringLength*/) {
     auto* conn = static_cast<OdbcConnection*>(ConnectionHandle);
     if (!conn) return SQL_INVALID_HANDLE;
+    conn->diag.clear();
 
     switch (Attribute) {
         case SQL_ATTR_AUTOCOMMIT:
@@ -104,10 +107,11 @@ SQLRETURN SQL_API SQLSetConnectAttr(SQLHDBC ConnectionHandle, SQLINTEGER Attribu
     }
 }
 
-SQLRETURN SQL_API SQLGetConnectAttr(SQLHDBC ConnectionHandle, SQLINTEGER Attribute, SQLPOINTER ValuePtr,
+IFXODBC_EXPORT SQLRETURN SQL_API SQLGetConnectAttr(SQLHDBC ConnectionHandle, SQLINTEGER Attribute, SQLPOINTER ValuePtr,
                                      SQLINTEGER /*BufferLength*/, SQLINTEGER* StringLengthPtr) {
     auto* conn = static_cast<OdbcConnection*>(ConnectionHandle);
     if (!conn) return SQL_INVALID_HANDLE;
+    conn->diag.clear();
 
     switch (Attribute) {
         case SQL_ATTR_AUTOCOMMIT:
@@ -123,12 +127,13 @@ SQLRETURN SQL_API SQLGetConnectAttr(SQLHDBC ConnectionHandle, SQLINTEGER Attribu
     }
 }
 
-SQLRETURN SQL_API SQLDriverConnect(SQLHDBC ConnectionHandle, SQLHWND /*WindowHandle*/, SQLCHAR* InConnectionString,
+IFXODBC_EXPORT SQLRETURN SQL_API SQLDriverConnect(SQLHDBC ConnectionHandle, SQLHWND /*WindowHandle*/, SQLCHAR* InConnectionString,
                                     SQLSMALLINT StringLength1, SQLCHAR* OutConnectionString,
                                     SQLSMALLINT BufferLength, SQLSMALLINT* StringLength2Ptr,
                                     SQLUSMALLINT /*DriverCompletion*/) {
     auto* conn = static_cast<OdbcConnection*>(ConnectionHandle);
     if (!conn) return SQL_INVALID_HANDLE;
+    conn->diag.clear();
     if (!InConnectionString) {
         postDriverError(conn->diag, "HY009", "connection string is null");
         return SQL_ERROR;
@@ -157,11 +162,12 @@ SQLRETURN SQL_API SQLDriverConnect(SQLHDBC ConnectionHandle, SQLHWND /*WindowHan
     return SQL_SUCCESS;
 }
 
-SQLRETURN SQL_API SQLConnect(SQLHDBC ConnectionHandle, SQLCHAR* ServerName, SQLSMALLINT /*NameLength1*/,
+IFXODBC_EXPORT SQLRETURN SQL_API SQLConnect(SQLHDBC ConnectionHandle, SQLCHAR* ServerName, SQLSMALLINT /*NameLength1*/,
                               SQLCHAR* UserName, SQLSMALLINT /*NameLength2*/, SQLCHAR* Authentication,
                               SQLSMALLINT /*NameLength3*/) {
     auto* conn = static_cast<OdbcConnection*>(ConnectionHandle);
     if (!conn) return SQL_INVALID_HANDLE;
+    conn->diag.clear();
 
     // DSN-based connect (odbc.ini lookup via SQLGetPrivateProfileString) is
     // not implemented yet - this driver's MVP path is SQLDriverConnect's
@@ -176,9 +182,10 @@ SQLRETURN SQL_API SQLConnect(SQLHDBC ConnectionHandle, SQLCHAR* ServerName, SQLS
     return SQL_ERROR;
 }
 
-SQLRETURN SQL_API SQLDisconnect(SQLHDBC ConnectionHandle) {
+IFXODBC_EXPORT SQLRETURN SQL_API SQLDisconnect(SQLHDBC ConnectionHandle) {
     auto* conn = static_cast<OdbcConnection*>(ConnectionHandle);
     if (!conn) return SQL_INVALID_HANDLE;
+    conn->diag.clear();
     if (!conn->connected || !conn->sqli) {
         postDriverError(conn->diag, "08003", "connection not open");
         return SQL_ERROR;

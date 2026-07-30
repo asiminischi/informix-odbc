@@ -10,6 +10,7 @@
 #include "sqli/types.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 using namespace ifxodbc;
@@ -87,17 +88,26 @@ SQLSMALLINT decimalDigitsFor(const ifxsqli::ColumnDesc& col) {
 
 } // namespace
 
-extern "C" {
+namespace {
 
-SQLRETURN SQL_API SQLPrepare(SQLHSTMT StatementHandle, SQLCHAR* StatementText, SQLINTEGER TextLength) {
-    auto* s = static_cast<OdbcStatement*>(StatementHandle);
-    if (!s) return SQL_INVALID_HANDLE;
+// SQLExecDirect is implemented as prepare-then-execute, but it must NOT do
+// so by calling the exported SQLPrepare/SQLExecute symbols by name: on ELF
+// platforms, a same-named default-visibility symbol in another loaded
+// shared object (unixODBC's own libodbc.so, which - being a Driver
+// Manager - also exports functions literally named SQLPrepare/SQLExecute/
+// etc.) can interpose on the call, silently redirecting it to the DM's
+// version instead of this driver's own. Confirmed live: an earlier version
+// of this function called SQLPrepare(...)/SQLExecute(...) directly and
+// SQLExecDirect returned SQL_INVALID_HANDLE (-2) every time - the DM's
+// SQLPrepare doesn't understand this driver's raw OdbcStatement* handles.
+// Routing all three entry points through these internal (non-exported)
+// helpers instead sidesteps the whole class of bug.
+SQLRETURN doPrepare(OdbcStatement* s, const std::string& sql) {
     if (!s->conn->connected) {
         postDriverError(s->diag, "08003", "connection is not open");
         return SQL_ERROR;
     }
-
-    auto result = ifxsqli::SqliStatement::prepare(*s->conn->sqli, toStdString(StatementText, TextLength));
+    auto result = ifxsqli::SqliStatement::prepare(*s->conn->sqli, sql);
     if (!result) {
         postSqliError(s->diag, result.error());
         return SQL_ERROR;
@@ -108,14 +118,11 @@ SQLRETURN SQL_API SQLPrepare(SQLHSTMT StatementHandle, SQLCHAR* StatementText, S
     return SQL_SUCCESS;
 }
 
-SQLRETURN SQL_API SQLExecute(SQLHSTMT StatementHandle) {
-    auto* s = static_cast<OdbcStatement*>(StatementHandle);
-    if (!s) return SQL_INVALID_HANDLE;
+SQLRETURN doExecute(OdbcStatement* s) {
     if (s->state == StmtState::kUnprepared || !s->stmt) {
         postDriverError(s->diag, "HY010", "function sequence error: statement is not prepared");
         return SQL_ERROR;
     }
-
     auto result = s->stmt->execute();
     if (!result) {
         postSqliError(s->diag, result.error());
@@ -126,15 +133,37 @@ SQLRETURN SQL_API SQLExecute(SQLHSTMT StatementHandle) {
     return SQL_SUCCESS;
 }
 
-SQLRETURN SQL_API SQLExecDirect(SQLHSTMT StatementHandle, SQLCHAR* StatementText, SQLINTEGER TextLength) {
-    SQLRETURN rc = SQLPrepare(StatementHandle, StatementText, TextLength);
-    if (rc != SQL_SUCCESS) return rc;
-    return SQLExecute(StatementHandle);
-}
+} // namespace
 
-SQLRETURN SQL_API SQLNumResultCols(SQLHSTMT StatementHandle, SQLSMALLINT* ColumnCountPtr) {
+extern "C" {
+
+IFXODBC_EXPORT SQLRETURN SQL_API SQLPrepare(SQLHSTMT StatementHandle, SQLCHAR* StatementText, SQLINTEGER TextLength) {
     auto* s = static_cast<OdbcStatement*>(StatementHandle);
     if (!s) return SQL_INVALID_HANDLE;
+    s->diag.clear();
+    return doPrepare(s, toStdString(StatementText, TextLength));
+}
+
+IFXODBC_EXPORT SQLRETURN SQL_API SQLExecute(SQLHSTMT StatementHandle) {
+    auto* s = static_cast<OdbcStatement*>(StatementHandle);
+    if (!s) return SQL_INVALID_HANDLE;
+    s->diag.clear();
+    return doExecute(s);
+}
+
+IFXODBC_EXPORT SQLRETURN SQL_API SQLExecDirect(SQLHSTMT StatementHandle, SQLCHAR* StatementText, SQLINTEGER TextLength) {
+    auto* s = static_cast<OdbcStatement*>(StatementHandle);
+    if (!s) return SQL_INVALID_HANDLE;
+    s->diag.clear();
+    SQLRETURN rc = doPrepare(s, toStdString(StatementText, TextLength));
+    if (rc != SQL_SUCCESS) return rc;
+    return doExecute(s);
+}
+
+IFXODBC_EXPORT SQLRETURN SQL_API SQLNumResultCols(SQLHSTMT StatementHandle, SQLSMALLINT* ColumnCountPtr) {
+    auto* s = static_cast<OdbcStatement*>(StatementHandle);
+    if (!s) return SQL_INVALID_HANDLE;
+    s->diag.clear();
     if (!s->stmt) {
         postDriverError(s->diag, "HY010", "function sequence error: statement is not prepared");
         return SQL_ERROR;
@@ -143,11 +172,12 @@ SQLRETURN SQL_API SQLNumResultCols(SQLHSTMT StatementHandle, SQLSMALLINT* Column
     return SQL_SUCCESS;
 }
 
-SQLRETURN SQL_API SQLDescribeCol(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNumber, SQLCHAR* ColumnName,
+IFXODBC_EXPORT SQLRETURN SQL_API SQLDescribeCol(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNumber, SQLCHAR* ColumnName,
                                   SQLSMALLINT BufferLength, SQLSMALLINT* NameLengthPtr, SQLSMALLINT* DataTypePtr,
                                   SQLULEN* ColumnSizePtr, SQLSMALLINT* DecimalDigitsPtr, SQLSMALLINT* NullablePtr) {
     auto* s = static_cast<OdbcStatement*>(StatementHandle);
     if (!s) return SQL_INVALID_HANDLE;
+    s->diag.clear();
     if (!s->stmt) {
         postDriverError(s->diag, "HY010", "function sequence error: statement is not prepared");
         return SQL_ERROR;
@@ -176,11 +206,19 @@ SQLRETURN SQL_API SQLDescribeCol(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNu
     return SQL_SUCCESS;
 }
 
-SQLRETURN SQL_API SQLColAttribute(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNumber, SQLUSMALLINT FieldIdentifier,
-                                   SQLPOINTER CharacterAttributePtr, SQLSMALLINT BufferLength,
-                                   SQLSMALLINT* StringLengthPtr, SQLLEN* NumericAttributePtr) {
-    auto* s = static_cast<OdbcStatement*>(StatementHandle);
-    if (!s) return SQL_INVALID_HANDLE;
+namespace {
+
+// Shared by SQLColAttribute (ODBC3) and SQLColAttributes (the ODBC2 legacy
+// name some clients - isql included - still call; same parameter shapes,
+// and the field-identifier constants used here are the ones common to
+// both). Kept as an internal (non-exported) helper for the same reason
+// doPrepare/doExecute are: an exported function calling another exported
+// same-named symbol risks ELF interposition from the Driver Manager's own
+// same-named export - see that comment for the concrete failure this
+// caused elsewhere in this file.
+SQLRETURN doColAttribute(OdbcStatement* s, SQLUSMALLINT ColumnNumber, SQLUSMALLINT FieldIdentifier,
+                          SQLPOINTER CharacterAttributePtr, SQLSMALLINT BufferLength, SQLSMALLINT* StringLengthPtr,
+                          SQLLEN* NumericAttributePtr) {
     if (!s->stmt) {
         postDriverError(s->diag, "HY010", "function sequence error: statement is not prepared");
         return SQL_ERROR;
@@ -231,10 +269,38 @@ SQLRETURN SQL_API SQLColAttribute(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnN
     }
 }
 
-SQLRETURN SQL_API SQLBindCol(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNumber, SQLSMALLINT TargetType,
+} // namespace
+
+IFXODBC_EXPORT SQLRETURN SQL_API SQLColAttribute(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNumber, SQLUSMALLINT FieldIdentifier,
+                                   SQLPOINTER CharacterAttributePtr, SQLSMALLINT BufferLength,
+                                   SQLSMALLINT* StringLengthPtr, SQLLEN* NumericAttributePtr) {
+    auto* s = static_cast<OdbcStatement*>(StatementHandle);
+    if (!s) return SQL_INVALID_HANDLE;
+    s->diag.clear();
+    return doColAttribute(s, ColumnNumber, FieldIdentifier, CharacterAttributePtr, BufferLength, StringLengthPtr,
+                          NumericAttributePtr);
+}
+
+// ODBC 2.x legacy name for the same function, same parameter shapes except
+// pfDesc is a plain SQLLEN* on this SDK (matching NumericAttributePtr
+// exactly) - still called by some clients (confirmed: isql prints blank
+// column headers without this, even though SQLDescribeCol/SQLColAttribute
+// both return the correct name when called directly - see
+// tools/odbc_dm_probe, which exercises SQLDescribeCol successfully).
+IFXODBC_EXPORT SQLRETURN SQL_API SQLColAttributes(SQLHSTMT hstmt, SQLUSMALLINT icol, SQLUSMALLINT fDescType,
+                                    SQLPOINTER rgbDesc, SQLSMALLINT cbDescMax, SQLSMALLINT* pcbDesc,
+                                    SQLLEN* pfDesc) {
+    auto* s = static_cast<OdbcStatement*>(hstmt);
+    if (!s) return SQL_INVALID_HANDLE;
+    s->diag.clear();
+    return doColAttribute(s, icol, fDescType, rgbDesc, cbDescMax, pcbDesc, pfDesc);
+}
+
+IFXODBC_EXPORT SQLRETURN SQL_API SQLBindCol(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNumber, SQLSMALLINT TargetType,
                               SQLPOINTER TargetValuePtr, SQLLEN BufferLength, SQLLEN* StrLen_or_IndPtr) {
     auto* s = static_cast<OdbcStatement*>(StatementHandle);
     if (!s) return SQL_INVALID_HANDLE;
+    s->diag.clear();
 
     if (!TargetValuePtr) {
         s->boundColumns.erase(ColumnNumber);
@@ -248,9 +314,10 @@ SQLRETURN SQL_API SQLBindCol(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNumber
     return SQL_SUCCESS;
 }
 
-SQLRETURN SQL_API SQLFetch(SQLHSTMT StatementHandle) {
+IFXODBC_EXPORT SQLRETURN SQL_API SQLFetch(SQLHSTMT StatementHandle) {
     auto* s = static_cast<OdbcStatement*>(StatementHandle);
     if (!s) return SQL_INVALID_HANDLE;
+    s->diag.clear();
     if (s->state != StmtState::kExecuted || !s->stmt) {
         postDriverError(s->diag, "HY010", "function sequence error: statement is not executed");
         return SQL_ERROR;
@@ -287,10 +354,11 @@ SQLRETURN SQL_API SQLFetch(SQLHSTMT StatementHandle) {
     return SQL_SUCCESS;
 }
 
-SQLRETURN SQL_API SQLGetData(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNumber, SQLSMALLINT TargetType,
+IFXODBC_EXPORT SQLRETURN SQL_API SQLGetData(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNumber, SQLSMALLINT TargetType,
                               SQLPOINTER TargetValuePtr, SQLLEN BufferLength, SQLLEN* StrLen_or_IndPtr) {
     auto* s = static_cast<OdbcStatement*>(StatementHandle);
     if (!s) return SQL_INVALID_HANDLE;
+    s->diag.clear();
     if (!s->currentRow) {
         postDriverError(s->diag, "HY010", "function sequence error: no current row (call SQLFetch first)");
         return SQL_ERROR;
@@ -317,9 +385,10 @@ SQLRETURN SQL_API SQLGetData(SQLHSTMT StatementHandle, SQLUSMALLINT ColumnNumber
     return SQL_SUCCESS;
 }
 
-SQLRETURN SQL_API SQLFreeStmt(SQLHSTMT StatementHandle, SQLUSMALLINT Option) {
+IFXODBC_EXPORT SQLRETURN SQL_API SQLFreeStmt(SQLHSTMT StatementHandle, SQLUSMALLINT Option) {
     auto* s = static_cast<OdbcStatement*>(StatementHandle);
     if (!s) return SQL_INVALID_HANDLE;
+    s->diag.clear();
 
     switch (Option) {
         case SQL_CLOSE:
@@ -347,9 +416,10 @@ SQLRETURN SQL_API SQLFreeStmt(SQLHSTMT StatementHandle, SQLUSMALLINT Option) {
     }
 }
 
-SQLRETURN SQL_API SQLRowCount(SQLHSTMT StatementHandle, SQLLEN* RowCountPtr) {
+IFXODBC_EXPORT SQLRETURN SQL_API SQLRowCount(SQLHSTMT StatementHandle, SQLLEN* RowCountPtr) {
     auto* s = static_cast<OdbcStatement*>(StatementHandle);
     if (!s) return SQL_INVALID_HANDLE;
+    s->diag.clear();
     // SELECT row counts aren't known ahead of a full fetch in this
     // protocol, and DML row counts aren't wired up yet (sqli/statement.cpp
     // reads but discards SQ_DONE's row-count field - see the plan's Phase 4

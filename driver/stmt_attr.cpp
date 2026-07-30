@@ -12,17 +12,19 @@ using namespace ifxodbc;
 
 extern "C" {
 
-SQLRETURN SQL_API SQLSetStmtAttr(SQLHSTMT StatementHandle, SQLINTEGER /*Attribute*/, SQLPOINTER /*ValuePtr*/,
+IFXODBC_EXPORT SQLRETURN SQL_API SQLSetStmtAttr(SQLHSTMT StatementHandle, SQLINTEGER /*Attribute*/, SQLPOINTER /*ValuePtr*/,
                                   SQLINTEGER /*StringLength*/) {
     auto* s = static_cast<OdbcStatement*>(StatementHandle);
     if (!s) return SQL_INVALID_HANDLE;
+    s->diag.clear();
     return SQL_SUCCESS;
 }
 
-SQLRETURN SQL_API SQLGetStmtAttr(SQLHSTMT StatementHandle, SQLINTEGER Attribute, SQLPOINTER ValuePtr,
+IFXODBC_EXPORT SQLRETURN SQL_API SQLGetStmtAttr(SQLHSTMT StatementHandle, SQLINTEGER Attribute, SQLPOINTER ValuePtr,
                                   SQLINTEGER /*BufferLength*/, SQLINTEGER* StringLengthPtr) {
     auto* s = static_cast<OdbcStatement*>(StatementHandle);
     if (!s) return SQL_INVALID_HANDLE;
+    s->diag.clear();
 
     // The two attributes worth a real answer even before slice 3's fuller
     // attribute support: cursor type and row array size, both fixed at
@@ -41,7 +43,7 @@ SQLRETURN SQL_API SQLGetStmtAttr(SQLHSTMT StatementHandle, SQLINTEGER Attribute,
     }
 }
 
-SQLRETURN SQL_API SQLCancel(SQLHSTMT StatementHandle) {
+IFXODBC_EXPORT SQLRETURN SQL_API SQLCancel(SQLHSTMT StatementHandle) {
     // No asynchronous execution or separate cancel thread exists yet -
     // accepted as a no-op success, since this driver's calls are already
     // synchronous/blocking by the time SQLCancel could plausibly be called.
