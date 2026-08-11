@@ -386,13 +386,13 @@ bytes at all.
   TUPLE-format decoders in `sqli/types.h`, confirmed identical for all
   three by live round-trip (encode → SQ_BIND → server storage → plain
   SELECT → decode, matching the original value exactly).
-- **CHAR**: not yet implemented, but traced via the decompiled
-  `IfxChar.toIfx()` → `JavaToIfxChar`: the value bytes are **self-describing**
-  (`u16` length + raw bytes, the same shape as this protocol's own
-  `ifxChar2`), so `precisionField` there is metadata the server presumably
-  validates against the declared column width, not framing the client needs
-  to get exactly right to avoid a desync; still needs a live check before
-  relying on that read.
+- **CHAR**: confirmed live (`tests/integration/test_bind.cpp`). Traced via
+  the decompiled `IfxChar.toIfx()` → `JavaToIfxChar`: the value bytes are
+  **self-describing** (`u16` length + raw bytes, the same shape as this
+  protocol's own `ifxChar2`). Confirmed empirically that `precisionField`
+  can just be the string's own length - the server does not require it to
+  match the target column's declared width (a 10-byte value bound into a
+  `CHAR(20)` column round-tripped correctly with `precisionField=10`).
 - **VARCHAR**: not yet implemented, but traced via `JavaToIfxVarChar(s,
   dbEnc, leng, usestrenc)`: the encoded buffer is **fixed at `leng + 1`
   bytes** (`leng` being the *declared target column width*, not derived

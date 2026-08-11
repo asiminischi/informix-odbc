@@ -104,21 +104,24 @@ Roughly in the order they'd bite a real application:
    clients (BI tools, admin GUIs, even some ORM schema-introspection code)
    need at least `SQLTables`/`SQLColumns` to do anything beyond a
    hand-typed query.
-3. **Bind parameters cover 3 of 8 MVP types.** `SQL_INTEGER`/`SQL_SMALLINT`/
-   `SQL_BIGINT` are done and confirmed live (`tests/integration/test_bind.cpp`)
-   - all three use the same plain big-endian encoding as the fetch direction
-   and a hardcoded SQ_BIND precision field, so no column metadata was needed.
-   CHAR/VARCHAR/DATE are NOT the same straightforward extension this used to
-   say: tracing the decompiled JDBC reference shows their SQ_BIND precision
-   field comes from the target column's DESCRIBE-reported width, not a
-   constant - VARCHAR's encoded buffer size is fixed at that declared width
-   (`leng + 1` bytes) rather than derived from the actual string length, so a
-   wrong value there is a wire-framing bug, not just a validation nicety.
-   `driver/bind_encode.cpp`'s `encodeBindParam` currently discards
-   `SQLBindParameter`'s `ColumnSize`/`DecimalDigits` - that will need
-   threading through for these three. DECIMAL/DATETIME still need their own
-   encoders since their BIND wire format differs from their fetch format
-   (documented in `docs/protocol-notes.md`).
+3. **Bind parameters cover 4 of 8 MVP types.** `SQL_INTEGER`/`SQL_SMALLINT`/
+   `SQL_BIGINT`/`SQL_CHAR` are done and confirmed live
+   (`tests/integration/test_bind.cpp`). The integer types use the same plain
+   big-endian encoding as the fetch direction and a hardcoded SQ_BIND
+   precision field; CHAR's value bytes are self-describing (a length prefix
+   inside the data itself) and confirmed live to need no column metadata
+   either - a value shorter than the target column's declared width
+   round-trips fine with `precisionField` set to just the value's own length.
+   VARCHAR/DATE are NOT the same straightforward extension this used to
+   say: tracing the decompiled JDBC reference shows VARCHAR's encoded
+   buffer size is fixed at the target column's DESCRIBE-reported declared
+   width (`leng + 1` bytes) rather than derived from the actual string
+   length, so a wrong value there is a wire-framing bug, not just a
+   validation nicety - this needs `SQLBindParameter`'s `ColumnSize`, which
+   `driver/bind_encode.cpp`'s `encodeBindParam` currently discards. DATE's
+   precision-field requirement is untraced. DECIMAL/DATETIME still need
+   their own encoders since their BIND wire format differs from their fetch
+   format (documented in `docs/protocol-notes.md`).
 4. **No DSN-based connect (`SQLConnect`).** Only `SQLDriverConnect` with an
    explicit keyword string works today. Fine for `isql -k`, but many
    GUI/ODBC-Admin tools default to the DSN path.

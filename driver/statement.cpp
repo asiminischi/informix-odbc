@@ -194,7 +194,8 @@ std::optional<std::vector<ifxsqli::BindParam>> buildBindParams(OdbcStatement* s)
             params.push_back(std::move(p));
             continue;
         }
-        auto encoded = encodeBindParam(binding.valueType, binding.parameterType, binding.parameterValuePtr);
+        SQLLEN strLenOrInd = binding.strLenOrIndPtr ? *binding.strLenOrIndPtr : SQL_NTS;
+        auto encoded = encodeBindParam(binding.valueType, binding.parameterType, binding.parameterValuePtr, strLenOrInd);
         if (encoded.status != BindEncodeStatus::kOk) {
             postDriverError(s->diag, "HYC00",
                             "SQLBindParameter: unsupported ValueType/ParameterType combination for parameter #" +
@@ -400,15 +401,17 @@ IFXODBC_EXPORT SQLRETURN SQL_API SQLColAttributes(SQLHSTMT hstmt, SQLUSMALLINT i
     return doColAttribute(s, icol, fDescType, rgbDesc, cbDescMax, pcbDesc, pfDesc);
 }
 
-// Phase 5, first slice: only SQL_INTEGER "?" parameters bound as
-// SQL_C_SLONG/SQL_C_LONG/SQL_C_DEFAULT are supported so far - see
-// driver/bind_encode.h for why (proving the SQ_BIND wire plumbing on one
-// type before widening). Values aren't read here at all: SQLBindParameter
-// only records where to read from later (ParameterValuePtr/
-// StrLen_or_IndPtr), matching ODBC's late-binding semantics (the
-// application may change the pointed-to value any number of times before
-// SQLExecute actually reads it) - the same pattern SQLBindCol already uses
-// for output columns.
+// Phase 5: SQL_INTEGER/SQL_SMALLINT/SQL_BIGINT/SQL_CHAR "?" parameters are
+// supported so far - see driver/bind_encode.h for what's still missing
+// (VARCHAR/DATE/DECIMAL/DATETIME). Values aren't read here at all:
+// SQLBindParameter only records where to read from later
+// (ParameterValuePtr/StrLen_or_IndPtr), matching ODBC's late-binding
+// semantics (the application may change the pointed-to value any number of
+// times before SQLExecute actually reads it) - the same pattern
+// SQLBindCol already uses for output columns. ColumnSize/DecimalDigits are
+// still unused - CHAR's SQ_BIND framing is self-describing so this driver
+// currently doesn't need them (see sqli/types.h's encodeChar), but VARCHAR
+// will (see docs/protocol-notes.md's SQ_BIND notes).
 IFXODBC_EXPORT SQLRETURN SQL_API SQLBindParameter(SQLHSTMT StatementHandle, SQLUSMALLINT ParameterNumber,
                                     SQLSMALLINT /*InputOutputType*/, SQLSMALLINT ValueType, SQLSMALLINT ParameterType,
                                     SQLULEN /*ColumnSize*/, SQLSMALLINT /*DecimalDigits*/, SQLPOINTER ParameterValuePtr,

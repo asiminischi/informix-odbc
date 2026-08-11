@@ -1,18 +1,17 @@
 #pragma once
 
-// Phase 5, first slice: encodes an application's bound "?" parameter value
-// (SQLBindParameter's ValueType/ParameterType + a live pointer into the
-// caller's buffer) into a sqli::BindParam ready for SQ_BIND. The mirror
-// image of driver/convert_native.h's decode direction, but deliberately its
-// own module rather than added there: convert_native.h existing functions
-// all take an already-fetched column's raw bytes and a ColumnDesc; encoding
-// starts from an ODBC C value and has no column metadata to consult at all
-// (a "?" marker's Informix-side type comes from SQLBindParameter's
-// ParameterType argument, not from any DESCRIBE response).
+// Encodes an application's bound "?" parameter value (SQLBindParameter's
+// ValueType/ParameterType + a live pointer into the caller's buffer) into a
+// sqli::BindParam ready for SQ_BIND. The mirror image of
+// driver/convert_native.h's decode direction, but deliberately its own
+// module rather than added there: convert_native.h's existing functions all
+// take an already-fetched column's raw bytes and a ColumnDesc; encoding
+// starts from an ODBC C value instead.
 //
-// Scope for this first slice: SQL_C_SLONG/SQL_C_DEFAULT -> SQL_INTEGER only
-// (see the plan) - proving the SQ_BIND wire plumbing end-to-end before
-// widening to the rest of the MVP scalar types.
+// SQL_INTEGER/SQL_SMALLINT/SQL_BIGINT/SQL_CHAR are done. Still missing:
+// VARCHAR/DATE/DECIMAL/DATETIME - see docs/protocol-notes.md's SQ_BIND
+// notes for why those need SQLBindParameter's ColumnSize/DecimalDigits
+// (currently discarded) while the types above don't.
 
 #include "sqli/statement.h"
 
@@ -40,7 +39,14 @@ struct BindEncodeResult {
 // of responsibility as driver/convert_native.h's writeNativeCell/caller
 // split - encoding a NULL needs no type-specific logic at all (SQ_BIND
 // signals it via the indicator field alone).
+//
+// `strLenOrInd` is SQLBindParameter's StrLen_or_IndPtr value at execute
+// time, already confirmed non-NULL-indicator by the caller - only
+// meaningful for variable-length ValueTypes (SQL_C_CHAR today): SQL_NTS
+// means "read a NUL-terminated string from parameterValuePtr", any other
+// non-negative value is the exact byte count to read. Fixed-width types
+// ignore it entirely.
 [[nodiscard]] BindEncodeResult encodeBindParam(SQLSMALLINT valueType, SQLSMALLINT parameterType,
-                                                SQLPOINTER parameterValuePtr);
+                                                SQLPOINTER parameterValuePtr, SQLLEN strLenOrInd);
 
 } // namespace ifxodbc

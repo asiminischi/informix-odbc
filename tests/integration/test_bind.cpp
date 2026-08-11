@@ -1,8 +1,8 @@
 // Live integration test for SQ_BIND parameter encoding (sqli/types.h's
-// encodeSmallInt/encodeInteger/encodeBigInt, see driver/bind_encode.cpp for
-// the ODBC-surface mirror). Confirms the full round trip: encode -> SQ_BIND
-// wire bytes -> server storage -> plain SELECT fetch -> decode, for each
-// fixed-width integer type currently supported.
+// encodeSmallInt/encodeInteger/encodeBigInt/encodeChar, see
+// driver/bind_encode.cpp for the ODBC-surface mirror). Confirms the full
+// round trip: encode -> SQ_BIND wire bytes -> server storage -> plain
+// SELECT fetch -> decode, for each bind-parameter type currently supported.
 
 #include "sqli/connection.h"
 #include "sqli/statement.h"
@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <string_view>
 
 using namespace ifxsqli;
 
@@ -43,7 +44,8 @@ void check(const char* label, bool condition) {
         return false;
     }
     if (auto r = setup->executeCommand(
-            "create table bind_probe (col_smallint smallint, col_integer integer, col_bigint bigint)");
+            "create table bind_probe (col_smallint smallint, col_integer integer, col_bigint bigint,"
+            " col_char char(20))");
         !r) {
         std::fprintf(stderr, "create table failed: %s\n", r.error().message.c_str());
         return false;
@@ -59,17 +61,20 @@ void check(const char* label, bool condition) {
         return false;
     }
 
-    auto insertStmt = SqliStatement::prepare(*conn, "insert into bind_probe values (?, ?, ?)");
+    auto insertStmt = SqliStatement::prepare(*conn, "insert into bind_probe values (?, ?, ?, ?)");
     if (!insertStmt) {
         std::fprintf(stderr, "prepare insert failed: %s\n", insertStmt.error().message.c_str());
         return false;
     }
 
+    std::string_view charValue = "hello bind";
     std::vector<BindParam> params2;
     params2.push_back(BindParam{ifxtype::kSmallInt, false, encodeSmallInt(-12345), kSmallIntBindPrecision});
     params2.push_back(BindParam{ifxtype::kInteger, false, encodeInteger(1234567890), kIntegerBindPrecision});
     params2.push_back(
         BindParam{ifxtype::kBigInt, false, encodeBigInt(123456789012345), kBigIntBindPrecision});
+    params2.push_back(BindParam{ifxtype::kChar, false, encodeChar(charValue),
+                                 static_cast<std::uint16_t>(charValue.size())});
     if (auto r = insertStmt->execute(params2); !r) {
         std::fprintf(stderr, "execute insert failed: %s\n", r.error().message.c_str());
         return false;
@@ -77,7 +82,8 @@ void check(const char* label, bool condition) {
     if (auto r = insertStmt->close(); !r) return false;
     if (auto r = insertStmt->release(); !r) return false;
 
-    auto selectStmt = SqliStatement::prepare(*conn, "select col_smallint, col_integer, col_bigint from bind_probe");
+    auto selectStmt =
+        SqliStatement::prepare(*conn, "select col_smallint, col_integer, col_bigint, col_char from bind_probe");
     if (!selectStmt) {
         std::fprintf(stderr, "prepare select failed: %s\n", selectStmt.error().message.c_str());
         return false;
@@ -99,13 +105,18 @@ void check(const char* label, bool condition) {
     auto smallintVal = decodeSmallInt((**row)[0]);
     auto integerVal = decodeInteger((**row)[1]);
     auto bigintVal = decodeBigInt((**row)[2]);
-    if (!smallintVal || !integerVal || !bigintVal) {
+    auto charVal = decodeChar((**row)[3]);
+    if (!smallintVal || !integerVal || !bigintVal || !charVal) {
         std::fprintf(stderr, "decode failed\n");
         return false;
     }
     check("bound SMALLINT round-trips", smallintVal->has_value() && **smallintVal == -12345);
     check("bound INTEGER round-trips", integerVal->has_value() && **integerVal == 1234567890);
     check("bound BIGINT round-trips", bigintVal->has_value() && **bigintVal == 123456789012345);
+    // CHAR(20) is space-padded to the declared width on the wire (see
+    // decodeChar's doc comment) - "hello bind" is 10 bytes, so 10 trailing
+    // spaces are expected, not a bug in either direction.
+    check("bound CHAR round-trips", charVal->has_value() && **charVal == "hello bind          ");
 
     if (auto r = selectStmt->close(); !r) return false;
     if (auto r = selectStmt->release(); !r) return false;

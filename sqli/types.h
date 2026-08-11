@@ -8,6 +8,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ifxsqli {
@@ -80,6 +81,19 @@ inline constexpr std::uint16_t kIntegerBindPrecision = 0x0A00;
 [[nodiscard]] std::vector<std::byte> encodeBigInt(std::int64_t v);
 inline constexpr std::uint16_t kSmallIntBindPrecision = 0x0500;
 inline constexpr std::uint16_t kBigIntBindPrecision = 0x1300;
+
+// CHAR bind encoding: unlike the fixed-width integer types above, this is
+// NOT the same bytes as decodeChar's TUPLE-format input - traced via the
+// decompiled JDBC reference's IfxChar.toIfx() -> JavaToIfxChar: a u16
+// length prefix (not including a NUL) followed by the raw bytes, the same
+// self-describing shape as this protocol's own ifxChar2 (see byte_io.h),
+// unpadded (writeBindBlock's own even-alignment padding applies afterward,
+// same as every other bind value - do not pad here too). Confirmed live
+// (tests/integration/test_bind.cpp) that precisionField can simply be the
+// string's own length - the server does not require it to match the
+// target column's declared width, unlike VARCHAR (see
+// docs/protocol-notes.md's SQ_BIND notes).
+[[nodiscard]] std::vector<std::byte> encodeChar(std::string_view s);
 
 // Fixed-width space-padded CHAR(n). NULL is a leading 0x00 byte (confirmed
 // live); the rest of the buffer is not meaningful in that case. Non-NULL
