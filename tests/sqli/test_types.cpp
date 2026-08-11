@@ -172,6 +172,53 @@ TEST_CASE("DECIMAL zero and NULL") {
     CHECK(!null->has_value());
 }
 
+namespace {
+
+// Round-trips a decimal literal through encodeDecimal then decodeDecimal
+// (stripping encodeDecimal's SQ_BIND-only 2-byte length prefix first,
+// which decodeDecimal's TUPLE-format input never has), using exactly the
+// mantissa width encodeDecimal itself chose - it deliberately doesn't pad
+// to any declared column precision (see sqli/types.h), so a fixed
+// precision argument would be wrong for one of these test cases and right
+// for another.
+std::string roundTripDecimal(std::string_view literal) {
+    auto encoded = encodeDecimal(literal);
+    REQUIRE(encoded.has_value());
+    REQUIRE(encoded->data.size() >= 3);
+    std::span<const std::byte> withoutLengthPrefix(encoded->data.data() + 2, encoded->data.size() - 2);
+    unsigned mantissaBytes = static_cast<unsigned>(withoutLengthPrefix.size() - 1);
+    auto decoded = decodeDecimal(withoutLengthPrefix, mantissaBytes * 2, encoded->scale);
+    REQUIRE(decoded.has_value());
+    REQUIRE(decoded->has_value());
+    return **decoded;
+}
+
+} // namespace
+
+TEST_CASE("DECIMAL bind encoding round-trips through decodeDecimal") {
+    CHECK(roundTripDecimal("12345.67") == "12345.67");
+    CHECK(roundTripDecimal("0.01") == "0.01");
+    CHECK(roundTripDecimal("-99.99") == "-99.99");
+    CHECK(roundTripDecimal("-12345.67") == "-12345.67");
+    CHECK(roundTripDecimal("-0.01") == "-0.01");
+    CHECK(roundTripDecimal("-100.00") == "-100.00");
+    CHECK(roundTripDecimal("0.00") == "0.00");
+    CHECK(roundTripDecimal("100") == "100");
+}
+
+TEST_CASE("DECIMAL bind encoding matches hand-derived bytes for -0.01") {
+    // Independently derived from convFromBigDecimal's algorithm (see
+    // sqli/types.h's encodeDecimal doc comment): unscaledValue "1", scale
+    // 2, exp = 1 - 2 = -1 (odd) -> prepend a zero digit, trueExp = 0.
+    // Mantissa digit before complementing: [01]. Positive low7 = 64 -> 0x40.
+    // Negative: exponent = 0x7F - 0x40 = 0x3F; mantissa hundred's-complement
+    // of [1] is [99]=0x63 (99-1=98, +1 carry -> 99).
+    auto encoded = encodeDecimal("-0.01");
+    REQUIRE(encoded.has_value());
+    CHECK(encoded->scale == 2);
+    CHECK(encoded->data == fromHex("0002 3f 63"));
+}
+
 TEST_CASE("DATETIME YEAR TO SECOND") {
     // encodedLength = (14 << 8) | 0x0A: 14 total digits, qualifier
     // start=YEAR(0) end=SECOND(10).

@@ -142,6 +142,41 @@ inline constexpr std::uint16_t kBigIntBindPrecision = 0x1300;
 [[nodiscard]] std::expected<std::optional<std::string>, Error> decodeDecimal(std::span<const std::byte> raw,
                                                                                unsigned precision, unsigned scale);
 
+// One DECIMAL SQ_BIND value: the encoded bytes (ready to hand to
+// BindParam::data) and the scale to use as precisionField. Bundled
+// together since, unlike every other bind type so far, DECIMAL's
+// precisionField is not self-evident from the byte count or a hardcoded
+// constant - it is the value's own scale (confirmed via the decompiled
+// JDBC reference's dispatch in sendBind: for DECIMAL specifically it sends
+// ((IfxDecimal)ival).getScale(), i.e. BigDecimal.scale() - intrinsic to
+// the value itself, not derived from any target column's declared scale,
+// so no column metadata is needed here either).
+struct DecimalBindEncoding {
+    std::vector<std::byte> data;
+    std::uint16_t scale = 0;
+};
+
+// Encodes a decimal literal (e.g. "12345.67", "-0.01", "0") for SQ_BIND.
+// Unlike decodeDecimal's TUPLE-format input, this prepends a u16 length
+// (the byte count of the exponent+mantissa that follows, i.e. dec_ndgts+1)
+// before the same exponent-byte-plus-packed-mantissa shape decodeDecimal
+// reads - confirmed via the decompiled JDBC reference's
+// IfxDecimal.toIfx() -> convIfx(true) (its convIfx(false), used by
+// toIfxTuple, is what decodeDecimal's shape matches instead - see
+// VARCHAR's toIfx()/toIfxTuple() mixup in docs/protocol-notes.md for why
+// this distinction matters). Uses the minimal mantissa width needed to
+// represent the literal's own digits exactly, not padded to any declared
+// column precision (convFromBigDecimal pads to a target precision when one
+// is known, but this driver has none to consult at bind time - same
+// reasoning as CHAR/VARCHAR/DATE). Confirmed live
+// (tests/integration/test_bind.cpp) that the server accepts this minimal
+// mantissa width without requiring it to match the target column's
+// declared precision. The exponent/
+// mantissa math is independently derived as decodeDecimal's mathematical
+// inverse (reconstructed, not copied), reusing the same hundred's-
+// complement transform for negative values.
+[[nodiscard]] std::expected<DecimalBindEncoding, Error> encodeDecimal(std::string_view decimalLiteral);
+
 // Informix DATETIME(qualifier): same packed base-100-digit-pair mantissa
 // machinery as DECIMAL (always positive/no complement - datetimes aren't
 // signed), where the digit sequence is just the calendar fields

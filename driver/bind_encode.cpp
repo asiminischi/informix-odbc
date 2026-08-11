@@ -20,6 +20,14 @@ std::int32_t unixDaysFromDateStruct(const SQL_DATE_STRUCT& ds) {
     return static_cast<std::int32_t>(sys_days{ymd}.time_since_epoch().count());
 }
 
+// Shared by every SQL_C_CHAR-based bind (CHAR/VARCHAR/DECIMAL): resolves
+// the actual string length per ODBC's StrLen_or_IndPtr convention (SQL_NTS
+// means NUL-terminated, otherwise it's the exact byte count).
+std::string_view charBindValue(SQLPOINTER parameterValuePtr, SQLLEN strLenOrInd) {
+    const auto* text = static_cast<const char*>(parameterValuePtr);
+    return strLenOrInd == SQL_NTS ? std::string_view(text) : std::string_view(text, static_cast<std::size_t>(strLenOrInd));
+}
+
 } // namespace
 
 BindEncodeResult encodeBindParam(SQLSMALLINT valueType, SQLSMALLINT parameterType, SQLPOINTER parameterValuePtr,
@@ -51,9 +59,7 @@ BindEncodeResult encodeBindParam(SQLSMALLINT valueType, SQLSMALLINT parameterTyp
     }
     if ((parameterType == SQL_CHAR || parameterType == SQL_VARCHAR) &&
         (valueType == SQL_C_CHAR || valueType == SQL_C_DEFAULT)) {
-        const auto* text = static_cast<const char*>(parameterValuePtr);
-        std::string_view s = strLenOrInd == SQL_NTS ? std::string_view(text)
-                                                      : std::string_view(text, static_cast<std::size_t>(strLenOrInd));
+        std::string_view s = charBindValue(parameterValuePtr, strLenOrInd);
         ifxsqli::BindParam p;
         p.ifxType = parameterType == SQL_CHAR ? ifxsqli::ifxtype::kChar : ifxsqli::ifxtype::kVarchar;
         p.isNull = false;
@@ -72,6 +78,24 @@ BindEncodeResult encodeBindParam(SQLSMALLINT valueType, SQLSMALLINT parameterTyp
         // byte width) is a first hypothesis pending a live check, same
         // approach that worked for CHAR/VARCHAR.
         p.precisionField = 4;
+        return BindEncodeResult{BindEncodeStatus::kOk, std::move(p)};
+    }
+    if ((parameterType == SQL_DECIMAL || parameterType == SQL_NUMERIC) &&
+        (valueType == SQL_C_CHAR || valueType == SQL_C_DEFAULT)) {
+        // No SQL_NUMERIC_STRUCT support - DECIMAL binds go through an
+        // exact decimal-literal string instead, same convention this
+        // driver's fetch direction already uses for exact DECIMAL access
+        // (see convert_native.cpp's SQL_C_DOUBLE/decodeDecimal handling
+        // and sqli/types.h's encodeDecimal doc comment for why a string is
+        // the only representation that doesn't lose precision).
+        std::string_view s = charBindValue(parameterValuePtr, strLenOrInd);
+        auto encoded = ifxsqli::encodeDecimal(s);
+        if (!encoded) return BindEncodeResult{BindEncodeStatus::kUnsupported, {}};
+        ifxsqli::BindParam p;
+        p.ifxType = ifxsqli::ifxtype::kDecimal;
+        p.isNull = false;
+        p.data = std::move(encoded->data);
+        p.precisionField = encoded->scale;
         return BindEncodeResult{BindEncodeStatus::kOk, std::move(p)};
     }
     return BindEncodeResult{BindEncodeStatus::kUnsupported, {}};

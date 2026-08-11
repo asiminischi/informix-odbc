@@ -33,6 +33,71 @@ void check(const char* label, bool condition) {
     }
 }
 
+// Inserts `literal` into a fresh row's col_decimal (every other column left
+// NULL) and fetches it straight back, on its own connection. Used to
+// exercise DECIMAL's positive and zero exponent-byte shapes live, distinct
+// paths from the general negative case the main round trip below already
+// covers - encodeDecimal's positive/zero branches were previously
+// validated only by decodeDecimal round-tripping its own output, which
+// can't catch "self-consistent bytes the server actually rejects."
+[[nodiscard]] bool checkDecimalRoundTrip(const std::string& host, int port, const ConnectParams& params,
+                                          const char* literal) {
+    auto conn = SqliConnection::connect(host, port, params);
+    if (!conn) {
+        std::fprintf(stderr, "connect failed: %s\n", conn.error().message.c_str());
+        return false;
+    }
+    auto encoded = encodeDecimal(literal);
+    if (!encoded) {
+        std::fprintf(stderr, "encodeDecimal failed: %s\n", encoded.error().message.c_str());
+        return false;
+    }
+    auto insertStmt = SqliStatement::prepare(*conn, "insert into bind_probe (col_decimal) values (?)");
+    if (!insertStmt) {
+        std::fprintf(stderr, "prepare insert failed: %s\n", insertStmt.error().message.c_str());
+        return false;
+    }
+    std::vector<BindParam> params2{BindParam{ifxtype::kDecimal, false, encoded->data, encoded->scale}};
+    if (auto r = insertStmt->execute(params2); !r) {
+        std::fprintf(stderr, "execute insert failed: %s\n", r.error().message.c_str());
+        return false;
+    }
+    if (auto r = insertStmt->close(); !r) return false;
+    if (auto r = insertStmt->release(); !r) return false;
+
+    auto selectStmt = SqliStatement::prepare(
+        *conn, "select col_decimal from bind_probe where col_decimal is not null order by col_decimal desc");
+    if (!selectStmt) {
+        std::fprintf(stderr, "prepare select failed: %s\n", selectStmt.error().message.c_str());
+        return false;
+    }
+    if (auto r = selectStmt->execute(); !r) {
+        std::fprintf(stderr, "execute select failed: %s\n", r.error().message.c_str());
+        return false;
+    }
+    auto row = selectStmt->fetchRow();
+    if (!row || !*row) {
+        std::fprintf(stderr, "fetchRow failed or no row\n");
+        return false;
+    }
+    auto decoded = decodeDecimal((**row)[0], 10, 2);
+    if (auto r = selectStmt->close(); !r) return false;
+    if (auto r = selectStmt->release(); !r) return false;
+    // Consume every not-null col_decimal row (including run()'s own,
+    // already-checked row on the first call here) so the next call's
+    // "order by ... desc" pick is unambiguous rather than racing against
+    // whatever earlier literals are still sitting in the table.
+    if (auto r = conn->executeCommand("delete from bind_probe where col_decimal is not null"); !r) return false;
+    if (auto r = conn->disconnectOrderly(); !r) return false;
+    if (!decoded) {
+        std::fprintf(stderr, "decode failed: %s\n", decoded.error().message.c_str());
+        return false;
+    }
+    check((std::string("bound DECIMAL round-trips (") + literal + ")").c_str(),
+          decoded->has_value() && **decoded == literal);
+    return true;
+}
+
 [[nodiscard]] bool run(const std::string& host, int port, const ConnectParams& params) {
     auto setup = SqliConnection::connect(host, port, params);
     if (!setup) {
@@ -45,7 +110,7 @@ void check(const char* label, bool condition) {
     }
     if (auto r = setup->executeCommand(
             "create table bind_probe (col_smallint smallint, col_integer integer, col_bigint bigint,"
-            " col_char char(20), col_varchar varchar(32), col_date date)");
+            " col_char char(20), col_varchar varchar(32), col_date date, col_decimal decimal(10,2))");
         !r) {
         std::fprintf(stderr, "create table failed: %s\n", r.error().message.c_str());
         return false;
@@ -61,7 +126,7 @@ void check(const char* label, bool condition) {
         return false;
     }
 
-    auto insertStmt = SqliStatement::prepare(*conn, "insert into bind_probe values (?, ?, ?, ?, ?, ?)");
+    auto insertStmt = SqliStatement::prepare(*conn, "insert into bind_probe values (?, ?, ?, ?, ?, ?, ?)");
     if (!insertStmt) {
         std::fprintf(stderr, "prepare insert failed: %s\n", insertStmt.error().message.c_str());
         return false;
@@ -74,6 +139,11 @@ void check(const char* label, bool condition) {
     std::string_view charValue = "hi bind";
     std::string_view varcharValue = "varchar!";
     std::int32_t dateUnixDays = 10957; // 2000-01-01
+    auto decimalEncoded = encodeDecimal("-12345.67");
+    if (!decimalEncoded) {
+        std::fprintf(stderr, "encodeDecimal failed: %s\n", decimalEncoded.error().message.c_str());
+        return false;
+    }
     std::vector<BindParam> params2;
     params2.push_back(BindParam{ifxtype::kSmallInt, false, encodeSmallInt(-12345), kSmallIntBindPrecision});
     params2.push_back(BindParam{ifxtype::kInteger, false, encodeInteger(1234567890), kIntegerBindPrecision});
@@ -84,6 +154,7 @@ void check(const char* label, bool condition) {
     params2.push_back(BindParam{ifxtype::kVarchar, false, encodeChar(varcharValue),
                                  static_cast<std::uint16_t>(varcharValue.size())});
     params2.push_back(BindParam{ifxtype::kDate, false, encodeDateUnixDays(dateUnixDays), 4});
+    params2.push_back(BindParam{ifxtype::kDecimal, false, decimalEncoded->data, decimalEncoded->scale});
     if (auto r = insertStmt->execute(params2); !r) {
         std::fprintf(stderr, "execute insert failed: %s\n", r.error().message.c_str());
         return false;
@@ -91,9 +162,9 @@ void check(const char* label, bool condition) {
     if (auto r = insertStmt->close(); !r) return false;
     if (auto r = insertStmt->release(); !r) return false;
 
-    auto selectStmt = SqliStatement::prepare(
-        *conn,
-        "select col_smallint, col_integer, col_bigint, col_char, col_varchar, col_date from bind_probe");
+    auto selectStmt = SqliStatement::prepare(*conn,
+                                              "select col_smallint, col_integer, col_bigint, col_char, col_varchar,"
+                                              " col_date, col_decimal from bind_probe");
     if (!selectStmt) {
         std::fprintf(stderr, "prepare select failed: %s\n", selectStmt.error().message.c_str());
         return false;
@@ -118,7 +189,8 @@ void check(const char* label, bool condition) {
     auto charVal = decodeChar((**row)[3]);
     auto varcharVal = decodeVarchar((**row)[4]);
     auto dateVal = decodeDateUnixDays((**row)[5]);
-    if (!smallintVal || !integerVal || !bigintVal || !charVal || !varcharVal || !dateVal) {
+    auto decimalVal = decodeDecimal((**row)[6], 10, 2);
+    if (!smallintVal || !integerVal || !bigintVal || !charVal || !varcharVal || !dateVal || !decimalVal) {
         std::fprintf(stderr, "decode failed\n");
         return false;
     }
@@ -132,12 +204,14 @@ void check(const char* label, bool condition) {
     check("bound CHAR round-trips (odd byte length)", charVal->has_value() && **charVal == expectedChar);
     check("bound VARCHAR round-trips", varcharVal->has_value() && **varcharVal == "varchar!");
     check("bound DATE round-trips", dateVal->has_value() && **dateVal == dateUnixDays);
+    check("bound DECIMAL round-trips", decimalVal->has_value() && **decimalVal == "-12345.67");
 
     if (auto r = selectStmt->close(); !r) return false;
     if (auto r = selectStmt->release(); !r) return false;
-    if (auto r = conn->executeCommand("drop table if exists bind_probe"); !r) return false;
     if (auto r = conn->disconnectOrderly(); !r) return false;
 
+    // bind_probe is dropped by main() after the standalone DECIMAL checks
+    // below, which reuse this same table.
     return true;
 }
 
@@ -159,6 +233,36 @@ int main() {
     if (!run(host, port, params)) {
         std::printf("\nbind integration test FAILED to complete (see error above)\n");
         return 1;
+    }
+
+    // DECIMAL's positive and zero exponent-byte shapes are structurally
+    // different from the negative case run() just exercised (sign bit set
+    // vs. clear vs. the hardcoded 0x80 zero special case) - check them
+    // live too rather than trusting the unit tests' decodeDecimal
+    // round-trip, which can't catch bytes the server itself rejects.
+    if (!checkDecimalRoundTrip(host, port, params, "12345.67")) {
+        std::printf("\nbind integration test FAILED to complete (see error above)\n");
+        return 1;
+    }
+    if (!checkDecimalRoundTrip(host, port, params, "0.00")) {
+        std::printf("\nbind integration test FAILED to complete (see error above)\n");
+        return 1;
+    }
+
+    {
+        auto cleanup = SqliConnection::connect(host, port, params);
+        if (!cleanup) {
+            std::fprintf(stderr, "cleanup connect failed: %s\n", cleanup.error().message.c_str());
+            return 1;
+        }
+        if (auto r = cleanup->executeCommand("drop table if exists bind_probe"); !r) {
+            std::fprintf(stderr, "cleanup drop table failed: %s\n", r.error().message.c_str());
+            return 1;
+        }
+        if (auto r = cleanup->disconnectOrderly(); !r) {
+            std::fprintf(stderr, "cleanup disconnect failed: %s\n", r.error().message.c_str());
+            return 1;
+        }
     }
 
     if (g_failures > 0) {

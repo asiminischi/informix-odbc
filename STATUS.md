@@ -104,23 +104,28 @@ Roughly in the order they'd bite a real application:
    clients (BI tools, admin GUIs, even some ORM schema-introspection code)
    need at least `SQLTables`/`SQLColumns` to do anything beyond a
    hand-typed query.
-3. **Bind parameters cover 6 of 8 MVP types.** `SQL_INTEGER`/`SQL_SMALLINT`/
-   `SQL_BIGINT`/`SQL_CHAR`/`SQL_VARCHAR`/`SQL_TYPE_DATE` are done and
-   confirmed live (`tests/integration/test_bind.cpp`), none needing
-   `SQLBindParameter`'s `ColumnSize`/`DecimalDigits` (currently discarded by
-   `driver/bind_encode.cpp`'s `encodeBindParam`) - the integer types and
-   DATE use a hardcoded SQ_BIND precision field, CHAR/VARCHAR's value bytes
-   are self-describing (a length prefix inside the data itself, confirmed
-   live to need no column metadata: a value shorter than the target
-   column's declared width round-trips fine with `precisionField` set to
-   just the value's own length). Note this was initially mis-traced for
-   VARCHAR - a first pass followed `IfxVarChar.toIfxTuple()` (a bulk-load
-   path, not `sendBind`'s) and concluded the encoded buffer was fixed at
-   the declared column width; the real bind path (`toIfx()`) turned out to
-   be identical to CHAR's. Remaining: DECIMAL/DATETIME, which need their
-   own encoders since their BIND wire format differs from their fetch
-   format (documented in `docs/protocol-notes.md`) - the last two of the
-   MVP set.
+3. **Bind parameters cover 7 of 8 MVP types.** `SQL_INTEGER`/`SQL_SMALLINT`/
+   `SQL_BIGINT`/`SQL_CHAR`/`SQL_VARCHAR`/`SQL_TYPE_DATE`/`SQL_DECIMAL` are
+   done and confirmed live (`tests/integration/test_bind.cpp`), none
+   needing `SQLBindParameter`'s `ColumnSize`/`DecimalDigits` (still
+   discarded by `driver/bind_encode.cpp`'s `encodeBindParam`) - the integer
+   types and DATE use a hardcoded SQ_BIND precision field, CHAR/VARCHAR's
+   value bytes are self-describing (a length prefix inside the data
+   itself), and DECIMAL's precision field is the value's own scale
+   (`BigDecimal.scale()`, i.e. however many digits the caller wrote after
+   the decimal point) rather than any target column's declared scale - all
+   confirmed live to need no column metadata, including that a
+   minimally-sized DECIMAL mantissa (not padded to the target column's
+   declared precision) round-trips fine. `SQL_DECIMAL` binds go through an
+   exact decimal-literal string (`SQL_C_CHAR`), matching this driver's
+   existing exact-DECIMAL-fetch convention, since there's no
+   `SQL_NUMERIC_STRUCT` support. Note VARCHAR was initially mis-traced - a
+   first pass followed `IfxVarChar.toIfxTuple()` (a bulk-load path, not
+   `sendBind`'s) and concluded the encoded buffer was fixed at the declared
+   column width; the real bind path (`toIfx()`) turned out to be identical
+   to CHAR's. Remaining: DATETIME, the last MVP type, which needs its own
+   encoder since its BIND wire format differs from its fetch format
+   (documented in `docs/protocol-notes.md`).
 4. **No DSN-based connect (`SQLConnect`).** Only `SQLDriverConnect` with an
    explicit keyword string works today. Fine for `isql -k`, but many
    GUI/ODBC-Admin tools default to the DSN path.

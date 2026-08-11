@@ -410,14 +410,36 @@ bytes at all.
   width) round-trips correctly; whether the server actually inspects this
   field for DATE at all is untested, only that this value doesn't cause an
   error or desync.
-- **DECIMAL**: the value's scale alone (not precision-shifted).
+- **DECIMAL**: confirmed live for all three exponent-byte shapes -
+  negative (sign bit clear), positive (sign bit set), and the canonical
+  zero special case - via three separate round trips in
+  `tests/integration/test_bind.cpp`, not just one value plus a
+  `decodeDecimal` self-round-trip (which by construction can't catch
+  bytes that are internally self-consistent but that the server itself
+  rejects or misreads). The precision field is the value's scale alone
+  (not precision-shifted), confirmed via the decompiled `IfxSqli.
+  sendBind`'s dispatch: for DECIMAL specifically it sends
+  `((IfxDecimal)ival).getScale()` (`BigDecimal.scale()`), not
+  `getEncodedLength()` the way every other type does. Crucially, this
+  scale is intrinsic to the *value itself* (however many digits the
+  caller wrote after the decimal point), not derived from the target
+  column's declared scale - so, like CHAR/VARCHAR/DATE, no column
+  metadata is needed. `sqli::encodeDecimal` independently re-derives
+  `convFromBigDecimal`'s digit-packing math (matched against
+  `decodeDecimal`'s confirmed live test vectors before ever going live)
+  rather than copying it, and confirmed live that the server accepts a
+  minimally-sized mantissa (exactly as many bytes as the literal's own
+  digits need) rather than requiring it padded to the target column's
+  declared precision.
 - **DATETIME**: the qualifier (same packed `(totalDigits << 8) |
-  qualifierByte` DESCRIBE already uses).
+  qualifierByte` DESCRIBE already uses). Not yet implemented.
 
 DECIMAL/DATETIME's BIND value encoding additionally prepends a 2-byte length
-(`dec_ndgts + 1`) that the TUPLE format doesn't have (per the decompiled
-`IfxDecimal.convIfx`'s `prependLength` parameter), not yet implemented or
-live-tested.
+(`dec_ndgts + 1`, the byte count of the exponent+mantissa that follows) that
+the TUPLE format doesn't have - confirmed for DECIMAL via the decompiled
+`IfxDecimal.toIfx()` → `convIfx(true)` (its `convIfx(false)`, used by
+`toIfxTuple()`, is the bulk-load path and what `decodeDecimal`'s shape
+matches instead). DATETIME's is not yet implemented or live-tested.
 
 **SQ_RETURN_TYPE + SQ_FETCH** (`SqliStatement::fetchNextBatch`): `u16(4)`,
 `statementId`(u16), then — **only on the first fetch for a given cursor** —

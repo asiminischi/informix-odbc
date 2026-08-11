@@ -1,9 +1,11 @@
 #include "sqli/types.h"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstring>
 #include <limits>
+#include <string>
 #include <vector>
 
 namespace ifxsqli {
@@ -202,6 +204,99 @@ std::expected<std::optional<std::string>, Error> decodeDecimal(std::span<const s
 
     std::string result = (sign < 0 ? "-" : "") + intPart;
     if (scale > 0) result += "." + fracPart;
+    return result;
+}
+
+std::expected<DecimalBindEncoding, Error> encodeDecimal(std::string_view decimalLiteral) {
+    if (decimalLiteral.empty()) return std::unexpected(Error{ErrorKind::Protocol, "DECIMAL: empty literal"});
+
+    bool negative = false;
+    std::string_view s = decimalLiteral;
+    if (s.front() == '-') {
+        negative = true;
+        s.remove_prefix(1);
+    } else if (s.front() == '+') {
+        s.remove_prefix(1);
+    }
+
+    auto dot = s.find('.');
+    std::string_view intPart = dot == std::string_view::npos ? s : s.substr(0, dot);
+    std::string_view fracPart = dot == std::string_view::npos ? std::string_view{} : s.substr(dot + 1);
+    if (intPart.empty()) return std::unexpected(Error{ErrorKind::Protocol, "DECIMAL: missing integer part"});
+    auto isAllDigits = [](std::string_view part) {
+        for (char c : part) {
+            if (c < '0' || c > '9') return false;
+        }
+        return true;
+    };
+    if (!isAllDigits(intPart) || !isAllDigits(fracPart)) {
+        return std::unexpected(Error{ErrorKind::Protocol, "DECIMAL: non-digit character in literal"});
+    }
+
+    auto scale = static_cast<std::uint16_t>(fracPart.size());
+
+    // BigDecimal's unscaledValue digit string: intPart+fracPart with
+    // leading zeros stripped (a plain "0.01" literal has digits "001"
+    // before stripping but unscaledValue is "1", not "001" - confirmed
+    // against convFromBigDecimal, which derives everything below from
+    // this stripped string, not from the literal's own formatting).
+    std::string combined;
+    combined.reserve(intPart.size() + fracPart.size());
+    combined += intPart;
+    combined += fracPart;
+    std::size_t firstNonZero = combined.find_first_not_of('0');
+    bool isZero = firstNonZero == std::string::npos;
+    std::string unscaled = isZero ? "0" : combined.substr(firstNonZero);
+
+    // Mirrors convFromBigDecimal's exp-parity/prepend logic exactly (see
+    // sqli/types.h's encodeDecimal doc comment): trueExp is derived from
+    // buflen-scale, not from where the decimal point falls in the
+    // formatted literal, and a leading '0' digit is prepended only when
+    // that difference is odd. Also applies uniformly to the zero case
+    // (unscaled="0", buflen=1), matching convFromBigDecimal falling
+    // through to this same derivation even when dec_exp is separately
+    // overridden to the canonical -64 for zero.
+    int buflen = static_cast<int>(unscaled.size());
+    int exp = buflen - static_cast<int>(scale);
+    std::vector<char> unpack(unscaled.begin(), unscaled.end());
+    int trueExp;
+    if (exp % 2 != 0) {
+        unpack.insert(unpack.begin(), '0');
+        trueExp = (exp + 1) / 2;
+    } else {
+        trueExp = exp / 2;
+    }
+    if (unpack.size() % 2 != 0) unpack.push_back('0');
+
+    std::vector<int> mantissa;
+    mantissa.reserve(unpack.size() / 2);
+    for (std::size_t i = 0; i + 1 < unpack.size(); i += 2) {
+        mantissa.push_back((unpack[i] - '0') * 10 + (unpack[i + 1] - '0'));
+    }
+
+    std::uint8_t exponentByte;
+    if (isZero) {
+        // Canonical zero (matches decodeDecimal's own special case):
+        // magnitude bits aren't meaningful, sign is dropped regardless of
+        // the literal's own leading '-' (matches BigDecimal.ZERO
+        // comparison being sign-blind).
+        exponentByte = 0x80;
+        std::fill(mantissa.begin(), mantissa.end(), 0);
+    } else if (!negative) {
+        exponentByte = static_cast<std::uint8_t>(0x80 | ((64 + trueExp) & 0x7F));
+    } else {
+        hundredsComplementInPlace(mantissa);
+        auto positiveLow7 = static_cast<std::uint8_t>((64 + trueExp) & 0x7F);
+        exponentByte = static_cast<std::uint8_t>(0x7F - positiveLow7);
+    }
+
+    DecimalBindEncoding result;
+    result.scale = scale;
+    auto decNdgts = static_cast<std::uint16_t>(mantissa.size());
+    auto lengthField = writeBigEndian<std::uint16_t>(static_cast<std::uint16_t>(decNdgts + 1));
+    result.data.insert(result.data.end(), lengthField.begin(), lengthField.end());
+    result.data.push_back(std::byte{exponentByte});
+    for (int d : mantissa) result.data.push_back(static_cast<std::byte>(static_cast<unsigned char>(d)));
     return result;
 }
 

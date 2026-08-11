@@ -8,10 +8,11 @@
 // take an already-fetched column's raw bytes and a ColumnDesc; encoding
 // starts from an ODBC C value instead.
 //
-// SQL_INTEGER/SQL_SMALLINT/SQL_BIGINT/SQL_CHAR/SQL_VARCHAR are done. Still
-// missing: DATE/DECIMAL/DATETIME - see docs/protocol-notes.md's SQ_BIND
-// notes for why those need SQLBindParameter's ColumnSize/DecimalDigits
-// (currently discarded) while the types above don't.
+// SQL_INTEGER/SQL_SMALLINT/SQL_BIGINT/SQL_CHAR/SQL_VARCHAR/SQL_TYPE_DATE/
+// SQL_DECIMAL are done - none of them need SQLBindParameter's ColumnSize/
+// DecimalDigits (still discarded), see docs/protocol-notes.md's SQ_BIND
+// notes for why (DECIMAL's precisionField is the value's own scale, not
+// any target column's declared scale). Still missing: DATETIME.
 
 #include "sqli/statement.h"
 
