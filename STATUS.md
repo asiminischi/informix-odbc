@@ -88,10 +88,17 @@ testing.
 
 Roughly in the order they'd bite a real application:
 
-1. **No transactions.** `SQLEndTran` isn't implemented at all: no commit,
-   no rollback, no `SQ_BEGIN`/`SQ_CMMTWORK`/`SQ_RBWORK`. Every statement is
-   effectively auto-committed by the server's own default behavior, not by
-   any driver-managed transaction boundary.
+1. **`SQLEndTran` not wired up yet.** The protocol-layer primitive is done:
+   `SqliConnection::beginTransaction`/`commitTransaction`/`rollbackTransaction`
+   (`SQ_BEGIN`/`SQ_CMMTWORK`/`SQ_RBWORK`) are implemented and confirmed live
+   (see `docs/protocol-notes.md`'s Transactions section) - a row inserted
+   inside a transaction and rolled back is invisible even to the same
+   connection, and a committed row is visible from a separate connection.
+   What's still missing is the ODBC entry point itself: `SQLEndTran` doesn't
+   call any of this yet, and there's no driver-managed transaction boundary
+   (autocommit state, `SQL_ATTR_AUTOCOMMIT`) tying connection lifecycle to
+   these calls. Every statement is still effectively auto-committed by the
+   server's own default behavior until that wiring exists.
 2. **No catalog functions.** `SQLTables`, `SQLColumns`, `SQLGetTypeInfo`,
    `SQLPrimaryKeys`, `SQLStatistics`, etc. don't exist. Most real ODBC
    clients (BI tools, admin GUIs, even some ORM schema-introspection code)
@@ -165,7 +172,9 @@ notes:
 ## Suggested next steps, in priority order
 
 1. Finish bind-parameter coverage for the remaining 7 MVP types.
-2. Transactions (`SQLEndTran` -> `SQ_BEGIN`/`SQ_CMMTWORK`/`SQ_RBWORK`).
+2. Wire `SQLEndTran` to the now-confirmed `SqliConnection::beginTransaction`/
+   `commitTransaction`/`rollbackTransaction`, plus `SQL_ATTR_AUTOCOMMIT`
+   handling.
 3. Catalog functions: `SQLTables`/`SQLColumns` first (unblocks the most
    client tooling), then `SQLGetTypeInfo`/`SQLPrimaryKeys`/`SQLStatistics`.
 4. Windows driver registration (registry helper plus install doc) so the

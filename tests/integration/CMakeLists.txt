@@ -3,3 +3,9 @@ target_link_libraries(type_probe_integration_test PRIVATE ifx_sqli)
 
 add_test(NAME type_probe_integration COMMAND type_probe_integration_test)
 set_tests_properties(type_probe_integration PROPERTIES LABELS "integration")
+
+add_executable(transactions_integration_test test_transactions.cpp)
+target_link_libraries(transactions_integration_test PRIVATE ifx_sqli)
+
+add_test(NAME transactions_integration COMMAND transactions_integration_test)
+set_tests_properties(transactions_integration PROPERTIES LABELS "integration")

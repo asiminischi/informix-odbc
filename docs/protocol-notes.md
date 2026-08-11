@@ -557,6 +557,49 @@ reproducing the exact captured bytes above, and exercised live end-to-end via
 `tools/ifx_probe` against the full `type_probe` table (including the
 all-NULL row).
 
+## Transactions
+
+**Status: verified** - `SqliConnection::beginTransaction`/`commitTransaction`/
+`rollbackTransaction` (`sqli/connection.cpp`) confirmed live end-to-end: a row
+inserted after `beginTransaction` and then rolled back is invisible even to
+the same connection, and a row committed instead is visible from a separate
+connection (`tests/integration/test_transactions.cpp`).
+
+Opcodes (`sqli/protocol.h`): `SQ_BEGIN`=35, `SQ_CMMTWORK`=19, `SQ_RBWORK`=20.
+Sourced from the decompiled JDBC reference's `IfxMessageTypes`, now confirmed
+against a live server.
+
+**Request shape:**
+- `SQ_BEGIN` / `SQ_CMMTWORK`: opcode only, then `EOT`.
+- `SQ_RBWORK`: opcode, then a trailing `u16` savepoint id, then `EOT`. This
+  extra field is easy to miss, it isn't present on begin or commit, and
+  omitting it doesn't error; the server just waits forever for the two bytes
+  that never arrive, since it's still mid-message and hasn't seen `EOT` yet.
+  `0` means "roll back the whole transaction, not a named savepoint" (this
+  driver doesn't implement savepoints). Confirmed against the decompiled
+  reference's `sendRollback()`, which writes `20` then `0` before its caller
+  sends `EOT` separately.
+
+**Reply shape** - all three opcodes reply identically: `SQ_XACTSTAT`(99) tag,
+then 3 more `u16` fields, then `DONE`, then `EOT`. Captured live for commit:
+`00 63 00 01 00 00 00 01 00 0c` (`SQ_XACTSTAT`, `0001`, `0000`, `0001`, `EOT`;
+no separate `DONE` record appeared in this capture, meaning the 3-field
+tail is `SQ_XACTSTAT`'s own payload rather than a distinct following record).
+This is the same tag `disconnectOrderly` already tolerates around `SQ_EXIT`,
+now confirmed to also lead the reply to all three transaction-control
+opcodes specifically (not just as a drain-before-close heuristic).
+
+**Debugging note for future protocol work**: when a live round-trip hangs
+with no error on either side, check `onstat -g ses` / `onstat -g sql <sid>`
+on the server before guessing at another reply shape: an idle server thread
+with no `SQL ERR`/`ISAM ERR` after the last statement means it already
+consumed a complete, valid request and is waiting for the *next* one, which
+rules out request-side bugs and points at either a still-missing request
+field (as it was here) or an over-read on the client's *previous* reply
+parse. A raw byte capture (write the request, then read whatever comes back
+without parsing it) resolves this class of bug in one round trip instead of
+iterating on guessed field counts.
+
 ## Open questions / risks
 
 - Whether `has4ByteOffsets()`'s constituent capability bits (see "Narrow vs. wide

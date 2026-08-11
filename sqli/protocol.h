@@ -31,4 +31,11 @@ inline constexpr std::uint16_t kCost = 55;
 inline constexpr std::uint16_t kExit = 56;
 inline constexpr std::uint16_t kProtocols = 126;
 
+// Transaction opcodes. Confirmed live via
+// tests/integration/test_transactions.cpp - see docs/protocol-notes.md's
+// Transactions section.
+inline constexpr std::uint16_t kBegin = 35;
+inline constexpr std::uint16_t kCommitWork = 19;
+inline constexpr std::uint16_t kRollbackWork = 20;
+
 } // namespace ifxsqli::opcode

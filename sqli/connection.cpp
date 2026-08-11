@@ -322,6 +322,91 @@ std::expected<void, Error> SqliConnection::executeCommand(const std::string& sql
     return {};
 }
 
+namespace {
+
+// Sends an opcode (with an optional trailing u16 field some opcodes require
+// before the EOT - e.g. SQ_RBWORK's savepoint id) and reads back the generic
+// tagged-record response, tolerating DONE/COST and surfacing ERROR - the
+// shape executeCommand's own reply loop uses minus the DESCRIBE handling,
+// since a transaction-control opcode carries no SQL text and nothing should
+// ever prepare a statement in response to one. Any DESCRIBE or unrecognized
+// tag is treated as a protocol error rather than silently ignored, so a
+// future opcode reusing this helper with a reply shape it doesn't handle
+// yet fails loudly instead of quietly desyncing the stream.
+std::expected<void, Error> sendBareOpcodeAndReadReply(TcpSocket& sock, std::uint16_t op,
+                                                        std::optional<std::uint16_t> extraField = std::nullopt) {
+    ByteWriter w;
+    w.u16(op);
+    if (extraField) w.u16(*extraField);
+    w.u16(kSqEot);
+    if (auto r = sock.writeAll(w.view()); !r) return r;
+
+    std::optional<Error> pendingError;
+    for (;;) {
+        auto tag = readU16(sock);
+        if (!tag) return std::unexpected(tag.error());
+        if (*tag == kSqEot) break;
+
+        switch (*tag) {
+            case opcode::kDone: {
+                if (!readU16(sock)) return std::unexpected(Error{ErrorKind::Transport, "read failed (warnings)"});
+                if (!readU32(sock) || !readU32(sock) || !readU32(sock)) {
+                    return std::unexpected(Error{ErrorKind::Transport, "read failed (done fields)"});
+                }
+                break;
+            }
+            case opcode::kCost: {
+                auto b = sock.readExactN(8);
+                if (!b) return std::unexpected(b.error());
+                break;
+            }
+            case opcode::kError: {
+                auto err = readErrorRecord(sock);
+                if (!err) return std::unexpected(err.error());
+                pendingError = *err;
+                break;
+            }
+            case kSqXactStat: {
+                // Confirmed live: SQ_BEGIN/SQ_CMMTWORK/SQ_RBWORK's reply all
+                // lead with this tag, followed by 3 more u16 fields, the
+                // same shape disconnectOrderly already tolerates around
+                // SQ_EXIT.
+                if (!readU16(sock) || !readU16(sock) || !readU16(sock)) {
+                    return std::unexpected(Error{ErrorKind::Transport, "read failed (xactstat fields)"});
+                }
+                break;
+            }
+            default:
+                return std::unexpected(Error{ErrorKind::Protocol,
+                    "unrecognized tag in transaction-control response (opcode " + std::to_string(op) +
+                    ", tag " + std::to_string(*tag) + ") - see protocol.h"});
+        }
+    }
+
+    if (pendingError) return std::unexpected(*pendingError);
+    return {};
+}
+
+} // namespace
+
+std::expected<void, Error> SqliConnection::beginTransaction() {
+    return sendBareOpcodeAndReadReply(sock_, opcode::kBegin);
+}
+
+std::expected<void, Error> SqliConnection::commitTransaction() {
+    return sendBareOpcodeAndReadReply(sock_, opcode::kCommitWork);
+}
+
+std::expected<void, Error> SqliConnection::rollbackTransaction() {
+    // SQ_RBWORK carries a trailing u16 savepoint id after the opcode, unlike
+    // SQ_BEGIN/SQ_CMMTWORK - confirmed against the decompiled JDBC
+    // reference's sendRollback(), which writes 20 then 0 before the caller's
+    // later EOT. Without it the server waits for those two bytes forever
+    // instead of replying. 0 means "roll back the whole transaction", not a
+    // named savepoint - this driver doesn't support savepoints yet.
+    return sendBareOpcodeAndReadReply(sock_, opcode::kRollbackWork, std::uint16_t{0});
+}
+
 std::expected<SqliConnection, Error> SqliConnection::connect(const std::string& host, int port,
                                                                const ConnectParams& params) {
     auto sock = TcpSocket::connect(host, port);
