@@ -65,6 +65,22 @@ struct DatetimeValue {
 // DESCRIBE uses elsewhere in this protocol.
 inline constexpr std::uint16_t kIntegerBindPrecision = 0x0A00;
 
+// SMALLINT/BIGINT bind encoders and their SQ_BIND precision fields, same
+// plain big-endian two's-complement shape as the TUPLE decoders above
+// (confirmed via IfxShort/IfxBigInt.toIfx() -> JavaToIfxSmallInt/
+// JavaToIfxLongBigInt, both byte-identical to the fetch-direction encoding -
+// unlike DECIMAL/DATETIME, whose bind and fetch formats differ). The
+// precision fields are hardcoded per-type constants exactly like
+// kIntegerBindPrecision, confirmed via IfxShort/IfxBigInt.getEncodedLength()
+// (1280 = 0x0500, 4864 = 0x1300) - NOT derived from any DESCRIBE-reported
+// placeholder metadata, unlike the variable-width types (see
+// docs/protocol-notes.md's SQ_BIND notes once the rest of the MVP set is
+// wired up).
+[[nodiscard]] std::vector<std::byte> encodeSmallInt(std::int16_t v);
+[[nodiscard]] std::vector<std::byte> encodeBigInt(std::int64_t v);
+inline constexpr std::uint16_t kSmallIntBindPrecision = 0x0500;
+inline constexpr std::uint16_t kBigIntBindPrecision = 0x1300;
+
 // Fixed-width space-padded CHAR(n). NULL is a leading 0x00 byte (confirmed
 // live); the rest of the buffer is not meaningful in that case. Non-NULL
 // values are returned exactly as stored on the wire (space-padded to the

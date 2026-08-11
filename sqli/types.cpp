@@ -69,6 +69,9 @@ std::expected<std::optional<std::int32_t>, Error> decodeInteger(std::span<const 
 
 std::vector<std::byte> encodeInteger(std::int32_t v) { return writeBigEndian<std::int32_t>(v); }
 
+std::vector<std::byte> encodeSmallInt(std::int16_t v) { return writeBigEndian<std::int16_t>(v); }
+std::vector<std::byte> encodeBigInt(std::int64_t v) { return writeBigEndian<std::int64_t>(v); }
+
 std::expected<std::optional<std::int64_t>, Error> decodeBigInt(std::span<const std::byte> raw) {
     if (raw.size() != 8) return std::unexpected(Error{ErrorKind::Protocol, "BIGINT: expected 8 bytes"});
     auto v = readBigEndian<std::int64_t>(raw);

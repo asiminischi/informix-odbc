@@ -47,6 +47,12 @@ TEST_CASE("SMALLINT") {
     auto null = decodeSmallInt(fromHex("8000"));
     REQUIRE(null.has_value());
     CHECK(!null->has_value());
+
+    // encodeSmallInt is confirmed (see sqli/types.h) to be the same plain
+    // big-endian shape as the TUPLE decoder above, so it must round-trip
+    // through decodeSmallInt exactly.
+    CHECK(encodeSmallInt(12345) == fromHex("3039"));
+    CHECK(encodeSmallInt(-12345) == fromHex("cfc7"));
 }
 
 TEST_CASE("INTEGER") {
@@ -75,6 +81,12 @@ TEST_CASE("BIGINT") {
     auto null = decodeBigInt(fromHex("8000000000000000"));
     REQUIRE(null.has_value());
     CHECK(!null->has_value());
+
+    // encodeBigInt is confirmed (see sqli/types.h) to be the same plain
+    // big-endian shape as the TUPLE decoder above, so it must round-trip
+    // through decodeBigInt exactly.
+    CHECK(encodeBigInt(123456789012345) == fromHex("0000704886 0ddf79"));
+    CHECK(encodeBigInt(-123456789012345) == fromHex("ffff8fb779f22087"));
 }
 
 TEST_CASE("CHAR") {

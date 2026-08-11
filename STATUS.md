@@ -104,9 +104,19 @@ Roughly in the order they'd bite a real application:
    clients (BI tools, admin GUIs, even some ORM schema-introspection code)
    need at least `SQLTables`/`SQLColumns` to do anything beyond a
    hand-typed query.
-3. **Bind parameters cover 1 of 8 MVP types.** Only `SQL_INTEGER` can be
-   bound today. SMALLINT/BIGINT/CHAR/VARCHAR/DATE are straightforward
-   extensions of the same mechanism; DECIMAL/DATETIME need their own
+3. **Bind parameters cover 3 of 8 MVP types.** `SQL_INTEGER`/`SQL_SMALLINT`/
+   `SQL_BIGINT` are done and confirmed live (`tests/integration/test_bind.cpp`)
+   - all three use the same plain big-endian encoding as the fetch direction
+   and a hardcoded SQ_BIND precision field, so no column metadata was needed.
+   CHAR/VARCHAR/DATE are NOT the same straightforward extension this used to
+   say: tracing the decompiled JDBC reference shows their SQ_BIND precision
+   field comes from the target column's DESCRIBE-reported width, not a
+   constant - VARCHAR's encoded buffer size is fixed at that declared width
+   (`leng + 1` bytes) rather than derived from the actual string length, so a
+   wrong value there is a wire-framing bug, not just a validation nicety.
+   `driver/bind_encode.cpp`'s `encodeBindParam` currently discards
+   `SQLBindParameter`'s `ColumnSize`/`DecimalDigits` - that will need
+   threading through for these three. DECIMAL/DATETIME still need their own
    encoders since their BIND wire format differs from their fetch format
    (documented in `docs/protocol-notes.md`).
 4. **No DSN-based connect (`SQLConnect`).** Only `SQLDriverConnect` with an

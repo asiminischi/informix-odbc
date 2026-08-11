@@ -9,3 +9,9 @@ target_link_libraries(transactions_integration_test PRIVATE ifx_sqli)
 
 add_test(NAME transactions_integration COMMAND transactions_integration_test)
 set_tests_properties(transactions_integration PROPERTIES LABELS "integration")
+
+add_executable(bind_integration_test test_bind.cpp)
+target_link_libraries(bind_integration_test PRIVATE ifx_sqli)
+
+add_test(NAME bind_integration COMMAND bind_integration_test)
+set_tests_properties(bind_integration PROPERTIES LABELS "integration")

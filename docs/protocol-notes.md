@@ -247,7 +247,7 @@ Confirmed opcodes (see `sqli/protocol.h`):
 | SQ_PREPARE (SQL text + placeholder count) | 2 | C→S |
 | SQ_CURSOR_NAME | 3 | C→S |
 | SQ_ID (selects which prepared statement subsequent messages target) | 4 | C→S |
-| SQ_BIND | 5 | C→S (unused — no bind params in Phase 2 scope) |
+| SQ_BIND | 5 | C→S |
 | SQ_OPEN (opens a cursor for a prepared SELECT) | 6 | C→S |
 | SQ_EXECUTE | 7 | C→S |
 | SQ_DESCRIBE | 8 | S→C |
@@ -363,31 +363,54 @@ nothing for `SQ_CLOSE` to close).
 
 **SQ_BIND** (`SqliStatement::execute`, sent - for both the cursor and
 no-cursor branches - right after `statementId`, only when the statement has
-bound parameters; confirmed live for `SQL_INTEGER`, Phase 5's first slice):
-`u16(5)`, `u16(count)`, then per parameter: `ifxType`(u16), `indicator`(u16:
-`0xFFFF`/-1 for NULL, `0` for a real value). **Only when non-NULL**:
-`precisionField`(u16) then the encoded value bytes, padded to even length
-(same even-alignment rule as every other variable-length field in this
-protocol). A NULL parameter sends nothing beyond the indicator — no
-precision field, no data bytes at all. `precisionField`'s meaning is
-type-specific metadata, **not a byte count** (the byte count is either
-implicit from the fixed type width, or self-embedded in the value's own
-encoding - see below): for INTEGER it's the constant `0x0A00` (confirmed via
-the decompiled JDBC driver's `IfxInteger.getEncodedLength()` - a hardcoded
-`(precision << 8) | 0` value, `10` being INTEGER's max decimal digit count,
-the same `(precision << 8 | scale)`-shaped metadata DESCRIBE uses elsewhere);
-SMALLINT/BIGINT have their own analogous constants (`0x0500`/`0x1300`, not
-yet used live); for DECIMAL it's the value's scale alone (not
-precision-shifted); for DATETIME it's the qualifier (same packed
-`(totalDigits << 8) | qualifierByte` DESCRIBE already uses). Value encoding
-for a non-NULL parameter is **not always the same bytes as the TUPLE-format
-decoders in `sqli/types.h`** — confirmed for INTEGER (identical: plain
-big-endian, fixed 4 bytes) but DECIMAL/DATETIME's BIND encoding additionally
-prepends a 2-byte length (`dec_ndgts + 1`) that the TUPLE format doesn't
-have (per the decompiled `IfxDecimal.convIfx`'s `prependLength` parameter -
-not yet implemented or live-tested, since this slice deliberately proved the
-wire plumbing on INTEGER alone first before widening to the rest of the MVP
-scalar types).
+bound parameters; confirmed live for `SQL_INTEGER`/`SQL_SMALLINT`/
+`SQL_BIGINT`, see `tests/integration/test_bind.cpp`): `u16(5)`, `u16(count)`,
+then per parameter: `ifxType`(u16), `indicator`(u16: `0xFFFF`/-1 for NULL,
+`0` for a real value). **Only when non-NULL**: `precisionField`(u16) then the
+encoded value bytes, padded to even length (same even-alignment rule as
+every other variable-length field in this protocol, confirmed via
+`IfxDataOutputStream.writePadded`: a plain `write(bytes)` plus a single
+0-byte pad if odd, **no length prefix of its own**, so any field whose
+byte count isn't implicit from the type alone must carry that information
+via `precisionField` or an embedded length inside the value bytes. A NULL
+parameter sends nothing beyond the indicator, no precision field, no data
+bytes at all.
+
+`precisionField`'s meaning is type-specific metadata:
+- **INTEGER/SMALLINT/BIGINT**: a hardcoded constant, confirmed via the
+  decompiled JDBC driver's `IfxInteger`/`IfxShort`/`IfxBigInt.
+  getEncodedLength()` (`0x0A00`/`0x0500`/`0x1300` respectively, a
+  `(precision << 8) | 0` value, the digit count being each type's max
+  decimal digits, the same `(precision << 8 | scale)` shape DESCRIBE uses
+  elsewhere). The value bytes are the same plain big-endian encoding as the
+  TUPLE-format decoders in `sqli/types.h`, confirmed identical for all
+  three by live round-trip (encode → SQ_BIND → server storage → plain
+  SELECT → decode, matching the original value exactly).
+- **CHAR**: not yet implemented, but traced via the decompiled
+  `IfxChar.toIfx()` → `JavaToIfxChar`: the value bytes are **self-describing**
+  (`u16` length + raw bytes, the same shape as this protocol's own
+  `ifxChar2`), so `precisionField` there is metadata the server presumably
+  validates against the declared column width, not framing the client needs
+  to get exactly right to avoid a desync; still needs a live check before
+  relying on that read.
+- **VARCHAR**: not yet implemented, but traced via `JavaToIfxVarChar(s,
+  dbEnc, leng, usestrenc)`: the encoded buffer is **fixed at `leng + 1`
+  bytes** (`leng` being the *declared target column width*, not derived
+  from the actual string length) with a `u8` actual-length prefix inside.
+  This makes `precisionField` load-bearing wire framing for VARCHAR
+  specifically: a wrong value changes how many bytes were actually
+  written, unlike CHAR/INTEGER/SMALLINT/BIGINT where the framing is
+  self-evident. `driver/bind_encode.cpp` will need `SQLBindParameter`'s
+  `ColumnSize` threaded through to encode this correctly, which it
+  currently discards.
+- **DECIMAL**: the value's scale alone (not precision-shifted).
+- **DATETIME**: the qualifier (same packed `(totalDigits << 8) |
+  qualifierByte` DESCRIBE already uses).
+
+DECIMAL/DATETIME's BIND value encoding additionally prepends a 2-byte length
+(`dec_ndgts + 1`) that the TUPLE format doesn't have (per the decompiled
+`IfxDecimal.convIfx`'s `prependLength` parameter), not yet implemented or
+live-tested.
 
 **SQ_RETURN_TYPE + SQ_FETCH** (`SqliStatement::fetchNextBatch`): `u16(4)`,
 `statementId`(u16), then — **only on the first fetch for a given cursor** —
