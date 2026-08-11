@@ -110,7 +110,8 @@ void check(const char* label, bool condition) {
     }
     if (auto r = setup->executeCommand(
             "create table bind_probe (col_smallint smallint, col_integer integer, col_bigint bigint,"
-            " col_char char(20), col_varchar varchar(32), col_date date, col_decimal decimal(10,2))");
+            " col_char char(20), col_varchar varchar(32), col_date date, col_decimal decimal(10,2),"
+            " col_datetime datetime year to second)");
         !r) {
         std::fprintf(stderr, "create table failed: %s\n", r.error().message.c_str());
         return false;
@@ -126,7 +127,7 @@ void check(const char* label, bool condition) {
         return false;
     }
 
-    auto insertStmt = SqliStatement::prepare(*conn, "insert into bind_probe values (?, ?, ?, ?, ?, ?, ?)");
+    auto insertStmt = SqliStatement::prepare(*conn, "insert into bind_probe values (?, ?, ?, ?, ?, ?, ?, ?)");
     if (!insertStmt) {
         std::fprintf(stderr, "prepare insert failed: %s\n", insertStmt.error().message.c_str());
         return false;
@@ -144,6 +145,13 @@ void check(const char* label, bool condition) {
         std::fprintf(stderr, "encodeDecimal failed: %s\n", decimalEncoded.error().message.c_str());
         return false;
     }
+    DatetimeValue datetimeValue{2026, 7, 29, 12, 34, 56};
+    constexpr std::uint32_t kYearToSecond = (14u << 8) | 0x0A;
+    auto datetimeEncoded = encodeDatetime(datetimeValue, kYearToSecond);
+    if (!datetimeEncoded) {
+        std::fprintf(stderr, "encodeDatetime failed: %s\n", datetimeEncoded.error().message.c_str());
+        return false;
+    }
     std::vector<BindParam> params2;
     params2.push_back(BindParam{ifxtype::kSmallInt, false, encodeSmallInt(-12345), kSmallIntBindPrecision});
     params2.push_back(BindParam{ifxtype::kInteger, false, encodeInteger(1234567890), kIntegerBindPrecision});
@@ -155,6 +163,8 @@ void check(const char* label, bool condition) {
                                  static_cast<std::uint16_t>(varcharValue.size())});
     params2.push_back(BindParam{ifxtype::kDate, false, encodeDateUnixDays(dateUnixDays), 4});
     params2.push_back(BindParam{ifxtype::kDecimal, false, decimalEncoded->data, decimalEncoded->scale});
+    params2.push_back(BindParam{ifxtype::kDatetime, false, *datetimeEncoded,
+                                 static_cast<std::uint16_t>(kYearToSecond)});
     if (auto r = insertStmt->execute(params2); !r) {
         std::fprintf(stderr, "execute insert failed: %s\n", r.error().message.c_str());
         return false;
@@ -164,7 +174,7 @@ void check(const char* label, bool condition) {
 
     auto selectStmt = SqliStatement::prepare(*conn,
                                               "select col_smallint, col_integer, col_bigint, col_char, col_varchar,"
-                                              " col_date, col_decimal from bind_probe");
+                                              " col_date, col_decimal, col_datetime from bind_probe");
     if (!selectStmt) {
         std::fprintf(stderr, "prepare select failed: %s\n", selectStmt.error().message.c_str());
         return false;
@@ -190,7 +200,9 @@ void check(const char* label, bool condition) {
     auto varcharVal = decodeVarchar((**row)[4]);
     auto dateVal = decodeDateUnixDays((**row)[5]);
     auto decimalVal = decodeDecimal((**row)[6], 10, 2);
-    if (!smallintVal || !integerVal || !bigintVal || !charVal || !varcharVal || !dateVal || !decimalVal) {
+    auto datetimeVal = decodeDatetime((**row)[7], kYearToSecond);
+    if (!smallintVal || !integerVal || !bigintVal || !charVal || !varcharVal || !dateVal || !decimalVal ||
+        !datetimeVal) {
         std::fprintf(stderr, "decode failed\n");
         return false;
     }
@@ -205,6 +217,10 @@ void check(const char* label, bool condition) {
     check("bound VARCHAR round-trips", varcharVal->has_value() && **varcharVal == "varchar!");
     check("bound DATE round-trips", dateVal->has_value() && **dateVal == dateUnixDays);
     check("bound DECIMAL round-trips", decimalVal->has_value() && **decimalVal == "-12345.67");
+    check("bound DATETIME round-trips", datetimeVal->has_value() && (*datetimeVal)->year == 2026 &&
+                                             (*datetimeVal)->month == 7 && (*datetimeVal)->day == 29 &&
+                                             (*datetimeVal)->hour == 12 && (*datetimeVal)->minute == 34 &&
+                                             (*datetimeVal)->second == 56);
 
     if (auto r = selectStmt->close(); !r) return false;
     if (auto r = selectStmt->release(); !r) return false;

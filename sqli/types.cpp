@@ -300,8 +300,24 @@ std::expected<DecimalBindEncoding, Error> encodeDecimal(std::string_view decimal
     return result;
 }
 
-std::expected<std::optional<DatetimeValue>, Error> decodeDatetime(std::span<const std::byte> raw,
-                                                                     std::uint32_t encodedLength) {
+namespace {
+
+// Field order matches wire order: YEAR (2 mantissa bytes / 4 decimal
+// digits) then MONTH/DAY/HOUR/MINUTE/SECOND (1 mantissa byte each). Shared
+// by decodeDatetime and encodeDatetime so both directions can't drift.
+struct DatetimeField {
+    unsigned tu;
+    unsigned mantissaBytes;
+};
+constexpr std::array<DatetimeField, 6> kDatetimeFields{{{0, 2}, {2, 1}, {4, 1}, {6, 1}, {8, 1}, {10, 1}}};
+
+struct DatetimeQualifier {
+    unsigned totalDigits;
+    unsigned start;
+    unsigned end;
+};
+
+std::expected<DatetimeQualifier, Error> parseDatetimeQualifier(std::uint32_t encodedLength) {
     unsigned totalDigits = (encodedLength >> 8) & 0xFF;
     unsigned qualifierByte = encodedLength & 0xFF;
     unsigned start = (qualifierByte >> 4) & 0xF;
@@ -314,11 +330,17 @@ std::expected<std::optional<DatetimeValue>, Error> decodeDatetime(std::span<cons
     if (start > end || start % 2 != 0 || end % 2 != 0) {
         return std::unexpected(Error{ErrorKind::Protocol, "DATETIME: malformed qualifier byte"});
     }
+    return DatetimeQualifier{totalDigits, start, end};
+}
 
-    // Field order matches wire order: YEAR (2 mantissa bytes / 4 decimal
-    // digits) then MONTH/DAY/HOUR/MINUTE/SECOND (1 mantissa byte each).
-    struct Field { unsigned tu; unsigned mantissaBytes; };
-    static constexpr std::array<Field, 6> kFields{{{0, 2}, {2, 1}, {4, 1}, {6, 1}, {8, 1}, {10, 1}}};
+} // namespace
+
+std::expected<std::optional<DatetimeValue>, Error> decodeDatetime(std::span<const std::byte> raw,
+                                                                     std::uint32_t encodedLength) {
+    auto qualifierR = parseDatetimeQualifier(encodedLength);
+    if (!qualifierR) return std::unexpected(qualifierR.error());
+    auto [totalDigits, start, end] = *qualifierR;
+    const auto& kFields = kDatetimeFields;
 
     std::size_t expectedMantissa = 0;
     unsigned expectedDigits = 0;
@@ -357,6 +379,48 @@ std::expected<std::optional<DatetimeValue>, Error> decodeDatetime(std::span<cons
         }
     }
     return result;
+}
+
+std::expected<std::vector<std::byte>, Error> encodeDatetime(const DatetimeValue& value,
+                                                                std::uint32_t encodedLength) {
+    auto qualifierR = parseDatetimeQualifier(encodedLength);
+    if (!qualifierR) return std::unexpected(qualifierR.error());
+    unsigned start = qualifierR->start;
+    unsigned end = qualifierR->end;
+
+    std::vector<int> mantissa;
+    for (const auto& f : kDatetimeFields) {
+        if (f.tu < start || f.tu > end) continue;
+        int fieldValue = 0;
+        switch (f.tu) {
+            case 0: fieldValue = value.year; break;
+            case 2: fieldValue = value.month; break;
+            case 4: fieldValue = value.day; break;
+            case 6: fieldValue = value.hour; break;
+            case 8: fieldValue = value.minute; break;
+            case 10: fieldValue = value.second; break;
+        }
+        if (f.mantissaBytes == 2) {
+            mantissa.push_back(fieldValue / 100);
+            mantissa.push_back(fieldValue % 100);
+        } else {
+            mantissa.push_back(fieldValue);
+        }
+    }
+
+    // Confirmed live (see decodeDatetime's doc comment): the exponent
+    // byte's biased magnitude equals the total mantissa byte count, always
+    // positive - datetimes aren't signed, so there's no complement step
+    // DECIMAL's negative case needs.
+    auto decNdgts = static_cast<std::uint16_t>(mantissa.size());
+    auto exponentByte = static_cast<std::uint8_t>(0x80 | ((64 + decNdgts) & 0x7F));
+
+    std::vector<std::byte> data;
+    auto lengthField = writeBigEndian<std::uint16_t>(static_cast<std::uint16_t>(decNdgts + 1));
+    data.insert(data.end(), lengthField.begin(), lengthField.end());
+    data.push_back(std::byte{exponentByte});
+    for (int d : mantissa) data.push_back(static_cast<std::byte>(static_cast<unsigned char>(d)));
+    return data;
 }
 
 } // namespace ifxsqli

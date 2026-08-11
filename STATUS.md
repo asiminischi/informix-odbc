@@ -8,11 +8,13 @@ as part of writing this report; see "How this was verified" below).
 This is a working prototype, not a production-grade driver yet. The protocol
 layer and a real ODBC surface both round-trip correctly against a live
 Informix server today, confirmed via `isql` through the actual unixODBC
-Driver Manager, not just unit tests. But large, expected pieces of a
-production ODBC driver are still missing outright: transactions, catalog
-functions (`SQLTables`/`SQLColumns`/...), most bind-parameter types, Unicode,
-Windows driver registration, LOBs, and more. See "Gaps to close before
-production-grade" below for the concrete list.
+Driver Manager, not just unit tests. Transactions and all 8 MVP
+bind-parameter types are done and confirmed live. But large, expected pieces
+of a production ODBC driver are still missing outright: `SQLEndTran` isn't
+wired to the now-working transaction primitive yet, catalog functions
+(`SQLTables`/`SQLColumns`/...), Unicode, Windows driver registration, LOBs,
+and more. See "Gaps to close before production-grade" below for the concrete
+list.
 
 ## What's done (verified live, not just "compiles")
 
@@ -104,28 +106,33 @@ Roughly in the order they'd bite a real application:
    clients (BI tools, admin GUIs, even some ORM schema-introspection code)
    need at least `SQLTables`/`SQLColumns` to do anything beyond a
    hand-typed query.
-3. **Bind parameters cover 7 of 8 MVP types.** `SQL_INTEGER`/`SQL_SMALLINT`/
-   `SQL_BIGINT`/`SQL_CHAR`/`SQL_VARCHAR`/`SQL_TYPE_DATE`/`SQL_DECIMAL` are
-   done and confirmed live (`tests/integration/test_bind.cpp`), none
-   needing `SQLBindParameter`'s `ColumnSize`/`DecimalDigits` (still
-   discarded by `driver/bind_encode.cpp`'s `encodeBindParam`) - the integer
-   types and DATE use a hardcoded SQ_BIND precision field, CHAR/VARCHAR's
-   value bytes are self-describing (a length prefix inside the data
-   itself), and DECIMAL's precision field is the value's own scale
-   (`BigDecimal.scale()`, i.e. however many digits the caller wrote after
-   the decimal point) rather than any target column's declared scale - all
-   confirmed live to need no column metadata, including that a
-   minimally-sized DECIMAL mantissa (not padded to the target column's
-   declared precision) round-trips fine. `SQL_DECIMAL` binds go through an
-   exact decimal-literal string (`SQL_C_CHAR`), matching this driver's
-   existing exact-DECIMAL-fetch convention, since there's no
-   `SQL_NUMERIC_STRUCT` support. Note VARCHAR was initially mis-traced - a
-   first pass followed `IfxVarChar.toIfxTuple()` (a bulk-load path, not
-   `sendBind`'s) and concluded the encoded buffer was fixed at the declared
-   column width; the real bind path (`toIfx()`) turned out to be identical
-   to CHAR's. Remaining: DATETIME, the last MVP type, which needs its own
-   encoder since its BIND wire format differs from its fetch format
-   (documented in `docs/protocol-notes.md`).
+3. **~~Bind parameters cover N of 8 MVP types~~ - done.** All 8 MVP types
+   (`SQL_INTEGER`/`SQL_SMALLINT`/`SQL_BIGINT`/`SQL_CHAR`/`SQL_VARCHAR`/
+   `SQL_TYPE_DATE`/`SQL_DECIMAL`/`SQL_TYPE_TIMESTAMP`) are confirmed live
+   (`tests/integration/test_bind.cpp`), none needing `SQLBindParameter`'s
+   `ColumnSize`/`DecimalDigits` (still discarded by
+   `driver/bind_encode.cpp`'s `encodeBindParam`) - the integer types and
+   DATE use a hardcoded SQ_BIND precision field, CHAR/VARCHAR's value
+   bytes are self-describing (a length prefix inside the data itself),
+   and DECIMAL/DATETIME's precision field is intrinsic to the value
+   itself (scale, or qualifier) rather than the target column's declared
+   metadata - all confirmed live to need no column metadata, including
+   that a minimally-sized DECIMAL mantissa (not padded to the target
+   column's declared precision) round-trips fine. `SQL_DECIMAL` binds go
+   through an exact decimal-literal string (`SQL_C_CHAR`), matching this
+   driver's existing exact-DECIMAL-fetch convention, since there's no
+   `SQL_NUMERIC_STRUCT` support. `SQL_TYPE_TIMESTAMP` is scoped to
+   whole-second `YEAR TO SECOND` only, hardcoded rather than derived from
+   the target column's actual qualifier (the only one confirmed live);
+   FRACTION values are rejected outright rather than silently truncated.
+   Note VARCHAR was initially mis-traced - a first pass followed
+   `IfxVarChar.toIfxTuple()` (a bulk-load path, not `sendBind`'s) and
+   concluded the encoded buffer was fixed at the declared column width;
+   the real bind path (`toIfx()`) turned out to be identical to CHAR's.
+   This is still just the 8-type MVP set, not the full type system BOP's
+   Informix plugin eventually needs (LOB, FLOAT/SMALLFLOAT, BOOLEAN,
+   INTERVAL, sub-second DATETIME all remain unimplemented on both the
+   bind and fetch sides).
 4. **No DSN-based connect (`SQLConnect`).** Only `SQLDriverConnect` with an
    explicit keyword string works today. Fine for `isql -k`, but many
    GUI/ODBC-Admin tools default to the DSN path.
@@ -188,16 +195,16 @@ notes:
 
 ## Suggested next steps, in priority order
 
-1. Finish bind-parameter coverage for the remaining 7 MVP types.
-2. Wire `SQLEndTran` to the now-confirmed `SqliConnection::beginTransaction`/
+1. Wire `SQLEndTran` to the now-confirmed `SqliConnection::beginTransaction`/
    `commitTransaction`/`rollbackTransaction`, plus `SQL_ATTR_AUTOCOMMIT`
    handling.
-3. Catalog functions: `SQLTables`/`SQLColumns` first (unblocks the most
+2. Catalog functions: `SQLTables`/`SQLColumns` first (unblocks the most
    client tooling), then `SQLGetTypeInfo`/`SQLPrimaryKeys`/`SQLStatistics`.
-4. Windows driver registration (registry helper plus install doc) so the
+3. Windows driver registration (registry helper plus install doc) so the
    native Windows ODBC DM path is actually usable, not just the DLL.
-5. Remaining scalar types (FLOAT/SMALLFLOAT/BOOLEAN/INTERVAL), then LOBs.
-6. Unicode (`SQLWCHAR`) support.
+4. Remaining scalar types beyond the MVP-8 set (FLOAT/SMALLFLOAT/BOOLEAN/
+   INTERVAL, sub-second DATETIME), then LOBs - both bind and fetch sides.
+5. Unicode (`SQLWCHAR`) support.
 7. SSL and PAM auth.
 8. Thread-safety pass plus connection pooling.
 9. Installer packaging for both platforms.

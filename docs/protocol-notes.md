@@ -431,15 +431,30 @@ bytes at all.
   minimally-sized mantissa (exactly as many bytes as the literal's own
   digits need) rather than requiring it padded to the target column's
   declared precision.
-- **DATETIME**: the qualifier (same packed `(totalDigits << 8) |
-  qualifierByte` DESCRIBE already uses). Not yet implemented.
+- **DATETIME**: confirmed live for `YEAR TO SECOND`
+  (`tests/integration/test_bind.cpp`). The precision field is the qualifier
+  (same packed `(totalDigits << 8) | qualifierByte` DESCRIBE already uses),
+  hardcoded to `YEAR TO SECOND` in `driver/bind_encode.cpp` rather than
+  derived from the target column's actual declared qualifier - this
+  driver has no column metadata to consult at bind time regardless (same
+  limitation as DATE/CHAR/VARCHAR), and `YEAR TO SECOND` is the only
+  qualifier confirmed live on either the fetch or bind side so far.
+  FRACTION qualifiers are rejected outright rather than silently
+  truncated. `sqli::encodeDatetime`'s exact output bytes were hand-derived
+  and checked in a unit test (see `tests/sqli/test_types.cpp`) *before*
+  ever going live, reusing the same value already confirmed live on the
+  decode side (`2026-07-29 12:34:56`) - the prediction matched the actual
+  live round trip on the first attempt.
 
 DECIMAL/DATETIME's BIND value encoding additionally prepends a 2-byte length
 (`dec_ndgts + 1`, the byte count of the exponent+mantissa that follows) that
 the TUPLE format doesn't have - confirmed for DECIMAL via the decompiled
 `IfxDecimal.toIfx()` → `convIfx(true)` (its `convIfx(false)`, used by
 `toIfxTuple()`, is the bulk-load path and what `decodeDecimal`'s shape
-matches instead). DATETIME's is not yet implemented or live-tested.
+matches instead), and for DATETIME via `IfxDateTime.toIfx()` routing
+through the same `Decimal.javaToIfx()` encoder `IfxDecimal.toIfx()` uses -
+Informix DATETIME reuses DECIMAL's packed-digit wire machinery end to end,
+not just its TUPLE-format decode shape.
 
 **SQ_RETURN_TYPE + SQ_FETCH** (`SqliStatement::fetchNextBatch`): `u16(4)`,
 `statementId`(u16), then — **only on the first fetch for a given cursor** —

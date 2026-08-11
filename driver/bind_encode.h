@@ -8,11 +8,15 @@
 // take an already-fetched column's raw bytes and a ColumnDesc; encoding
 // starts from an ODBC C value instead.
 //
-// SQL_INTEGER/SQL_SMALLINT/SQL_BIGINT/SQL_CHAR/SQL_VARCHAR/SQL_TYPE_DATE/
-// SQL_DECIMAL are done - none of them need SQLBindParameter's ColumnSize/
-// DecimalDigits (still discarded), see docs/protocol-notes.md's SQ_BIND
-// notes for why (DECIMAL's precisionField is the value's own scale, not
-// any target column's declared scale). Still missing: DATETIME.
+// All 8 MVP scalar types are done: SQL_INTEGER/SQL_SMALLINT/SQL_BIGINT/
+// SQL_CHAR/SQL_VARCHAR/SQL_TYPE_DATE/SQL_DECIMAL/SQL_TYPE_TIMESTAMP. None
+// of them need SQLBindParameter's ColumnSize/DecimalDigits (still
+// discarded) - see docs/protocol-notes.md's SQ_BIND notes for why
+// (DECIMAL's precisionField is the value's own scale, not any target
+// column's declared scale). SQL_TYPE_TIMESTAMP is scoped to whole-second
+// YEAR TO SECOND only (hardcoded, not derived from the target column's
+// actual qualifier - the only one confirmed live); FRACTION qualifiers
+// are rejected rather than silently truncated.
 
 #include "sqli/statement.h"
 

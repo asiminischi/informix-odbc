@@ -194,4 +194,26 @@ struct DecimalBindEncoding {
 [[nodiscard]] std::expected<std::optional<DatetimeValue>, Error> decodeDatetime(std::span<const std::byte> raw,
                                                                                   std::uint32_t encodedLength);
 
+// DATETIME bind encoding for whole-second qualifiers only, same scope
+// restriction as decodeDatetime (FRACTION isn't supported - see its doc
+// comment). `encodedLength` is the same packed (totalDigits << 8) |
+// qualifierByte value decodeDatetime takes; `value`'s fields outside
+// [start, end] are ignored. Unlike DATE, this genuinely differs from
+// decodeDatetime's TUPLE-format shape: it prepends a u16 length
+// (dec_ndgts + 1), the same bind-only framing DECIMAL uses - confirmed via
+// the decompiled JDBC reference's IfxDateTime.toIfx() routing through
+// Decimal.javaToIfx() (the exact same encoder IfxDecimal.toIfx() uses,
+// since Informix DATETIME reuses DECIMAL's packed-digit wire machinery
+// end to end, not just its TUPLE-format decode shape). The exponent
+// byte's biased magnitude equals the total mantissa byte count (matching
+// decodeDatetime's own confirmed-live observation that this holds for
+// YEAR TO SECOND, generalized here rather than re-derived per qualifier),
+// always positive - no hundred's-complement step, since datetimes aren't
+// signed. Confirmed live for YEAR TO SECOND
+// (tests/integration/test_bind.cpp), including a hand-derived exact-byte
+// unit test predicted before ever touching the network - the output
+// matched on the first live attempt.
+[[nodiscard]] std::expected<std::vector<std::byte>, Error> encodeDatetime(const DatetimeValue& value,
+                                                                            std::uint32_t encodedLength);
+
 } // namespace ifxsqli

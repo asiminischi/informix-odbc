@@ -3,6 +3,7 @@
 #include "sqli/types.h"
 
 #include <cctype>
+#include <span>
 #include <vector>
 
 namespace {
@@ -247,4 +248,28 @@ TEST_CASE("DATETIME YEAR TO SECOND") {
     auto null = decodeDatetime(fromHex("0000000000000000"), kEncLen);
     REQUIRE(null.has_value());
     CHECK(!null->has_value());
+}
+
+TEST_CASE("DATETIME YEAR TO SECOND bind encoding") {
+    constexpr std::uint32_t kEncLen = (14u << 8) | 0x0A;
+
+    // encodeDatetime's only difference from decodeDatetime's TUPLE-format
+    // shape is a 2-byte length prefix (dec_ndgts + 1 = 8) - so this must
+    // produce exactly the same exponent+mantissa bytes as the confirmed
+    // live decode test above for the same value, just with that prefix
+    // prepended.
+    DatetimeValue value{2026, 7, 29, 12, 34, 56};
+    auto encoded = encodeDatetime(value, kEncLen);
+    REQUIRE(encoded.has_value());
+    CHECK(*encoded == fromHex("0008 c7141a071d0c2238"));
+
+    auto decoded = decodeDatetime(std::span<const std::byte>(encoded->data() + 2, encoded->size() - 2), kEncLen);
+    REQUIRE(decoded.has_value());
+    REQUIRE(decoded->has_value());
+    CHECK((*decoded)->year == 2026);
+    CHECK((*decoded)->month == 7);
+    CHECK((*decoded)->day == 29);
+    CHECK((*decoded)->hour == 12);
+    CHECK((*decoded)->minute == 34);
+    CHECK((*decoded)->second == 56);
 }
