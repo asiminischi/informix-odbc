@@ -393,16 +393,15 @@ bytes at all.
   can just be the string's own length - the server does not require it to
   match the target column's declared width (a 10-byte value bound into a
   `CHAR(20)` column round-tripped correctly with `precisionField=10`).
-- **VARCHAR**: not yet implemented, but traced via `JavaToIfxVarChar(s,
-  dbEnc, leng, usestrenc)`: the encoded buffer is **fixed at `leng + 1`
-  bytes** (`leng` being the *declared target column width*, not derived
-  from the actual string length) with a `u8` actual-length prefix inside.
-  This makes `precisionField` load-bearing wire framing for VARCHAR
-  specifically: a wrong value changes how many bytes were actually
-  written, unlike CHAR/INTEGER/SMALLINT/BIGINT where the framing is
-  self-evident. `driver/bind_encode.cpp` will need `SQLBindParameter`'s
-  `ColumnSize` threaded through to encode this correctly, which it
-  currently discards.
+- **VARCHAR**: confirmed live (`tests/integration/test_bind.cpp`), same as
+  CHAR. First traced to the wrong method (`IfxVarChar.toIfxTuple()`, which
+  calls `JavaToIfxVarChar(s, dbEnc, leng, usestrenc)` and *would* fix the
+  buffer at the declared column width) before catching that `toIfxTuple()`
+  is the bulk PUT-array load path, not `sendBind`'s. `IfxVarChar.toIfx()`
+  (the real bind path) calls the exact same `JavaToIfxChar` as CHAR -
+  identical self-describing shape, `precisionField` confirmed live to just
+  be the string's own length here too, needing no `ColumnSize`. Reuses
+  `encodeChar` directly; only `ifxType` differs (13, not 0).
 - **DECIMAL**: the value's scale alone (not precision-shifted).
 - **DATETIME**: the qualifier (same packed `(totalDigits << 8) |
   qualifierByte` DESCRIBE already uses).

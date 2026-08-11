@@ -34,12 +34,13 @@ BindEncodeResult encodeBindParam(SQLSMALLINT valueType, SQLSMALLINT parameterTyp
         p.precisionField = ifxsqli::kBigIntBindPrecision;
         return BindEncodeResult{BindEncodeStatus::kOk, std::move(p)};
     }
-    if (parameterType == SQL_CHAR && (valueType == SQL_C_CHAR || valueType == SQL_C_DEFAULT)) {
+    if ((parameterType == SQL_CHAR || parameterType == SQL_VARCHAR) &&
+        (valueType == SQL_C_CHAR || valueType == SQL_C_DEFAULT)) {
         const auto* text = static_cast<const char*>(parameterValuePtr);
         std::string_view s = strLenOrInd == SQL_NTS ? std::string_view(text)
                                                       : std::string_view(text, static_cast<std::size_t>(strLenOrInd));
         ifxsqli::BindParam p;
-        p.ifxType = ifxsqli::ifxtype::kChar;
+        p.ifxType = parameterType == SQL_CHAR ? ifxsqli::ifxtype::kChar : ifxsqli::ifxtype::kVarchar;
         p.isNull = false;
         p.data = ifxsqli::encodeChar(s);
         p.precisionField = static_cast<std::uint16_t>(s.size());

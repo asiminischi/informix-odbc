@@ -45,7 +45,7 @@ void check(const char* label, bool condition) {
     }
     if (auto r = setup->executeCommand(
             "create table bind_probe (col_smallint smallint, col_integer integer, col_bigint bigint,"
-            " col_char char(20))");
+            " col_char char(20), col_varchar varchar(32))");
         !r) {
         std::fprintf(stderr, "create table failed: %s\n", r.error().message.c_str());
         return false;
@@ -61,13 +61,18 @@ void check(const char* label, bool condition) {
         return false;
     }
 
-    auto insertStmt = SqliStatement::prepare(*conn, "insert into bind_probe values (?, ?, ?, ?)");
+    auto insertStmt = SqliStatement::prepare(*conn, "insert into bind_probe values (?, ?, ?, ?, ?)");
     if (!insertStmt) {
         std::fprintf(stderr, "prepare insert failed: %s\n", insertStmt.error().message.c_str());
         return false;
     }
 
-    std::string_view charValue = "hello bind";
+    // Deliberately odd byte length (7): exercises writeBindBlock's
+    // even-alignment pad path, which the prior "hello bind" (10 bytes,
+    // even) value never touched - this protocol's own history is full of
+    // odd-length bugs masked until a differently-shaped value hit them.
+    std::string_view charValue = "hi bind";
+    std::string_view varcharValue = "varchar!";
     std::vector<BindParam> params2;
     params2.push_back(BindParam{ifxtype::kSmallInt, false, encodeSmallInt(-12345), kSmallIntBindPrecision});
     params2.push_back(BindParam{ifxtype::kInteger, false, encodeInteger(1234567890), kIntegerBindPrecision});
@@ -75,6 +80,8 @@ void check(const char* label, bool condition) {
         BindParam{ifxtype::kBigInt, false, encodeBigInt(123456789012345), kBigIntBindPrecision});
     params2.push_back(BindParam{ifxtype::kChar, false, encodeChar(charValue),
                                  static_cast<std::uint16_t>(charValue.size())});
+    params2.push_back(BindParam{ifxtype::kVarchar, false, encodeChar(varcharValue),
+                                 static_cast<std::uint16_t>(varcharValue.size())});
     if (auto r = insertStmt->execute(params2); !r) {
         std::fprintf(stderr, "execute insert failed: %s\n", r.error().message.c_str());
         return false;
@@ -82,8 +89,8 @@ void check(const char* label, bool condition) {
     if (auto r = insertStmt->close(); !r) return false;
     if (auto r = insertStmt->release(); !r) return false;
 
-    auto selectStmt =
-        SqliStatement::prepare(*conn, "select col_smallint, col_integer, col_bigint, col_char from bind_probe");
+    auto selectStmt = SqliStatement::prepare(
+        *conn, "select col_smallint, col_integer, col_bigint, col_char, col_varchar from bind_probe");
     if (!selectStmt) {
         std::fprintf(stderr, "prepare select failed: %s\n", selectStmt.error().message.c_str());
         return false;
@@ -106,7 +113,8 @@ void check(const char* label, bool condition) {
     auto integerVal = decodeInteger((**row)[1]);
     auto bigintVal = decodeBigInt((**row)[2]);
     auto charVal = decodeChar((**row)[3]);
-    if (!smallintVal || !integerVal || !bigintVal || !charVal) {
+    auto varcharVal = decodeVarchar((**row)[4]);
+    if (!smallintVal || !integerVal || !bigintVal || !charVal || !varcharVal) {
         std::fprintf(stderr, "decode failed\n");
         return false;
     }
@@ -114,9 +122,11 @@ void check(const char* label, bool condition) {
     check("bound INTEGER round-trips", integerVal->has_value() && **integerVal == 1234567890);
     check("bound BIGINT round-trips", bigintVal->has_value() && **bigintVal == 123456789012345);
     // CHAR(20) is space-padded to the declared width on the wire (see
-    // decodeChar's doc comment) - "hello bind" is 10 bytes, so 10 trailing
-    // spaces are expected, not a bug in either direction.
-    check("bound CHAR round-trips", charVal->has_value() && **charVal == "hello bind          ");
+    // decodeChar's doc comment) - compute the expected padded form instead
+    // of hand-counting trailing spaces.
+    std::string expectedChar = std::string(charValue) + std::string(20 - charValue.size(), ' ');
+    check("bound CHAR round-trips (odd byte length)", charVal->has_value() && **charVal == expectedChar);
+    check("bound VARCHAR round-trips", varcharVal->has_value() && **varcharVal == "varchar!");
 
     if (auto r = selectStmt->close(); !r) return false;
     if (auto r = selectStmt->release(); !r) return false;

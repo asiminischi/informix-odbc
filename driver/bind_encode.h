@@ -8,8 +8,8 @@
 // take an already-fetched column's raw bytes and a ColumnDesc; encoding
 // starts from an ODBC C value instead.
 //
-// SQL_INTEGER/SQL_SMALLINT/SQL_BIGINT/SQL_CHAR are done. Still missing:
-// VARCHAR/DATE/DECIMAL/DATETIME - see docs/protocol-notes.md's SQ_BIND
+// SQL_INTEGER/SQL_SMALLINT/SQL_BIGINT/SQL_CHAR/SQL_VARCHAR are done. Still
+// missing: DATE/DECIMAL/DATETIME - see docs/protocol-notes.md's SQ_BIND
 // notes for why those need SQLBindParameter's ColumnSize/DecimalDigits
 // (currently discarded) while the types above don't.
 
