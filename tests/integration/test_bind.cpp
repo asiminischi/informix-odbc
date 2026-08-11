@@ -45,7 +45,7 @@ void check(const char* label, bool condition) {
     }
     if (auto r = setup->executeCommand(
             "create table bind_probe (col_smallint smallint, col_integer integer, col_bigint bigint,"
-            " col_char char(20), col_varchar varchar(32))");
+            " col_char char(20), col_varchar varchar(32), col_date date)");
         !r) {
         std::fprintf(stderr, "create table failed: %s\n", r.error().message.c_str());
         return false;
@@ -61,7 +61,7 @@ void check(const char* label, bool condition) {
         return false;
     }
 
-    auto insertStmt = SqliStatement::prepare(*conn, "insert into bind_probe values (?, ?, ?, ?, ?)");
+    auto insertStmt = SqliStatement::prepare(*conn, "insert into bind_probe values (?, ?, ?, ?, ?, ?)");
     if (!insertStmt) {
         std::fprintf(stderr, "prepare insert failed: %s\n", insertStmt.error().message.c_str());
         return false;
@@ -73,6 +73,7 @@ void check(const char* label, bool condition) {
     // odd-length bugs masked until a differently-shaped value hit them.
     std::string_view charValue = "hi bind";
     std::string_view varcharValue = "varchar!";
+    std::int32_t dateUnixDays = 10957; // 2000-01-01
     std::vector<BindParam> params2;
     params2.push_back(BindParam{ifxtype::kSmallInt, false, encodeSmallInt(-12345), kSmallIntBindPrecision});
     params2.push_back(BindParam{ifxtype::kInteger, false, encodeInteger(1234567890), kIntegerBindPrecision});
@@ -82,6 +83,7 @@ void check(const char* label, bool condition) {
                                  static_cast<std::uint16_t>(charValue.size())});
     params2.push_back(BindParam{ifxtype::kVarchar, false, encodeChar(varcharValue),
                                  static_cast<std::uint16_t>(varcharValue.size())});
+    params2.push_back(BindParam{ifxtype::kDate, false, encodeDateUnixDays(dateUnixDays), 4});
     if (auto r = insertStmt->execute(params2); !r) {
         std::fprintf(stderr, "execute insert failed: %s\n", r.error().message.c_str());
         return false;
@@ -90,7 +92,8 @@ void check(const char* label, bool condition) {
     if (auto r = insertStmt->release(); !r) return false;
 
     auto selectStmt = SqliStatement::prepare(
-        *conn, "select col_smallint, col_integer, col_bigint, col_char, col_varchar from bind_probe");
+        *conn,
+        "select col_smallint, col_integer, col_bigint, col_char, col_varchar, col_date from bind_probe");
     if (!selectStmt) {
         std::fprintf(stderr, "prepare select failed: %s\n", selectStmt.error().message.c_str());
         return false;
@@ -114,7 +117,8 @@ void check(const char* label, bool condition) {
     auto bigintVal = decodeBigInt((**row)[2]);
     auto charVal = decodeChar((**row)[3]);
     auto varcharVal = decodeVarchar((**row)[4]);
-    if (!smallintVal || !integerVal || !bigintVal || !charVal || !varcharVal) {
+    auto dateVal = decodeDateUnixDays((**row)[5]);
+    if (!smallintVal || !integerVal || !bigintVal || !charVal || !varcharVal || !dateVal) {
         std::fprintf(stderr, "decode failed\n");
         return false;
     }
@@ -127,6 +131,7 @@ void check(const char* label, bool condition) {
     std::string expectedChar = std::string(charValue) + std::string(20 - charValue.size(), ' ');
     check("bound CHAR round-trips (odd byte length)", charVal->has_value() && **charVal == expectedChar);
     check("bound VARCHAR round-trips", varcharVal->has_value() && **varcharVal == "varchar!");
+    check("bound DATE round-trips", dateVal->has_value() && **dateVal == dateUnixDays);
 
     if (auto r = selectStmt->close(); !r) return false;
     if (auto r = selectStmt->release(); !r) return false;

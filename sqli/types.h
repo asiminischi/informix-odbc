@@ -113,6 +113,17 @@ inline constexpr std::uint16_t kBigIntBindPrecision = 0x1300;
 // it likes (e.g. via std::chrono::sys_days).
 [[nodiscard]] std::expected<std::optional<std::int32_t>, Error> decodeDateUnixDays(std::span<const std::byte> raw);
 
+// DATE bind encoding: the same plain 4-byte big-endian day count as
+// decodeDateUnixDays's TUPLE-format input, confirmed via the decompiled
+// JDBC reference's IfxDate.toIfx() -> JavaToIfxDate -> JavaToIfxInt (unlike
+// DECIMAL/DATETIME, whose bind and fetch formats differ). Takes a
+// Unix-epoch-relative day count, same convention as decodeDateUnixDays's
+// return value, and applies the same epoch shift in reverse. SQ_BIND's
+// precisionField is confirmed live to work as 4 (the byte width) - no
+// live evidence yet on whether the server actually inspects this value
+// for DATE at all, only that 4 doesn't cause an error or desync.
+[[nodiscard]] std::vector<std::byte> encodeDateUnixDays(std::int32_t unixDays);
+
 // Informix packed-decimal DECIMAL(precision,scale): 1 exponent byte + N
 // mantissa bytes (N = ceil(precision/2)), each mantissa byte a base-100
 // digit pair. Confirmed live for both positive and negative values (four

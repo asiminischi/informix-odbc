@@ -2,10 +2,25 @@
 
 #include "sqli/types.h"
 
+#include <chrono>
 #include <cstring>
 #include <string_view>
 
 namespace ifxodbc {
+
+namespace {
+
+// Inverse of driver/convert_native.cpp's dateStructFromUnixDays - kept as
+// its own copy rather than shared, since that one lives in the decode
+// direction's translation unit and this module deliberately doesn't
+// depend on it (see bind_encode.h's top comment).
+std::int32_t unixDaysFromDateStruct(const SQL_DATE_STRUCT& ds) {
+    using namespace std::chrono;
+    year_month_day ymd{year{ds.year}, month{static_cast<unsigned>(ds.month)}, day{static_cast<unsigned>(ds.day)}};
+    return static_cast<std::int32_t>(sys_days{ymd}.time_since_epoch().count());
+}
+
+} // namespace
 
 BindEncodeResult encodeBindParam(SQLSMALLINT valueType, SQLSMALLINT parameterType, SQLPOINTER parameterValuePtr,
                                   SQLLEN strLenOrInd) {
@@ -44,6 +59,19 @@ BindEncodeResult encodeBindParam(SQLSMALLINT valueType, SQLSMALLINT parameterTyp
         p.isNull = false;
         p.data = ifxsqli::encodeChar(s);
         p.precisionField = static_cast<std::uint16_t>(s.size());
+        return BindEncodeResult{BindEncodeStatus::kOk, std::move(p)};
+    }
+    if (parameterType == SQL_TYPE_DATE && (valueType == SQL_C_TYPE_DATE || valueType == SQL_C_DATE)) {
+        auto unixDays = unixDaysFromDateStruct(*static_cast<SQL_DATE_STRUCT*>(parameterValuePtr));
+        ifxsqli::BindParam p;
+        p.ifxType = ifxsqli::ifxtype::kDate;
+        p.isNull = false;
+        p.data = ifxsqli::encodeDateUnixDays(unixDays);
+        // precisionField's correct value for DATE is untraced (unlike
+        // INTEGER/SMALLINT/BIGINT's confirmed hardcoded constants) - 4 (the
+        // byte width) is a first hypothesis pending a live check, same
+        // approach that worked for CHAR/VARCHAR.
+        p.precisionField = 4;
         return BindEncodeResult{BindEncodeStatus::kOk, std::move(p)};
     }
     return BindEncodeResult{BindEncodeStatus::kUnsupported, {}};

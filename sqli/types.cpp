@@ -104,14 +104,19 @@ std::expected<std::optional<std::string>, Error> decodeVarchar(std::span<const s
     return std::string(reinterpret_cast<const char*>(raw.data() + 1), len);
 }
 
+// Confirmed live: DATE's day count is relative to 1899-12-31, which is
+// 25568 days before the Unix epoch (1970-01-01).
+constexpr std::int32_t kIfxEpochToUnixEpochDays = 25568;
+
 std::expected<std::optional<std::int32_t>, Error> decodeDateUnixDays(std::span<const std::byte> raw) {
     if (raw.size() != 4) return std::unexpected(Error{ErrorKind::Protocol, "DATE: expected 4 bytes"});
     auto v = readBigEndian<std::int32_t>(raw);
     if (v == std::numeric_limits<std::int32_t>::min()) return std::nullopt;
-    // Confirmed live: day count is relative to 1899-12-31, which is 25568
-    // days before the Unix epoch (1970-01-01).
-    constexpr std::int32_t kIfxEpochToUnixEpochDays = 25568;
     return v - kIfxEpochToUnixEpochDays;
+}
+
+std::vector<std::byte> encodeDateUnixDays(std::int32_t unixDays) {
+    return writeBigEndian<std::int32_t>(unixDays + kIfxEpochToUnixEpochDays);
 }
 
 namespace {

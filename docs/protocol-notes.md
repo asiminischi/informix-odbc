@@ -402,6 +402,14 @@ bytes at all.
   identical self-describing shape, `precisionField` confirmed live to just
   be the string's own length here too, needing no `ColumnSize`. Reuses
   `encodeChar` directly; only `ifxType` differs (13, not 0).
+- **DATE**: confirmed live (`tests/integration/test_bind.cpp`). Value
+  bytes are the same plain 4-byte big-endian day count as
+  `decodeDateUnixDays`'s TUPLE-format input, traced via `IfxDate.toIfx()`
+  → `JavaToIfxDate` → `JavaToIfxInt` (unlike DECIMAL/DATETIME below,
+  DATE's bind and fetch formats match). `precisionField=4` (the byte
+  width) round-trips correctly; whether the server actually inspects this
+  field for DATE at all is untested, only that this value doesn't cause an
+  error or desync.
 - **DECIMAL**: the value's scale alone (not precision-shifted).
 - **DATETIME**: the qualifier (same packed `(totalDigits << 8) |
   qualifierByte` DESCRIBE already uses).
