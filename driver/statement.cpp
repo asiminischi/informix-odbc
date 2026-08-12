@@ -214,6 +214,16 @@ std::optional<std::vector<ifxsqli::BindParam>> buildBindParams(OdbcStatement* s)
             ifxsqli::BindParam p;
             p.ifxType = *ifxType;
             p.isNull = true;
+            // Extended types (currently just BOOLEAN) need their owner/name
+            // fields even for a NULL bind - confirmed live that omitting
+            // them hangs the connection (see BindParam's doc comment).
+            // encodeBindParam's non-NULL branches set these themselves;
+            // this NULL path builds the BindParam directly, so it has to
+            // set them too.
+            if (*ifxType == ifxsqli::ifxtype::kBooleanBindType) {
+                p.extendedOwnerName = "informix";
+                p.extendedTypeName = "boolean";
+            }
             params.push_back(std::move(p));
             continue;
         }

@@ -28,6 +28,17 @@ std::string_view charBindValue(SQLPOINTER parameterValuePtr, SQLLEN strLenOrInd)
     return strLenOrInd == SQL_NTS ? std::string_view(text) : std::string_view(text, static_cast<std::size_t>(strLenOrInd));
 }
 
+// Mirrors the decompiled IfxBoolean.fromString's accepted spellings
+// ("t"/"true"/"f"/"false", case-insensitive) - the same convention this
+// driver's own fetch side already surfaces BOOLEAN as via formatCellAsText
+// ("1"/"0"), extended here to accept what a human or Informix tooling
+// would actually type. std::nullopt means unrecognized text.
+std::optional<bool> boolFromText(std::string_view s) {
+    if (s == "1" || s == "t" || s == "T" || s == "true" || s == "TRUE") return true;
+    if (s == "0" || s == "f" || s == "F" || s == "false" || s == "FALSE") return false;
+    return std::nullopt;
+}
+
 } // namespace
 
 BindEncodeResult encodeBindParam(SQLSMALLINT valueType, SQLSMALLINT parameterType, SQLPOINTER parameterValuePtr,
@@ -77,6 +88,23 @@ BindEncodeResult encodeBindParam(SQLSMALLINT valueType, SQLSMALLINT parameterTyp
         p.isNull = false;
         p.data = ifxsqli::encodeSmallFloat(static_cast<float>(*static_cast<SQLDOUBLE*>(parameterValuePtr)));
         p.precisionField = ifxsqli::kSmallFloatBindPrecision;
+        return BindEncodeResult{BindEncodeStatus::kOk, std::move(p)};
+    }
+    // Text-based like CHAR/VARCHAR/DECIMAL above, not a native SQL_C_BIT
+    // path - mirrors this driver's own fetch-side "1"/"0" text convention
+    // for BOOLEAN (formatCellAsText) rather than adding yet another type
+    // to the shared native-type gate (see the SQL_REAL comment above).
+    if (parameterType == SQL_BIT && (valueType == SQL_C_CHAR || valueType == SQL_C_DEFAULT)) {
+        std::string_view s = charBindValue(parameterValuePtr, strLenOrInd);
+        auto b = boolFromText(s);
+        if (!b) return BindEncodeResult{BindEncodeStatus::kUnsupported, {}};
+        ifxsqli::BindParam p;
+        p.ifxType = ifxsqli::ifxtype::kBooleanBindType;
+        p.isNull = false;
+        p.data = ifxsqli::encodeBoolean(*b);
+        p.precisionField = ifxsqli::kBooleanBindPrecision;
+        p.extendedOwnerName = "informix";
+        p.extendedTypeName = "boolean";
         return BindEncodeResult{BindEncodeStatus::kOk, std::move(p)};
     }
     if ((parameterType == SQL_CHAR || parameterType == SQL_VARCHAR) &&
@@ -161,6 +189,8 @@ std::optional<int> ifxTypeForParameterType(SQLSMALLINT parameterType) {
             return ifxsqli::ifxtype::kFloat;
         case SQL_REAL:
             return ifxsqli::ifxtype::kSmallFloat;
+        case SQL_BIT:
+            return ifxsqli::ifxtype::kBooleanBindType;
         case SQL_CHAR:
             return ifxsqli::ifxtype::kChar;
         case SQL_VARCHAR:
