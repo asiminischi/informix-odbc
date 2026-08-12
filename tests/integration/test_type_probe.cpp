@@ -88,7 +88,8 @@ std::optional<T> unwrap(const char* label, std::expected<std::optional<T>, Error
             "  id serial not null, col_smallint smallint, col_integer integer,"
             "  col_bigint bigint, col_char char(10), col_varchar varchar(32),"
             "  col_decimal decimal(10,2), col_date date,"
-            "  col_datetime datetime year to second)");
+            "  col_datetime datetime year to second, col_boolean boolean,"
+            "  col_float float, col_smallfloat smallfloat)");
         !r) {
         std::fprintf(stderr, "create table failed: %s\n", r.error().message.c_str());
         return false;
@@ -96,26 +97,29 @@ std::optional<T> unwrap(const char* label, std::expected<std::optional<T>, Error
 
     if (auto r = conn->executeCommand(
             "insert into type_probe (col_smallint, col_integer, col_bigint, col_char,"
-            " col_varchar, col_decimal, col_date, col_datetime) values (12345, 1234567890,"
+            " col_varchar, col_decimal, col_date, col_datetime, col_boolean, col_float,"
+            " col_smallfloat) values (12345, 1234567890,"
             " 123456789012345, 'hello', 'world varchar', 12345.67, DATE('2026-07-29'),"
-            " DATETIME(2026-07-29 12:34:56) YEAR TO SECOND)");
+            " DATETIME(2026-07-29 12:34:56) YEAR TO SECOND, 't', 3.14159, 2.5)");
         !r) {
         std::fprintf(stderr, "insert (positive row) failed: %s\n", r.error().message.c_str());
         return false;
     }
     if (auto r = conn->executeCommand(
             "insert into type_probe (col_smallint, col_integer, col_bigint, col_char,"
-            " col_varchar, col_decimal, col_date, col_datetime) values (-12345, -2147483000,"
+            " col_varchar, col_decimal, col_date, col_datetime, col_boolean, col_float,"
+            " col_smallfloat) values (-12345, -2147483000,"
             " -123456789012345, 'ab', 'x', -99.99, DATE('2000-01-01'),"
-            " DATETIME(2000-01-01 00:00:00) YEAR TO SECOND)");
+            " DATETIME(2000-01-01 00:00:00) YEAR TO SECOND, 'f', -0.001, -100.25)");
         !r) {
         std::fprintf(stderr, "insert (negative row) failed: %s\n", r.error().message.c_str());
         return false;
     }
     if (auto r = conn->executeCommand(
             "insert into type_probe (col_smallint, col_integer, col_bigint, col_char,"
-            " col_varchar, col_decimal, col_date, col_datetime) values (null, null, null,"
-            " null, null, null, null, null)");
+            " col_varchar, col_decimal, col_date, col_datetime, col_boolean, col_float,"
+            " col_smallfloat) values (null, null, null,"
+            " null, null, null, null, null, null, null, null)");
         !r) {
         std::fprintf(stderr, "insert (NULL row) failed: %s\n", r.error().message.c_str());
         return false;
@@ -123,7 +127,8 @@ std::optional<T> unwrap(const char* label, std::expected<std::optional<T>, Error
 
     auto stmt = SqliStatement::prepare(*conn,
         "select id, col_smallint, col_integer, col_bigint, col_char, col_varchar,"
-        " col_decimal, col_date, col_datetime from type_probe order by id");
+        " col_decimal, col_date, col_datetime, col_boolean, col_float, col_smallfloat"
+        " from type_probe order by id");
     if (!stmt) {
         std::fprintf(stderr, "prepare failed: %s\n", stmt.error().message.c_str());
         return false;
@@ -175,6 +180,9 @@ std::optional<T> unwrap(const char* label, std::expected<std::optional<T>, Error
                 ++g_failures;
                 std::printf("  [FAIL] col_datetime expected a value, got NULL\n");
             }
+            checkEq("col_boolean", unwrap("col_boolean", decodeBoolean(r[9])), std::optional<bool>(true));
+            checkEq("col_float", unwrap("col_float", decodeFloat(r[10])), std::optional<double>(3.14159));
+            checkEq("col_smallfloat", unwrap("col_smallfloat", decodeSmallFloat(r[11])), std::optional<float>(2.5f));
         } else if (rowNum == 2) {
             checkEq("id", unwrap("id", decodeInteger(r[0])), std::optional<std::int32_t>(2));
             checkEq("col_smallint", unwrap("col_smallint", decodeSmallInt(r[1])),
@@ -201,6 +209,10 @@ std::optional<T> unwrap(const char* label, std::expected<std::optional<T>, Error
                 ++g_failures;
                 std::printf("  [FAIL] col_datetime expected a value, got NULL\n");
             }
+            checkEq("col_boolean", unwrap("col_boolean", decodeBoolean(r[9])), std::optional<bool>(false));
+            checkEq("col_float", unwrap("col_float", decodeFloat(r[10])), std::optional<double>(-0.001));
+            checkEq("col_smallfloat", unwrap("col_smallfloat", decodeSmallFloat(r[11])),
+                    std::optional<float>(-100.25f));
         } else if (rowNum == 3) {
             checkNull("col_smallint", !unwrap("col_smallint", decodeSmallInt(r[1])).has_value());
             checkNull("col_integer", !unwrap("col_integer", decodeInteger(r[2])).has_value());
@@ -210,6 +222,9 @@ std::optional<T> unwrap(const char* label, std::expected<std::optional<T>, Error
             checkNull("col_decimal", !unwrap("col_decimal", decodeDecimal(r[6], precision, scale)).has_value());
             checkNull("col_date", !unwrap("col_date", decodeDateUnixDays(r[7])).has_value());
             checkNull("col_datetime", !unwrap("col_datetime", decodeDatetime(r[8], cols[8].encodedLength)).has_value());
+            checkNull("col_boolean", !unwrap("col_boolean", decodeBoolean(r[9])).has_value());
+            checkNull("col_float", !unwrap("col_float", decodeFloat(r[10])).has_value());
+            checkNull("col_smallfloat", !unwrap("col_smallfloat", decodeSmallFloat(r[11])).has_value());
         } else {
             ++g_failures;
             std::printf("  [FAIL] unexpected extra row\n");
