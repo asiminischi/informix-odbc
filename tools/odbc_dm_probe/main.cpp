@@ -1040,7 +1040,7 @@ bool runTypeInfoTest(SQLHDBC dbc) {
         expectEq("SQL_ALL_TYPES found a 'varchar' row", foundChar);
         expectEq("SQL_ALL_TYPES found a 'date' row", foundDate);
         expectEq("SQL_ALL_TYPES found a 'datetime' row", foundDatetime);
-        expectEq("SQL_ALL_TYPES returned all 11 kTypeMap rows", rowCount == 11);
+        expectEq("SQL_ALL_TYPES returned all 14 kTypeMap rows", rowCount == 14);
         SQLFreeHandle(SQL_HANDLE_STMT, stmt);
     }
 

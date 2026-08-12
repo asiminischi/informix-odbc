@@ -244,6 +244,17 @@ constexpr TypeMapEntry kTypeMap[] = {
     {ifxsqli::ifxtype::kDecimal, SQL_DECIMAL, SQL_DECIMAL, 0, "decimal", 10},
     {ifxsqli::ifxtype::kDate, SQL_TYPE_DATE, SQL_DATETIME, SQL_CODE_DATE, "date", 0},
     {ifxsqli::ifxtype::kDatetime, SQL_TYPE_TIMESTAMP, SQL_DATETIME, SQL_CODE_TIMESTAMP, "datetime", 0},
+    // BOOLEAN/FLOAT/SMALLFLOAT: confirmed live that syscolumns.coltype uses
+    // the same base type codes as DESCRIBE's wire ifxType for all three
+    // (41/3/4) - unlike SQ_RETURN_TYPE/SQ_BIND, the catalog layer needs no
+    // extended-type special-casing (see sqli/types.h's kBoolean/kFloat/
+    // kSmallFloat doc comments for the wire-level BOOLEAN caveat this
+    // *doesn't* apply to here). radix=2 for the IEEE 754 types (binary
+    // floating point, the ODBC-conventional NUM_PREC_RADIX for REAL/
+    // DOUBLE); BOOLEAN has no meaningful radix, same as CHAR/VARCHAR.
+    {ifxsqli::ifxtype::kBoolean, SQL_BIT, SQL_BIT, 0, "boolean", 0},
+    {ifxsqli::ifxtype::kFloat, SQL_DOUBLE, SQL_DOUBLE, 0, "float", 2},
+    {ifxsqli::ifxtype::kSmallFloat, SQL_REAL, SQL_REAL, 0, "smallfloat", 2},
 };
 
 // `NULL` is not a valid substitute for 0 in the two fields (radix,
@@ -294,9 +305,9 @@ std::string caseTypeName() {
         sql += " when " + std::to_string(e.ifxBaseType) + " then '" + e.typeName + "'";
     }
     // Matches driver/statement.cpp's sqlTypeFor fallback: an Informix type
-    // this driver doesn't otherwise model (FLOAT/SMALLFLOAT/BOOLEAN/
-    // INTERVAL/LOBs/opaque types, all outside the MVP-8 set) still shows
-    // up as a column rather than being silently dropped from the result.
+    // this driver doesn't otherwise model (INTERVAL/LOBs/opaque types,
+    // outside the MVP-8-plus-BOOLEAN-plus-FLOAT-family set) still shows up
+    // as a column rather than being silently dropped from the result.
     sql += " else 'unknown' end) as type_name";
     return sql;
 }
@@ -351,6 +362,15 @@ std::string caseColumnSize() {
            " when " +
            std::to_string(ifxsqli::ifxtype::kDatetime) +
            " then 19"
+           " when " +
+           std::to_string(ifxsqli::ifxtype::kBoolean) +
+           " then 1"
+           " when " +
+           std::to_string(ifxsqli::ifxtype::kFloat) +
+           " then 15"
+           " when " +
+           std::to_string(ifxsqli::ifxtype::kSmallFloat) +
+           " then 7"
            " else null end as integer)";
 }
 
@@ -478,6 +498,9 @@ int typeInfoColumnSize(int ifxBaseType) {
         case ifxsqli::ifxtype::kDecimal: return 32;
         case ifxsqli::ifxtype::kDate: return 10;
         case ifxsqli::ifxtype::kDatetime: return 19;
+        case ifxsqli::ifxtype::kBoolean: return 1;
+        case ifxsqli::ifxtype::kFloat: return 15;
+        case ifxsqli::ifxtype::kSmallFloat: return 7;
         default: return 0;
     }
 }
