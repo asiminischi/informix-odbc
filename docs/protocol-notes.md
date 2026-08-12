@@ -709,13 +709,15 @@ iterating on guessed field counts.
 
 ## Catalog functions
 
-**Status: SQLTables and SQLColumns both done and confirmed live**
-(`driver/catalog.cpp`) - `tools/odbc_dm_probe`'s `runCatalogTest`/
-`runColumnsTest` through the real Driver Manager, plus `isql`'s `help`
-(all tables/views in a live multi-table database, correct TABLE_TYPE per
-row) and `help <table>` (correct DATA_TYPE/TYPE_NAME/COLUMN_SIZE/
-DECIMAL_DIGITS/NULLABLE/IS_NULLABLE per column, including a `SERIAL`
-column correctly reported as `integer`/NOT NULL).
+**Status: SQLTables, SQLColumns, and SQLGetTypeInfo all done and confirmed
+live** (`driver/catalog.cpp`) - `tools/odbc_dm_probe`'s `runCatalogTest`/
+`runColumnsTest`/`runTypeInfoTest` through the real Driver Manager, plus
+`isql`'s `help` (all tables/views in a live multi-table database, correct
+TABLE_TYPE per row) and `help <table>` (correct DATA_TYPE/TYPE_NAME/
+COLUMN_SIZE/DECIMAL_DIGITS/NULLABLE/IS_NULLABLE per column, including a
+`SERIAL` column correctly reported as `integer`/NOT NULL). SQLGetTypeInfo
+has no isql-native invocation path, so `odbc_dm_probe` is its verification
+bar rather than an `isql` command.
 
 This isn't a new protocol-level mechanism - it's a SQL query synthesized
 against `systables` and run through the exact same prepare/execute/fetch
@@ -769,6 +771,31 @@ behavior discovered along the way, not SQLI protocol behavior:
   `countRows` note) - even though the *value* was correct. Worked around
   with an explicit `cast(... as integer)` around the whole `CASE`, not
   just the offending branch.
+- A `UNION ALL`-specific variant of the `CASE`-padding quirk above: a
+  string column built from `UNION ALL`ing several differently-shaped
+  string literals gets coerced to a fixed `CHAR` sized to the widest
+  branch and blank-padded, same as `CASE` - but unlike `CASE`, wrapping
+  the result in `trim()` does **not** strip it back out, even reading from
+  an outer query against a derived table built from the union; the value
+  comes back genuinely padded, not just displayed that way. This was hit
+  building `SQLGetTypeInfo`'s type list, originally implemented as a
+  `UNION ALL` of one literal row per type. Casting each literal to
+  `lvarchar` (rather than `varchar`) does dodge the padding - Informix
+  keeps it as a true variable-length value through the union - but
+  `lvarchar` is a wire type this driver's fetch/decode path has never
+  implemented, and returning one desyncs the byte stream and hangs the
+  connection forever, exactly as the framing-bug warning at the top of
+  this document describes (confirmed live: a lone `SQLGetTypeInfo` call
+  with no other statement involved hung inside its own `SQLFetch` loop the
+  moment a returned column was `lvarchar`-typed - not a DM-interaction
+  issue, reproduced with nothing else on the connection). The actual fix
+  was structural, not a cast: `SQLGetTypeInfo` was rewritten to use the
+  same derived-table-plus-outer-`CASE` shape `SQLTables`/`SQLColumns`
+  already use, ranking real `systables` rows (`tabid <= 99`) via a
+  correlated-subquery row count rather than hardcoding tabid values or
+  using a window function, and dispatching on that rank the same way
+  `basetype` is dispatched on elsewhere in this file. No `UNION ALL` of
+  string literals, no `lvarchar`, no hang.
 
 Scope: the plain filtering case (`isql help`/`help <table>` and ordinary
 schema browsing) - catalog/schema/table-name/column-name filtering via

@@ -1,4 +1,4 @@
-// SQLTables/SQLColumns: catalog introspection, implemented by synthesizing
+// SQLTables/SQLColumns/SQLGetTypeInfo: catalog introspection, implemented by synthesizing
 // a real SQL query against Informix's system catalog (systables/
 // syscolumns) and running it through the same prepare/execute/fetch
 // pipeline every other statement uses (driver/statement.cpp's doPrepare/
@@ -25,10 +25,12 @@
 // figure (e.g. 4 for INTEGER, not 10). This is an advisory field most
 // callers don't consult; fine for MVP scope but not independently verified.
 //
-// Both SQLTables and SQLColumns are implemented and confirmed live
-// (tools/odbc_dm_probe's runCatalogTest/runColumnsTest through the real
-// Driver Manager, plus isql's `help`/`help <table>`) - see
-// docs/protocol-notes.md's Catalog functions section.
+// SQLTables, SQLColumns, and SQLGetTypeInfo are implemented and confirmed
+// live through the real Driver Manager (tools/odbc_dm_probe's
+// runCatalogTest/runColumnsTest/runTypeInfoTest) - for the first two, also
+// via isql's `help`/`help <table>`, which SQLGetTypeInfo has no isql-native
+// invocation path to exercise. See docs/protocol-notes.md's Catalog
+// functions section.
 
 #include "driver/error_map.h"
 #include "driver/handles.h"
@@ -36,6 +38,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <functional>
+#include <iterator>
+#include <optional>
 
 using namespace ifxodbc;
 
@@ -406,9 +411,226 @@ std::pair<std::string, std::vector<ifxsqli::BindParam>> buildColumnsSql(const st
     return {sql, params};
 }
 
+// SQLGetTypeInfo: one row per entry in kTypeMap (the same table SQLColumns'
+// CASE expressions read from), dispatched via CASE over a `rank` column
+// (0-based index into kTypeMap) the same way buildTablesSql/buildColumnsSql
+// dispatch over `basetype` - not a UNION ALL of literal rows.
+//
+// A UNION-specific variant of the CHAR-padding quirk documented above was
+// hit and rejected here: confirmed live that Informix infers a UNION ALL's
+// string column as a fixed CHAR sized to the widest literal branch and
+// blank-pads every row to that width, and unlike the CASE-expression
+// version of this quirk, wrapping the result in trim() does *not* strip it
+// back out - the value is genuinely stored/returned padded, not just
+// displayed that way. Casting each branch to lvarchar instead of varchar
+// does avoid the padding, but lvarchar is a wire type this driver's fetch
+// path has no decoder for at all, which desyncs the byte stream and hangs
+// the connection exactly as docs/protocol-notes.md warns a wrong field
+// width will - confirmed live (a standalone SQLGetTypeInfo call, no other
+// statement involved, hung forever inside its own SQLFetch loop the moment
+// a returned column was lvarchar-typed). Do not reintroduce a UNION ALL of
+// string literals here, and do not cast to lvarchar anywhere in this
+// driver until fetch-side decoding for it exists.
+//
+// `rank` is computed as a correlated-subquery row count (how many other
+// systables rows with tabid <= 99 have a smaller tabid), not a literal
+// tabid value or a window function (ROW_NUMBER, unused elsewhere in this
+// project) - gives a stable, gapless 0..N-1 sequence over any Informix
+// instance's system catalog without assuming specific tabid values are
+// present, only that at least 11 rows with tabid <= 99 exist (already
+// relied on elsewhere in this file as "the system table range").
+//
+// Scope/simplifications, none independently verified against a real ODBC
+// conformance trace (nothing in this project's verification bar - isql,
+// ordinary schema browsing - exercises SQLGetTypeInfo specifically):
+// NULLABLE is always SQL_NULLABLE (describes what the *type* permits, not
+// any particular column's declared nullability) and SEARCHABLE is always
+// SQL_SEARCHABLE for every type. DECIMAL's MINIMUM_SCALE/MAXIMUM_SCALE
+// (0/32) approximate Informix's documented max precision rather than being
+// read from the server. INTERVAL_PRECISION is always NULL (no INTERVAL
+// support - out of MVP-8 scope, same gap noted elsewhere in this file).
+std::string sqlSmallInt(int v) { return "cast(" + std::to_string(v) + " as smallint)"; }
+std::string sqlNullSmallInt() { return "cast(null as smallint)"; }
+std::string sqlQuotedLiteral(const std::string& s) {
+    std::string escaped = "'";
+    for (char c : s) {
+        if (c == '\'') escaped += '\'';
+        escaped += c;
+    }
+    escaped += '\'';
+    return escaped;
+}
+
+// COLUMN_SIZE per type mirrors caseColumnSize()'s values for the constant-
+// width types; CHAR/VARCHAR/NVARCHAR use Informix's documented maximum
+// declared width (32767 for CHAR, 255 for VARCHAR/NVARCHAR) rather than
+// collength, since there's no specific column here to read collength from.
+int typeInfoColumnSize(int ifxBaseType) {
+    switch (ifxBaseType) {
+        case ifxsqli::ifxtype::kSmallInt: return 5;
+        case ifxsqli::ifxtype::kInteger:
+        case ifxsqli::ifxtype::kSerial: return 10;
+        case ifxsqli::ifxtype::kBigInt:
+        case ifxsqli::ifxtype::kBigSerial: return 19;
+        case ifxsqli::ifxtype::kChar: return 32767;
+        case ifxsqli::ifxtype::kVarchar:
+        case ifxsqli::ifxtype::kNVarchar: return 255;
+        case ifxsqli::ifxtype::kDecimal: return 32;
+        case ifxsqli::ifxtype::kDate: return 10;
+        case ifxsqli::ifxtype::kDatetime: return 19;
+        default: return 0;
+    }
+}
+
+// Builds a "cast(case rank when 0 then ... when 1 then ... else <elseSql>
+// end as integer) as <label>" expression, one branch per kTypeMap entry -
+// the same shape as caseInt(), but keyed on 0-based array index (`rank`)
+// rather than an ifxBaseType value read from a live column. `field` returns
+// nullopt for "this branch is NULL" - unlike caseInt's bare-0-means-null
+// convention, several columns generated here (UNSIGNED_ATTRIBUTE,
+// MINIMUM_SCALE, CASE_SENSITIVE) have 0 as a genuine, non-null value, so
+// the sentinel has to be out-of-band, not a magic int.
+std::string typeInfoCaseInt(std::string_view label, std::string_view elseSql,
+                             const std::function<std::optional<int>(const TypeMapEntry&)>& field) {
+    std::string sql = "cast(case rank";
+    for (std::size_t i = 0; i < std::size(kTypeMap); ++i) {
+        std::optional<int> v = field(kTypeMap[i]);
+        sql += " when " + std::to_string(i) + " then " + (v ? std::to_string(*v) : "null");
+    }
+    sql += " else " + std::string(elseSql) + " end as integer) as " + std::string(label);
+    return sql;
+}
+
+// `field` returns nullopt for "this branch is NULL" - LITERAL_PREFIX/
+// LITERAL_SUFFIX/CREATE_PARAMS are genuinely absent (not just empty) for
+// most types, and a bare empty-string literal would read back as a
+// zero-length string, not SQL_NULL_DATA.
+std::string typeInfoCaseString(std::string_view label,
+                                const std::function<std::optional<std::string>(const TypeMapEntry&)>& field) {
+    std::string sql = "trim(case rank";
+    for (std::size_t i = 0; i < std::size(kTypeMap); ++i) {
+        std::optional<std::string> v = field(kTypeMap[i]);
+        sql += " when " + std::to_string(i) + " then " + (v ? sqlQuotedLiteral(*v) : "null");
+    }
+    sql += " else null end) as " + std::string(label);
+    return sql;
+}
+
+std::pair<std::string, std::vector<ifxsqli::BindParam>> buildTypeInfoSql(SQLSMALLINT dataType) {
+    auto isString = [](const TypeMapEntry& e) {
+        return e.ifxBaseType == ifxsqli::ifxtype::kChar || e.ifxBaseType == ifxsqli::ifxtype::kVarchar ||
+               e.ifxBaseType == ifxsqli::ifxtype::kNVarchar;
+    };
+    auto isDecimal = [](const TypeMapEntry& e) { return e.ifxBaseType == ifxsqli::ifxtype::kDecimal; };
+    auto isDateOrTime = [](const TypeMapEntry& e) {
+        return e.ifxBaseType == ifxsqli::ifxtype::kDate || e.ifxBaseType == ifxsqli::ifxtype::kDatetime;
+    };
+    auto isAutoIncrement = [](const TypeMapEntry& e) {
+        return e.ifxBaseType == ifxsqli::ifxtype::kSerial || e.ifxBaseType == ifxsqli::ifxtype::kBigSerial;
+    };
+    auto isIntegerFamily = [&](const TypeMapEntry& e) {
+        return !isString(e) && !isDecimal(e) && !isDateOrTime(e);
+    };
+
+    std::vector<int> matchingRanks;
+    for (std::size_t i = 0; i < std::size(kTypeMap); ++i) {
+        if (dataType == SQL_ALL_TYPES || kTypeMap[i].dataType == dataType) matchingRanks.push_back(static_cast<int>(i));
+    }
+
+    std::string sql =
+        "select " + typeInfoCaseString("type_name", [](const TypeMapEntry& e) { return e.typeName; }) + ", " +
+        typeInfoCaseInt("data_type", "null", [](const TypeMapEntry& e) { return std::optional<int>(e.dataType); }) +
+        ", " +
+        typeInfoCaseInt("column_size", "null",
+                         [](const TypeMapEntry& e) { return std::optional<int>(typeInfoColumnSize(e.ifxBaseType)); }) +
+        ", " +
+        typeInfoCaseString("literal_prefix",
+                            [&](const TypeMapEntry& e) -> std::optional<std::string> {
+                                return (isString(e) || isDateOrTime(e)) ? std::optional<std::string>("'") : std::nullopt;
+                            }) +
+        ", " +
+        typeInfoCaseString("literal_suffix",
+                            [&](const TypeMapEntry& e) -> std::optional<std::string> {
+                                return (isString(e) || isDateOrTime(e)) ? std::optional<std::string>("'") : std::nullopt;
+                            }) +
+        ", " +
+        typeInfoCaseString("create_params",
+                            [&](const TypeMapEntry& e) -> std::optional<std::string> {
+                                if (isString(e)) return "max length";
+                                if (isDecimal(e)) return "precision,scale";
+                                return std::nullopt;
+                            }) +
+        ", " + sqlSmallInt(SQL_NULLABLE) + " as nullable, " +
+        typeInfoCaseInt("case_sensitive", "null",
+                         [&](const TypeMapEntry& e) { return std::optional<int>(isString(e) ? 1 : 0); }) +
+        ", " + sqlSmallInt(SQL_SEARCHABLE) + " as searchable, " +
+        typeInfoCaseInt("unsigned_attribute", "null",
+                         [&](const TypeMapEntry& e) -> std::optional<int> {
+                             if (!isIntegerFamily(e) && !isDecimal(e)) return std::nullopt;
+                             return 0;
+                         }) +
+        ", " +
+        typeInfoCaseInt("fixed_prec_scale", "null",
+                         [&](const TypeMapEntry& e) { return std::optional<int>(isDecimal(e) ? 1 : 0); }) +
+        ", " +
+        typeInfoCaseInt("auto_unique_value", "null",
+                         [&](const TypeMapEntry& e) -> std::optional<int> {
+                             return isAutoIncrement(e) ? std::optional<int>(1) : std::nullopt;
+                         }) +
+        ", " + typeInfoCaseString("local_type_name", [](const TypeMapEntry& e) { return e.typeName; }) + ", " +
+        typeInfoCaseInt("minimum_scale", "null",
+                         [&](const TypeMapEntry& e) -> std::optional<int> {
+                             return isDecimal(e) ? std::optional<int>(0) : std::nullopt;
+                         }) +
+        ", " +
+        typeInfoCaseInt("maximum_scale", "null",
+                         [&](const TypeMapEntry& e) -> std::optional<int> {
+                             return isDecimal(e) ? std::optional<int>(32) : std::nullopt;
+                         }) +
+        ", " +
+        typeInfoCaseInt("sql_data_type", "null",
+                         [](const TypeMapEntry& e) { return std::optional<int>(e.sqlDataType); }) +
+        ", " +
+        typeInfoCaseInt("sql_datetime_sub", "null",
+                         [](const TypeMapEntry& e) -> std::optional<int> {
+                             return e.sqlDatetimeSub == 0 ? std::nullopt : std::optional<int>(e.sqlDatetimeSub);
+                         }) +
+        ", " +
+        typeInfoCaseInt("num_prec_radix", "null",
+                         [](const TypeMapEntry& e) -> std::optional<int> {
+                             return e.radix == 0 ? std::nullopt : std::optional<int>(e.radix);
+                         }) +
+        ", " + sqlNullSmallInt() + " as interval_precision" +
+        " from (select (select count(*) from systables s2 where s2.tabid <= 99 and s2.tabid < s1.tabid) as rank"
+        " from systables s1 where s1.tabid <= 99) t"
+        " where rank < " +
+        std::to_string(std::size(kTypeMap));
+
+    if (matchingRanks.empty()) {
+        sql += " and 1 = 0";
+    } else if (matchingRanks.size() != std::size(kTypeMap)) {
+        sql += " and rank in (";
+        for (std::size_t i = 0; i < matchingRanks.size(); ++i) {
+            sql += (i == 0 ? "" : ", ") + std::to_string(matchingRanks[i]);
+        }
+        sql += ")";
+    }
+    sql += " order by data_type";
+    return {sql, {}};
+}
+
 } // namespace
 
 extern "C" {
+
+IFXODBC_EXPORT SQLRETURN SQL_API SQLGetTypeInfo(SQLHSTMT StatementHandle, SQLSMALLINT DataType) {
+    auto* s = static_cast<OdbcStatement*>(StatementHandle);
+    if (!s) return SQL_INVALID_HANDLE;
+    s->diag.clear();
+
+    auto [sql, params] = buildTypeInfoSql(DataType);
+    return runCatalogQuery(s, sql, params);
+}
 
 IFXODBC_EXPORT SQLRETURN SQL_API SQLTables(SQLHSTMT StatementHandle, SQLCHAR* CatalogName, SQLSMALLINT NameLength1,
                                             SQLCHAR* SchemaName, SQLSMALLINT NameLength2, SQLCHAR* TableName,

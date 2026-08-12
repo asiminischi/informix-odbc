@@ -12,13 +12,14 @@ the actual unixODBC Driver Manager, not just unit tests. Transactions
 (including `SQLEndTran`/`SQL_ATTR_AUTOCOMMIT` now actually driving
 begin/commit/rollback, not just the underlying primitives) and all 8 MVP
 bind-parameter types are done and confirmed live, including NULL binds
-(fixed two framing/type bugs this pass - see gap 3 below). `SQLTables` and
-`SQLColumns` are both done and confirmed live via `isql help`/
-`help <table>` against a real multi-table database. But large, expected
-pieces of a production ODBC driver are still missing outright:
-`SQLGetTypeInfo`/`SQLPrimaryKeys`/`SQLStatistics` and the rest of catalog
-introspection, Unicode, Windows driver registration, LOBs, and more. See
-"Gaps to close before production-grade" below for the concrete list.
+(fixed two framing/type bugs this pass - see gap 3 below). `SQLTables`,
+`SQLColumns`, and `SQLGetTypeInfo` are all done and confirmed live via
+`isql help`/`help <table>` and `tools/odbc_dm_probe` against a real
+multi-table database. But large, expected pieces of a production ODBC
+driver are still missing outright: `SQLPrimaryKeys`/`SQLStatistics` and
+the rest of catalog introspection, Unicode, Windows driver registration,
+LOBs, and more. See "Gaps to close before production-grade" below for the
+concrete list.
 
 ## What's done (verified live, not just "compiles")
 
@@ -128,32 +129,40 @@ Roughly in the order they'd bite a real application:
    `SQL_TC_DML` (DML confirmed transactional; DDL-inside-a-transaction
    behavior hasn't been checked, so not claiming `SQL_TC_ALL`/
    `SQL_TC_DDL_COMMIT` yet).
-2. **Catalog functions: `SQLTables`/`SQLColumns` ~~missing~~ - done;
-   `SQLGetTypeInfo`/`SQLPrimaryKeys`/`SQLStatistics` still missing.**
-   Both (`driver/catalog.cpp`) are implemented by synthesizing a SQL query
-   against `systables`/`syscolumns` and running it through the same
-   prepare/execute/fetch pipeline every other statement uses - confirmed
-   live through the real Driver Manager (`tools/odbc_dm_probe`'s
-   `runCatalogTest`/`runColumnsTest`) and `isql`'s `help`/`help <table>`
-   against a live multi-table database (including a `SERIAL NOT NULL`
-   column correctly reported as `integer`/NOT NULL). See
-   `docs/protocol-notes.md`'s Catalog functions section for what the live
-   testing surfaced: `systables.owner` and several `CASE` expressions'
-   inferred types turn out to be space-padded fixed-width `CHAR` on this
-   server (worked around with `trim()`), `syscolumns.coltype`/`collength`
-   pack fields the same way the wire protocol already does, and
-   Informix's `trunc()`/`mod()` return `DECIMAL` even for integer
-   arguments - contaminating an entire `CASE`'s inferred type, not just
-   the branch that uses them, worked around with explicit
-   `cast(... as integer)`. Scoped to the plain filtering case those tools
+2. **Catalog functions: `SQLTables`/`SQLColumns`/`SQLGetTypeInfo`
+   ~~missing~~ - done; `SQLPrimaryKeys`/`SQLStatistics` still missing.**
+   All three (`driver/catalog.cpp`) are implemented by synthesizing a SQL
+   query and running it through the same prepare/execute/fetch pipeline
+   every other statement uses - confirmed live through the real Driver
+   Manager (`tools/odbc_dm_probe`'s `runCatalogTest`/`runColumnsTest`/
+   `runTypeInfoTest`) and, for the first two, `isql`'s `help`/
+   `help <table>` against a live multi-table database (including a
+   `SERIAL NOT NULL` column correctly reported as `integer`/NOT NULL).
+   `SQLGetTypeInfo` has no isql-native invocation path, so `odbc_dm_probe`
+   is its verification bar. See `docs/protocol-notes.md`'s Catalog
+   functions section for what the live testing surfaced:
+   `systables.owner` and several `CASE` expressions' inferred types turn
+   out to be space-padded fixed-width `CHAR` on this server (worked
+   around with `trim()`), `syscolumns.coltype`/`collength` pack fields the
+   same way the wire protocol already does, Informix's `trunc()`/`mod()`
+   return `DECIMAL` even for integer arguments - contaminating an entire
+   `CASE`'s inferred type, not just the branch that uses them, worked
+   around with explicit `cast(... as integer)` - and, hit building
+   `SQLGetTypeInfo`: a `UNION ALL`-specific variant of the `CASE`-padding
+   quirk where `trim()` does *not* undo the padding, and where casting to
+   `lvarchar` to dodge it instead desyncs this driver's wire decoder and
+   hangs the connection (this driver has never implemented `lvarchar`
+   fetch decoding) - fixed by rewriting `SQLGetTypeInfo` to use the same
+   derived-table-plus-outer-`CASE` shape as `SQLTables`/`SQLColumns`
+   instead of `UNION ALL`. Scoped to the plain filtering case those tools
    actually use (catalog/schema/table-name/column-name `LIKE` patterns,
    table-type `IN`-list filtering) - the ODBC catalog/schema-listing
    "special value" enumeration modes and `COLUMN_DEF` (default-value
    introspection) are documented, deliberate gaps, not oversights (see
-   that file's top comment). `SQLGetTypeInfo`/`SQLPrimaryKeys`/
-   `SQLStatistics` are next; most real ODBC clients (BI tools, admin GUIs,
-   ORM schema-introspection code) can already do useful schema browsing
-   with just `SQLTables`/`SQLColumns`.
+   that file's top comment). `SQLPrimaryKeys`/`SQLStatistics` are next;
+   most real ODBC clients (BI tools, admin GUIs, ORM schema-introspection
+   code) can already do useful schema browsing with just `SQLTables`/
+   `SQLColumns`/`SQLGetTypeInfo`.
 3. **~~Bind parameters cover N of 8 MVP types~~ - done.** All 8 MVP types
    (`SQL_INTEGER`/`SQL_SMALLINT`/`SQL_BIGINT`/`SQL_CHAR`/`SQL_VARCHAR`/
    `SQL_TYPE_DATE`/`SQL_DECIMAL`/`SQL_TYPE_TIMESTAMP`) are confirmed live
@@ -268,8 +277,8 @@ notes:
 
 ## Suggested next steps, in priority order
 
-1. `SQLGetTypeInfo`/`SQLPrimaryKeys`/`SQLStatistics` (`SQLTables`/
-   `SQLColumns` are done).
+1. `SQLPrimaryKeys`/`SQLStatistics` (`SQLTables`/`SQLColumns`/
+   `SQLGetTypeInfo` are done).
 2. Windows driver registration (registry helper plus install doc) so the
    native Windows ODBC DM path is actually usable, not just the DLL - the
    transaction work this pass had to fall back to WSL2/unixODBC for its

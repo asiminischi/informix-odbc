@@ -927,6 +927,163 @@ bool runColumnsTest(SQLHDBC dbc, const std::string& database) {
     return ok;
 }
 
+// Verifies SQLGetTypeInfo (driver/catalog.cpp): SQL_ALL_TYPES returns a row
+// per kTypeMap entry with sane field values, a specific DataType returns
+// exactly the matching rows (including the DATA_TYPE-collision case -
+// INTEGER and SERIAL both report SQL_INTEGER), and a DataType nothing maps
+// to returns zero rows rather than an error.
+bool runTypeInfoTest(SQLHDBC dbc) {
+    bool ok = true;
+    auto expectEq = [&ok](const char* label, bool cond) {
+        std::printf("  [%s] %s\n", cond ? "ok" : "FAIL", label);
+        if (!cond) ok = false;
+    };
+
+    struct TypeRow {
+        char typeName[64] = {};
+        SQLLEN typeNameInd = 0;
+        SQLSMALLINT dataType = 0;
+        SQLLEN dataTypeInd = 0;
+        SQLINTEGER columnSize = 0;
+        SQLLEN columnSizeInd = 0;
+        char literalPrefix[4] = {};
+        SQLLEN literalPrefixInd = 0;
+        char createParams[32] = {};
+        SQLLEN createParamsInd = 0;
+        SQLSMALLINT nullable = 0;
+        SQLLEN nullableInd = 0;
+        SQLSMALLINT caseSensitive = 0;
+        SQLLEN caseSensitiveInd = 0;
+        SQLSMALLINT unsignedAttr = 0;
+        SQLLEN unsignedAttrInd = 0;
+        SQLSMALLINT autoUnique = 0;
+        SQLLEN autoUniqueInd = 0;
+        SQLSMALLINT sqlDataType = 0;
+        SQLLEN sqlDataTypeInd = 0;
+        SQLSMALLINT sqlDatetimeSub = 0;
+        SQLLEN sqlDatetimeSubInd = 0;
+    };
+
+    // SQL_ALL_TYPES: find "integer" among the rows and check its fields.
+    {
+        SQLHSTMT stmt = SQL_NULL_HSTMT;
+        SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt);
+        SQLRETURN rc = SQLGetTypeInfo(stmt, SQL_ALL_TYPES);
+        expectEq("SQLGetTypeInfo(SQL_ALL_TYPES) succeeds", rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) printDiag(SQL_HANDLE_STMT, stmt, "SQLGetTypeInfo");
+
+        TypeRow row;
+        SQLBindCol(stmt, 1, SQL_C_CHAR, row.typeName, sizeof(row.typeName), &row.typeNameInd);
+        SQLBindCol(stmt, 2, SQL_C_SSHORT, &row.dataType, 0, &row.dataTypeInd);
+        SQLBindCol(stmt, 3, SQL_C_SLONG, &row.columnSize, 0, &row.columnSizeInd);
+        SQLBindCol(stmt, 4, SQL_C_CHAR, row.literalPrefix, sizeof(row.literalPrefix), &row.literalPrefixInd);
+        SQLBindCol(stmt, 6, SQL_C_CHAR, row.createParams, sizeof(row.createParams), &row.createParamsInd);
+        SQLBindCol(stmt, 7, SQL_C_SSHORT, &row.nullable, 0, &row.nullableInd);
+        SQLBindCol(stmt, 8, SQL_C_SSHORT, &row.caseSensitive, 0, &row.caseSensitiveInd);
+        SQLBindCol(stmt, 10, SQL_C_SSHORT, &row.unsignedAttr, 0, &row.unsignedAttrInd);
+        SQLBindCol(stmt, 12, SQL_C_SSHORT, &row.autoUnique, 0, &row.autoUniqueInd);
+        // Columns 16/17, not 14/15 (that's SQLColumns' layout) -
+        // SQLGetTypeInfo's result set has MINIMUM_SCALE/MAXIMUM_SCALE at
+        // 14/15, ahead of SQL_DATA_TYPE/SQL_DATETIME_SUB.
+        SQLBindCol(stmt, 16, SQL_C_SSHORT, &row.sqlDataType, 0, &row.sqlDataTypeInd);
+        SQLBindCol(stmt, 17, SQL_C_SSHORT, &row.sqlDatetimeSub, 0, &row.sqlDatetimeSubInd);
+
+        bool foundInteger = false;
+        bool foundChar = false;
+        bool foundDate = false;
+        bool foundDatetime = false;
+        int rowCount = 0;
+        while (SQLFetch(stmt) == SQL_SUCCESS) {
+            ++rowCount;
+            std::string name = row.typeNameInd != SQL_NULL_DATA ? row.typeName : "";
+            if (name == "integer") {
+                foundInteger = true;
+                expectEq("integer: DATA_TYPE == SQL_INTEGER", row.dataType == SQL_INTEGER);
+                expectEq("integer: COLUMN_SIZE == 10", row.columnSize == 10);
+                expectEq("integer: LITERAL_PREFIX is NULL", row.literalPrefixInd == SQL_NULL_DATA);
+                expectEq("integer: NULLABLE == SQL_NULLABLE", row.nullable == SQL_NULLABLE);
+                expectEq("integer: CASE_SENSITIVE == 0", row.caseSensitive == 0);
+                expectEq("integer: UNSIGNED_ATTRIBUTE == 0",
+                          row.unsignedAttrInd != SQL_NULL_DATA && row.unsignedAttr == 0);
+                expectEq("integer: AUTO_UNIQUE_VALUE is NULL", row.autoUniqueInd == SQL_NULL_DATA);
+            } else if (name == "serial") {
+                expectEq("serial: DATA_TYPE == SQL_INTEGER (collides with integer)", row.dataType == SQL_INTEGER);
+                expectEq("serial: AUTO_UNIQUE_VALUE == 1",
+                          row.autoUniqueInd != SQL_NULL_DATA && row.autoUnique == 1);
+            } else if (name == "varchar") {
+                foundChar = true;
+                expectEq("varchar: LITERAL_PREFIX == '", row.literalPrefixInd != SQL_NULL_DATA &&
+                                                              std::string(row.literalPrefix) == "'");
+                expectEq("varchar: CASE_SENSITIVE == 1", row.caseSensitive == 1);
+                expectEq("varchar: CREATE_PARAMS == max length",
+                          row.createParamsInd != SQL_NULL_DATA && std::string(row.createParams) == "max length");
+            } else if (name == "date") {
+                foundDate = true;
+                expectEq("date: SQL_DATA_TYPE == SQL_DATETIME",
+                          row.sqlDataTypeInd != SQL_NULL_DATA && row.sqlDataType == SQL_DATETIME);
+                expectEq("date: SQL_DATETIME_SUB == SQL_CODE_DATE",
+                          row.sqlDatetimeSubInd != SQL_NULL_DATA && row.sqlDatetimeSub == SQL_CODE_DATE);
+            } else if (name == "datetime") {
+                foundDatetime = true;
+                expectEq("datetime: SQL_DATA_TYPE == SQL_DATETIME",
+                          row.sqlDataTypeInd != SQL_NULL_DATA && row.sqlDataType == SQL_DATETIME);
+                expectEq("datetime: SQL_DATETIME_SUB == SQL_CODE_TIMESTAMP",
+                          row.sqlDatetimeSubInd != SQL_NULL_DATA && row.sqlDatetimeSub == SQL_CODE_TIMESTAMP);
+                expectEq("datetime: SQL_DATETIME_SUB is not SQL_CODE_DATE (date/datetime are distinguishable)",
+                          row.sqlDatetimeSub != SQL_CODE_DATE);
+            } else {
+                expectEq((name + ": SQL_DATETIME_SUB is NULL (not a datetime type)").c_str(),
+                          row.sqlDatetimeSubInd == SQL_NULL_DATA);
+            }
+        }
+        expectEq("SQL_ALL_TYPES found an 'integer' row", foundInteger);
+        expectEq("SQL_ALL_TYPES found a 'varchar' row", foundChar);
+        expectEq("SQL_ALL_TYPES found a 'date' row", foundDate);
+        expectEq("SQL_ALL_TYPES found a 'datetime' row", foundDatetime);
+        expectEq("SQL_ALL_TYPES returned all 11 kTypeMap rows", rowCount == 11);
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+    }
+
+    // DataType=SQL_INTEGER: exactly the two rows that collide on DATA_TYPE
+    // (integer, serial), ordered by data_type (both are SQL_INTEGER, so no
+    // further ordering guarantee - just check both are present).
+    {
+        SQLHSTMT stmt = SQL_NULL_HSTMT;
+        SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt);
+        SQLRETURN rc = SQLGetTypeInfo(stmt, SQL_INTEGER);
+        expectEq("SQLGetTypeInfo(SQL_INTEGER) succeeds", rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+
+        char name[64] = {};
+        SQLLEN nameInd = 0;
+        SQLBindCol(stmt, 1, SQL_C_CHAR, name, sizeof(name), &nameInd);
+        int rowCount = 0;
+        bool sawInteger = false, sawSerial = false;
+        while (SQLFetch(stmt) == SQL_SUCCESS) {
+            ++rowCount;
+            std::string n = nameInd != SQL_NULL_DATA ? name : "";
+            if (n == "integer") sawInteger = true;
+            if (n == "serial") sawSerial = true;
+        }
+        expectEq("DataType=SQL_INTEGER returns exactly 2 rows", rowCount == 2);
+        expectEq("DataType=SQL_INTEGER includes integer and serial", sawInteger && sawSerial);
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+    }
+
+    // A DataType nothing maps to (SQL_WCHAR - no Unicode support yet)
+    // returns zero rows, not an error.
+    {
+        SQLHSTMT stmt = SQL_NULL_HSTMT;
+        SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt);
+        SQLRETURN rc = SQLGetTypeInfo(stmt, SQL_WCHAR);
+        expectEq("SQLGetTypeInfo(SQL_WCHAR) succeeds", rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        rc = SQLFetch(stmt);
+        expectEq("DataType with no match returns zero rows", rc == SQL_NO_DATA);
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+    }
+
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -1053,6 +1210,10 @@ int main(int argc, char** argv) {
     bool columnsOk = runColumnsTest(dbc, database);
     std::printf("columns test: %s\n", columnsOk ? "PASS" : "FAIL");
 
+    std::printf("--- Phase 7: SQLGetTypeInfo ---\n");
+    bool typeInfoOk = runTypeInfoTest(dbc);
+    std::printf("type-info test: %s\n", typeInfoOk ? "PASS" : "FAIL");
+
     rc = SQLDisconnect(dbc);
     std::printf("SQLDisconnect rc=%d\n", static_cast<int>(rc));
     printDiag(SQL_HANDLE_DBC, dbc, "dbc");
@@ -1061,5 +1222,5 @@ int main(int argc, char** argv) {
     SQLFreeHandle(SQL_HANDLE_ENV, env);
     std::printf("done.\n");
     bool disconnectOk = (rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
-    return (disconnectOk && nativeOk && diagOk && bindOk && txnOk && catalogOk && columnsOk) ? 0 : 1;
+    return (disconnectOk && nativeOk && diagOk && bindOk && txnOk && catalogOk && columnsOk && typeInfoOk) ? 0 : 1;
 }
