@@ -326,3 +326,54 @@ TEST_CASE("DATETIME YEAR TO SECOND bind encoding") {
     CHECK((*decoded)->minute == 34);
     CHECK((*decoded)->second == 56);
 }
+
+TEST_CASE("DATETIME YEAR TO FRACTION(5)") {
+    // encodedLength = (19 << 8) | 0x0F: 19 total digits (14 whole-field +
+    // 5 fraction), qualifier start=YEAR(0) end=FRACTION(5)=15. Bytes are a
+    // live wire capture (IFX_SQLI_TRACE) of "2024-06-15 13:45:52.12345":
+    // exponent 0xc7 encodes 7 (the YEAR..SECOND pair count, *not* the
+    // total mantissa byte count of 10 - DATETIME's implicit "decimal
+    // point" always sits right after SECOND, matching DECIMAL's own
+    // exponent semantics), then 10 mantissa bytes, the last 3 of which are
+    // the FRACTION(5) pairs [12][34][50] - the trailing digit of the
+    // 5-digit (odd) fraction is zero-padded on the wire, not left-padded.
+    constexpr std::uint32_t kEncLen = (19u << 8) | 0x0F;
+
+    auto v = decodeDatetime(fromHex("c71418060f0d2d340c2232"), kEncLen);
+    REQUIRE(v.has_value());
+    REQUIRE(v->has_value());
+    CHECK((*v)->year == 2024);
+    CHECK((*v)->month == 6);
+    CHECK((*v)->day == 15);
+    CHECK((*v)->hour == 13);
+    CHECK((*v)->minute == 45);
+    CHECK((*v)->second == 52);
+    CHECK((*v)->fraction == 12345);
+    CHECK((*v)->fractionDigits == 5);
+
+    // An even fraction digit count needs no trailing zero-pad byte.
+    auto v2 = decodeDatetime(fromHex("c71418060f0d2d340c22"), (18u << 8) | 0x0E); // .1234
+    REQUIRE(v2.has_value());
+    REQUIRE(v2->has_value());
+    CHECK((*v2)->fraction == 1234);
+    CHECK((*v2)->fractionDigits == 4);
+}
+
+TEST_CASE("DATETIME YEAR TO FRACTION(5) bind encoding") {
+    constexpr std::uint32_t kEncLen = (19u << 8) | 0x0F;
+
+    // Same value as the live decode test above - encodeDatetime must
+    // reproduce the exact same exponent+mantissa bytes, confirmed live via
+    // a bind -> server storage -> plain SELECT -> decode round trip
+    // (tests/integration/test_bind.cpp).
+    DatetimeValue value{2024, 6, 15, 13, 45, 52, 12345, 5};
+    auto encoded = encodeDatetime(value, kEncLen);
+    REQUIRE(encoded.has_value());
+    CHECK(*encoded == fromHex("000b c71418060f0d2d340c2232"));
+
+    auto decoded = decodeDatetime(std::span<const std::byte>(encoded->data() + 2, encoded->size() - 2), kEncLen);
+    REQUIRE(decoded.has_value());
+    REQUIRE(decoded->has_value());
+    CHECK((*decoded)->fraction == 12345);
+    CHECK((*decoded)->fractionDigits == 5);
+}

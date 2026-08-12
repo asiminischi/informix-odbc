@@ -98,6 +98,72 @@ void check(const char* label, bool condition) {
     return true;
 }
 
+// Live round trip for DATETIME's FRACTION support (col_datetime_frac is
+// YEAR TO FRACTION(5)): encode -> SQ_BIND -> server storage -> plain
+// SELECT -> decode, on its own connection/row so it doesn't interact with
+// run()'s or checkDecimalRoundTrip's rows. Distinct from run()'s plain
+// col_datetime check (YEAR TO SECOND, no fraction) - this exercises the
+// exponent byte's fixed whole-field-pair-count encoding (confirmed live to
+// stay pinned at 7 even though the mantissa carries 10 pairs total once
+// FRACTION is appended) and the odd-digit-count zero-pad convention.
+[[nodiscard]] bool checkDatetimeFractionRoundTrip(const std::string& host, int port, const ConnectParams& params) {
+    auto conn = SqliConnection::connect(host, port, params);
+    if (!conn) {
+        std::fprintf(stderr, "connect failed: %s\n", conn.error().message.c_str());
+        return false;
+    }
+    constexpr std::uint32_t kYearToFraction5 = (19u << 8) | 0x0F;
+    DatetimeValue value{2024, 6, 15, 13, 45, 52, 12345, 5}; // 2024-06-15 13:45:52.12345
+    auto encoded = encodeDatetime(value, kYearToFraction5);
+    if (!encoded) {
+        std::fprintf(stderr, "encodeDatetime failed: %s\n", encoded.error().message.c_str());
+        return false;
+    }
+    auto insertStmt = SqliStatement::prepare(*conn, "insert into bind_probe (col_datetime_frac) values (?)");
+    if (!insertStmt) {
+        std::fprintf(stderr, "prepare insert failed: %s\n", insertStmt.error().message.c_str());
+        return false;
+    }
+    std::vector<BindParam> params2{
+        BindParam{ifxtype::kDatetime, false, *encoded, static_cast<std::uint16_t>(kYearToFraction5)}};
+    if (auto r = insertStmt->execute(params2); !r) {
+        std::fprintf(stderr, "execute insert failed: %s\n", r.error().message.c_str());
+        return false;
+    }
+    if (auto r = insertStmt->close(); !r) return false;
+    if (auto r = insertStmt->release(); !r) return false;
+
+    auto selectStmt =
+        SqliStatement::prepare(*conn, "select col_datetime_frac from bind_probe where col_datetime_frac is not null");
+    if (!selectStmt) {
+        std::fprintf(stderr, "prepare select failed: %s\n", selectStmt.error().message.c_str());
+        return false;
+    }
+    if (auto r = selectStmt->execute(); !r) {
+        std::fprintf(stderr, "execute select failed: %s\n", r.error().message.c_str());
+        return false;
+    }
+    auto row = selectStmt->fetchRow();
+    if (!row || !*row) {
+        std::fprintf(stderr, "fetchRow failed or no row\n");
+        return false;
+    }
+    auto decoded = decodeDatetime((**row)[0], kYearToFraction5);
+    if (auto r = selectStmt->close(); !r) return false;
+    if (auto r = selectStmt->release(); !r) return false;
+    if (auto r = conn->executeCommand("delete from bind_probe where col_datetime_frac is not null"); !r) return false;
+    if (auto r = conn->disconnectOrderly(); !r) return false;
+    if (!decoded) {
+        std::fprintf(stderr, "decode failed: %s\n", decoded.error().message.c_str());
+        return false;
+    }
+    check("bound DATETIME YEAR TO FRACTION(5) round-trips",
+          decoded->has_value() && (*decoded)->year == 2024 && (*decoded)->month == 6 && (*decoded)->day == 15 &&
+              (*decoded)->hour == 13 && (*decoded)->minute == 45 && (*decoded)->second == 52 &&
+              (*decoded)->fraction == 12345 && (*decoded)->fractionDigits == 5);
+    return true;
+}
+
 // Confirms SQ_BIND's NULL path: binds a NULL indicator (-1) into every
 // non-char column with the column's real ifxType attached (mirroring the
 // fix in driver/statement.cpp's buildBindParams, which used to leave
@@ -198,7 +264,7 @@ void check(const char* label, bool condition) {
             "create table bind_probe (col_smallint smallint, col_integer integer, col_bigint bigint,"
             " col_char char(20), col_varchar varchar(32), col_date date, col_decimal decimal(10,2),"
             " col_datetime datetime year to second, col_float float, col_smallfloat smallfloat,"
-            " col_boolean boolean)");
+            " col_boolean boolean, col_datetime_frac datetime year to fraction(5))");
         !r) {
         std::fprintf(stderr, "create table failed: %s\n", r.error().message.c_str());
         return false;
@@ -214,7 +280,8 @@ void check(const char* label, bool condition) {
         return false;
     }
 
-    auto insertStmt = SqliStatement::prepare(*conn, "insert into bind_probe values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    auto insertStmt =
+        SqliStatement::prepare(*conn, "insert into bind_probe values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
     if (!insertStmt) {
         std::fprintf(stderr, "prepare insert failed: %s\n", insertStmt.error().message.c_str());
         return false;
@@ -256,6 +323,8 @@ void check(const char* label, bool condition) {
     params2.push_back(BindParam{ifxtype::kSmallFloat, false, encodeSmallFloat(2.5f), kSmallFloatBindPrecision});
     params2.push_back(BindParam{ifxtype::kBooleanBindType, false, encodeBoolean(true), kBooleanBindPrecision,
                                  std::string("informix"), std::string("boolean")});
+    // col_datetime_frac isn't exercised here - see checkDatetimeFractionRoundTrip.
+    params2.push_back(BindParam{ifxtype::kDatetime, true, {}, 0});
     if (auto r = insertStmt->execute(params2); !r) {
         std::fprintf(stderr, "execute insert failed: %s\n", r.error().message.c_str());
         return false;
@@ -364,6 +433,10 @@ int main() {
         return 1;
     }
     if (!checkNullBind(host, port, params)) {
+        std::printf("\nbind integration test FAILED to complete (see error above)\n");
+        return 1;
+    }
+    if (!checkDatetimeFractionRoundTrip(host, port, params)) {
         std::printf("\nbind integration test FAILED to complete (see error above)\n");
         return 1;
     }

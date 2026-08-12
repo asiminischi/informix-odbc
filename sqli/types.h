@@ -52,8 +52,8 @@ inline constexpr int kBoolean = 41;
 inline constexpr int kBooleanBindType = 45;
 } // namespace ifxtype
 
-// A decoded calendar DATETIME value. Only whole-second qualifiers (some
-// contiguous span within YEAR..SECOND) are supported - see decodeDatetime.
+// A decoded calendar DATETIME value. Any contiguous qualifier span within
+// YEAR..FRACTION(5) is supported - see decodeDatetime.
 struct DatetimeValue {
     int year = 0;    // 0 if the qualifier doesn't include YEAR
     int month = 0;   // 1-12, 0 if not included
@@ -61,6 +61,15 @@ struct DatetimeValue {
     int hour = 0;
     int minute = 0;
     int second = 0;
+    // Sub-second digits as a plain zero-padded integer, e.g. FRACTION(3)
+    // value 5 means .005, not .500 - width is fractionDigits, not fixed.
+    // 0 if the qualifier doesn't include FRACTION.
+    int fraction = 0;
+    // Number of FRACTION digits the qualifier declares (1-5), 0 if the
+    // qualifier doesn't include FRACTION. Needed alongside `fraction`
+    // because the same integer value means different things at different
+    // widths (fraction=5 is .5 at FRACTION(1) but .00005 at FRACTION(5)).
+    int fractionDigits = 0;
 };
 
 // Decodes a fixed-width big-endian two's-complement integer. NULL is the
@@ -255,32 +264,36 @@ struct DecimalBindEncoding {
 // other field as 2 decimal digits/1 mantissa byte). `encodedLength` is the
 // DESCRIBE-reported value, packed as (totalDigits << 8) | qualifierByte
 // where qualifierByte's nibbles are the standard Informix TU_* start/end
-// codes (Year=0, Month=2, Day=4, Hour=6, Minute=8, Second=10). Confirmed
-// live only for the YEAR TO SECOND qualifier (0x0A, encodedLength 0x0E0A);
-// other whole-second sub-ranges within YEAR..SECOND follow the same
-// confirmed mechanism but aren't independently live-tested. FRACTION
-// qualifiers (end nibble 11-15) are not yet supported - the sub-second
-// byte layout hasn't been observed against a live server. NULL is all-zero
-// bytes, matching DECIMAL's convention.
+// codes (Year=0, Month=2, Day=4, Hour=6, Minute=8, Second=10, Fraction(n)=
+// 10+n for n in 1..5). Confirmed live for YEAR TO SECOND (0x0A, encodedLength
+// 0x0E0A) and YEAR TO FRACTION(5) (0x0F, encodedLength 0x130F); other
+// sub-ranges follow the same confirmed mechanism but aren't independently
+// live-tested. FRACTION digits continue the same digit-pair mantissa
+// stream immediately after SECOND - e.g. FRACTION(5) value .12345 packs as
+// three more mantissa bytes [12][34][50], the odd trailing digit
+// right-padded with a zero rather than left-padded (confirmed live via wire
+// capture: the 5-digit fraction ".12345" produced pair bytes 0x0c/0x22/0x32
+// = 12/34/50 decimal, not 12/34/05). NULL is all-zero bytes, matching
+// DECIMAL's convention.
 [[nodiscard]] std::expected<std::optional<DatetimeValue>, Error> decodeDatetime(std::span<const std::byte> raw,
                                                                                   std::uint32_t encodedLength);
 
-// DATETIME bind encoding for whole-second qualifiers only, same scope
-// restriction as decodeDatetime (FRACTION isn't supported - see its doc
-// comment). `encodedLength` is the same packed (totalDigits << 8) |
+// DATETIME bind encoding, same qualifier scope as decodeDatetime (including
+// FRACTION). `encodedLength` is the same packed (totalDigits << 8) |
 // qualifierByte value decodeDatetime takes; `value`'s fields outside
-// [start, end] are ignored. Unlike DATE, this genuinely differs from
-// decodeDatetime's TUPLE-format shape: it prepends a u16 length
-// (dec_ndgts + 1), the same bind-only framing DECIMAL uses - confirmed via
-// the decompiled JDBC reference's IfxDateTime.toIfx() routing through
-// Decimal.javaToIfx() (the exact same encoder IfxDecimal.toIfx() uses,
-// since Informix DATETIME reuses DECIMAL's packed-digit wire machinery
-// end to end, not just its TUPLE-format decode shape). The exponent
-// byte's biased magnitude equals the total mantissa byte count (matching
-// decodeDatetime's own confirmed-live observation that this holds for
-// YEAR TO SECOND, generalized here rather than re-derived per qualifier),
-// always positive - no hundred's-complement step, since datetimes aren't
-// signed. Confirmed live for YEAR TO SECOND
+// [start, end] are ignored, and `value.fraction`/`fractionDigits` are only
+// consulted when the qualifier's end code is a FRACTION code. Unlike DATE,
+// this genuinely differs from decodeDatetime's TUPLE-format shape: it
+// prepends a u16 length (dec_ndgts + 1), the same bind-only framing DECIMAL
+// uses - confirmed via the decompiled JDBC reference's IfxDateTime.toIfx()
+// routing through Decimal.javaToIfx() (the exact same encoder
+// IfxDecimal.toIfx() uses, since Informix DATETIME reuses DECIMAL's
+// packed-digit wire machinery end to end, not just its TUPLE-format decode
+// shape). The exponent byte's biased magnitude equals the total mantissa
+// byte count (matching decodeDatetime's own confirmed-live observation that
+// this holds for YEAR TO SECOND, generalized here rather than re-derived
+// per qualifier), always positive - no hundred's-complement step, since
+// datetimes aren't signed. Confirmed live for YEAR TO SECOND
 // (tests/integration/test_bind.cpp), including a hand-derived exact-byte
 // unit test predicted before ever touching the network - the output
 // matched on the first live attempt.

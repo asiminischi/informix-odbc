@@ -448,20 +448,26 @@ tests couldn't reach.
   minimally-sized mantissa (exactly as many bytes as the literal's own
   digits need) rather than requiring it padded to the target column's
   declared precision.
-- **DATETIME**: confirmed live for `YEAR TO SECOND`
-  (`tests/integration/test_bind.cpp`). The precision field is the qualifier
-  (same packed `(totalDigits << 8) | qualifierByte` DESCRIBE already uses),
-  hardcoded to `YEAR TO SECOND` in `driver/bind_encode.cpp` rather than
-  derived from the target column's actual declared qualifier - this
-  driver has no column metadata to consult at bind time regardless (same
-  limitation as DATE/CHAR/VARCHAR), and `YEAR TO SECOND` is the only
-  qualifier confirmed live on either the fetch or bind side so far.
-  FRACTION qualifiers are rejected outright rather than silently
-  truncated. `sqli::encodeDatetime`'s exact output bytes were hand-derived
-  and checked in a unit test (see `tests/sqli/test_types.cpp`) *before*
-  ever going live, reusing the same value already confirmed live on the
-  decode side (`2026-07-29 12:34:56`) - the prediction matched the actual
-  live round trip on the first attempt.
+- **DATETIME**: confirmed live for `YEAR TO SECOND` and `YEAR TO
+  FRACTION(5)` (`tests/integration/test_bind.cpp`). The precision field is
+  the qualifier (same packed `(totalDigits << 8) | qualifierByte` DESCRIBE
+  already uses); `driver/bind_encode.cpp` hardcodes `YEAR TO SECOND` when
+  `SQL_TIMESTAMP_STRUCT.fraction == 0` and `YEAR TO FRACTION(5)` otherwise,
+  rather than deriving either from the target column's actual declared
+  qualifier - this driver has no column metadata to consult at bind time
+  regardless (same limitation as DATE/CHAR/VARCHAR). `ts.fraction` is
+  nanoseconds; it's scaled down by `10^4` (truncating, not rounding) to
+  FRACTION(5)'s ten-microsecond resolution, Informix DATETIME's finest.
+  `sqli::encodeDatetime`'s exact output bytes were hand-derived and checked
+  in a unit test (see `tests/sqli/test_types.cpp`) *before* ever going
+  live, reusing the same value already confirmed live on the decode side
+  (`2026-07-29 12:34:56`, and separately `2024-06-15 13:45:52.12345` for
+  the FRACTION case) - the prediction matched the actual live round trip on
+  the first attempt for YEAR TO SECOND; the FRACTION case needed one fix
+  first (the exponent byte's biased magnitude has to stay pinned to the
+  whole-field pair count even once FRACTION pairs are appended - see the
+  DATETIME(qualifier) TUPLE-format section above for the live capture that
+  caught it).
 
 DECIMAL/DATETIME's BIND value encoding additionally prepends a 2-byte length
 (`dec_ndgts + 1`, the byte count of the exponent+mantissa that follows) that
@@ -619,21 +625,39 @@ fields concatenated), but is never negative (no complement step) and the
 digit sequence has a fixed, qualifier-derived meaning rather than a
 floating decimal point:
 - The qualifier byte's nibbles are the standard Informix TU_* constants:
-  `YEAR=0, MONTH=2, DAY=4, HOUR=6, MINUTE=8, SECOND=10` (fraction = 11-15,
-  **not yet supported** — no live capture with fractional seconds exists
-  yet, so the sub-second byte layout is unconfirmed; `decodeDatetime`
-  rejects these cleanly rather than guessing).
+  `YEAR=0, MONTH=2, DAY=4, HOUR=6, MINUTE=8, SECOND=10`, and FRACTION(n) for
+  n in 1-5 is `10+n` (11-15) — confirmed live via `IFX_SQLI_TRACE` capture
+  of a `YEAR TO FRACTION(5)` column holding `2024-06-15 13:45:52.12345`.
 - Each field from `start` to `end` contributes to the mantissa in order:
   YEAR contributes 2 mantissa bytes (4 decimal digits, e.g. `2026` → bytes
-  `20, 26`), every other field contributes 1 mantissa byte (2 decimal
-  digits, e.g. month `07` → byte `07`). The exponent byte's biased value
-  always equals the total mantissa byte count (e.g. `YEAR TO SECOND` = 7
-  mantissa bytes → exponent `0xC7`, confirmed live for both test rows).
+  `20, 26`), every other whole field (MONTH..SECOND) contributes 1 mantissa
+  byte (2 decimal digits, e.g. month `07` → byte `07`). FRACTION digits
+  continue the *same* digit-pair stream immediately after SECOND, packed
+  left-justified: `ceil(n/2)` more mantissa bytes for `n` fraction digits,
+  the trailing digit of an odd `n` **zero-padded on the low nibble** (not
+  left-padded) — e.g. `FRACTION(5)` value `.12345` → 3 more mantissa bytes
+  `[12][34][50]`, confirmed against the live capture below.
+- The exponent byte's biased value equals the *whole-field* mantissa byte
+  count (YEAR..SECOND only) even when FRACTION pairs follow — DATETIME's
+  implicit "decimal point" always sits right after SECOND, the same way
+  DECIMAL's exponent marks where its digit string's point falls. Confirmed
+  live: the `YEAR TO FRACTION(5)` capture below has 10 total mantissa bytes
+  (7 whole + 3 fraction) but exponent `0xC7` (biased `7`, not `10`) —
+  getting this wrong (using the total mantissa count instead) round-trips
+  fine through `decodeDatetime`'s own self-consistency but is rejected by
+  the server on `SQ_BIND` with sqlcode -1266 ("Intervals or Datetimes are
+  incompatible for the operation"), a mismatch `decodePackedDigits` can't
+  catch because it doesn't validate the exponent against the mantissa
+  length it's given.
 - Confirmed live for `YEAR TO SECOND` (qualifier `0x0A`) with two full
   round-trip values: `2026-07-29 12:34:56` (bytes `c7 14 1a 07 1d 0c 22 38`)
-  and `2000-01-01 00:00:00` (bytes `c7 14 00 01 01 00 00 00`). Other
-  whole-second sub-ranges within YEAR..SECOND (e.g. `MONTH TO DAY`) follow
-  the same confirmed mechanism but aren't independently live-tested.
+  and `2000-01-01 00:00:00` (bytes `c7 14 00 01 01 00 00 00`); and for
+  `YEAR TO FRACTION(5)` (qualifier `0x0F`, `encodedLength = 0x130F = 4879`)
+  with `2024-06-15 13:45:52.12345` (bytes
+  `c7 14 18 06 0f 0d 2d 34 0c 22 32`), including a bind round trip (encode
+  → `SQ_BIND` → server storage → plain SELECT → decode). Other sub-ranges
+  within YEAR..FRACTION(5) (e.g. `MONTH TO DAY`, `SECOND TO FRACTION(3)`)
+  follow the same confirmed mechanism but aren't independently live-tested.
 
 Both algorithms are implemented in `sqli/types.cpp` (`decodeDecimal`,
 `decodeDatetime`), with round-trip unit tests in `tests/sqli/test_types.cpp`
@@ -813,14 +837,14 @@ documented gaps rather than oversights.
   (Docker `ibmcom/informix-developer-database`, IDS 14.10.FC7W1DE) where they all
   happen to co-occur as true. Revisit if a server is found where DESCRIBE and
   TUPLE/FETCH negotiate differently.
-- DATETIME qualifiers including FRACTION (sub-second precision) are not
-  supported — `decodeDatetime` rejects them cleanly rather than guessing the
-  byte layout, since no live capture with fractional seconds has been taken.
-  Same open question applies to INTERVAL, which reuses DECIMAL/DATETIME-style
-  packed digits but *can* be negative (unlike DATETIME) — entirely unverified,
-  out of MVP scope.
+- DATETIME FRACTION (sub-second precision) is now supported (`YEAR TO
+  FRACTION(5)` confirmed live, decode and bind - see the DATETIME(qualifier)
+  section above). INTERVAL remains an open question: it reuses
+  DECIMAL/DATETIME-style packed digits but *can* be negative (unlike
+  DATETIME) — entirely unverified, out of MVP scope.
 - DECIMAL/DATETIME qualifiers outside what's been directly tested (precision
-  other than 10, qualifiers other than YEAR TO SECOND) are handled by a
-  general formula derived from - and consistent with - the tested cases, but
-  aren't independently confirmed against a live capture for those specific
+  other than 10, qualifiers other than YEAR TO SECOND/YEAR TO FRACTION(5))
+  are handled by a general formula derived from - and consistent with - the
+  tested cases, but aren't independently confirmed against a live capture
+  for those specific
   parameter values.

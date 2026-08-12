@@ -89,9 +89,6 @@ SQL_DATE_STRUCT dateStructFromUnixDays(std::int32_t unixDays) {
     return ds;
 }
 
-// FRACTION qualifiers aren't supported yet (see decodeDatetime's doc
-// comment), so `fraction` is always 0 here - correct for the confirmed-live
-// YEAR TO SECOND case, a known gap for anything finer.
 SQL_TIMESTAMP_STRUCT timestampStructFromDatetime(const DatetimeValue& dt) {
     SQL_TIMESTAMP_STRUCT ts{};
     ts.year = static_cast<SQLSMALLINT>(dt.year);
@@ -100,7 +97,15 @@ SQL_TIMESTAMP_STRUCT timestampStructFromDatetime(const DatetimeValue& dt) {
     ts.hour = static_cast<SQLUSMALLINT>(dt.hour);
     ts.minute = static_cast<SQLUSMALLINT>(dt.minute);
     ts.second = static_cast<SQLUSMALLINT>(dt.second);
+    // SQL_TIMESTAMP_STRUCT.fraction is nanoseconds; dt.fraction is a plain
+    // fractionDigits-wide integer (e.g. FRACTION(5) .12345 -> fraction=12345,
+    // fractionDigits=5), so scale up by 10^(9-fractionDigits).
     ts.fraction = 0;
+    if (dt.fractionDigits > 0) {
+        std::uint32_t scale = 1;
+        for (int i = dt.fractionDigits; i < 9; ++i) scale *= 10;
+        ts.fraction = static_cast<SQLUINTEGER>(dt.fraction) * scale;
+    }
     return ts;
 }
 

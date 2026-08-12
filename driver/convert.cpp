@@ -20,9 +20,13 @@ std::string formatDate(std::int32_t unixDays) {
 }
 
 std::string formatDatetime(const ifxsqli::DatetimeValue& dt) {
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d", dt.year, dt.month, dt.day, dt.hour, dt.minute,
-                  dt.second);
+    char buf[48];
+    int len = std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d", dt.year, dt.month, dt.day, dt.hour,
+                             dt.minute, dt.second);
+    if (dt.fractionDigits > 0 && len > 0 && static_cast<std::size_t>(len) < sizeof(buf)) {
+        std::snprintf(buf + len, sizeof(buf) - static_cast<std::size_t>(len), ".%0*d", dt.fractionDigits,
+                      dt.fraction);
+    }
     return buf;
 }
 

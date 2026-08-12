@@ -178,11 +178,13 @@ Roughly in the order they'd bite a real application:
    column's declared precision) round-trips fine. `SQL_DECIMAL` binds go
    through an exact decimal-literal string (`SQL_C_CHAR`), matching this
    driver's existing exact-DECIMAL-fetch convention, since there's no
-   `SQL_NUMERIC_STRUCT` support. `SQL_TYPE_TIMESTAMP` is scoped to
-   whole-second `YEAR TO SECOND` only, hardcoded rather than derived from
-   the target column's actual qualifier (the only one confirmed live);
-   FRACTION values are rejected outright rather than silently truncated.
-   Note VARCHAR was initially mis-traced - a first pass followed
+   `SQL_NUMERIC_STRUCT` support. `SQL_TYPE_TIMESTAMP` hardcodes `YEAR TO
+   SECOND` when there's no sub-second part and `YEAR TO FRACTION(5)`
+   otherwise (Informix DATETIME's finest precision, ten-microsecond
+   resolution - `ts.fraction` nanoseconds are truncated, not rounded, down
+   to that), rather than deriving either from the target column's actual
+   qualifier (the only two confirmed live). Note VARCHAR was initially
+   mis-traced - a first pass followed
    `IfxVarChar.toIfxTuple()` (a bulk-load path, not `sendBind`'s) and
    concluded the encoded buffer was fixed at the declared column width;
    the real bind path (`toIfx()`) turned out to be identical to CHAR's.
@@ -212,10 +214,11 @@ Roughly in the order they'd bite a real application:
      (`SQLBindParameter`) test harness exists to exercise it end-to-end.
 
    This is still mostly just the 8-type MVP set, not the full type system
-   BOP's Informix plugin eventually needs (LOB, INTERVAL, sub-second
-   DATETIME all remain unimplemented on both the bind and fetch sides).
-   BOOLEAN and FLOAT/SMALLFLOAT are now fully done end to end (bind,
-   fetch, and catalog). BOOLEAN turned out to be an extended/opaque type
+   BOP's Informix plugin eventually needs (LOB and INTERVAL remain
+   unimplemented on both the bind and fetch sides; sub-second DATETIME is
+   now done - see below). BOOLEAN and FLOAT/SMALLFLOAT are now fully done
+   end to end (bind, fetch, and catalog). BOOLEAN turned out to be an
+   extended/opaque type
    (nonzero `extendedId` in DESCRIBE, owner="informix"/name="boolean")
    rather than a plain fixed-width scalar, on the wire protocol layer
    only: fetch needed SQ_RETURN_TYPE's extended-column encoding plus a
@@ -233,6 +236,25 @@ Roughly in the order they'd bite a real application:
    fixed-width IEEE 754 values (wire ifxType matches the decompiled JDBC
    driver's codes exactly); see `decodeFloat`/`decodeSmallFloat`/
    `encodeFloat`/`encodeSmallFloat`.
+
+   DATETIME FRACTION (sub-second precision) is now fully done end to end
+   (bind, fetch-as-text, and fetch-as-`SQL_TIMESTAMP_STRUCT`). Confirmed
+   live via `IFX_SQLI_TRACE` wire capture of a `YEAR TO FRACTION(5)` column
+   holding `2024-06-15 13:45:52.12345`: FRACTION digits continue the same
+   packed base-100-digit-pair mantissa stream DECIMAL and the rest of
+   DATETIME already use, immediately after SECOND, left-justified with the
+   trailing digit of an odd digit count zero-padded on the wire. The one
+   real bug this surfaced: the exponent byte's biased magnitude has to stay
+   pinned to the *whole-field* (YEAR..SECOND) mantissa byte count even once
+   FRACTION pairs are appended - using the total mantissa count instead
+   (an easy mistake, since it happens to be correct whenever there's no
+   FRACTION) self-round-trips fine through `decodeDatetime` but the server
+   rejects it on bind with sqlcode -1266. `driver/bind_encode.cpp` hardcodes
+   `YEAR TO FRACTION(5)` (Informix DATETIME's finest precision) whenever
+   `SQL_TIMESTAMP_STRUCT.fraction != 0`, scaling nanoseconds down by `10^4`
+   (truncating, not rounding). See `sqli/types.h`'s decodeDatetime/
+   encodeDatetime doc comments and `docs/protocol-notes.md`'s
+   DATETIME(qualifier) section for the full byte-level writeup.
 4. **No DSN-based connect (`SQLConnect`).** Only `SQLDriverConnect` with an
    explicit keyword string works today. Fine for `isql -k`, but many
    GUI/ODBC-Admin tools default to the DSN path.
@@ -246,10 +268,9 @@ Roughly in the order they'd bite a real application:
    Linux/WSL2 + unixODBC + `isql`.
 6. **No Unicode.** ANSI (`SQL_C_CHAR`) only; no `SQLWCHAR`/`W`-suffixed
    functions.
-7. **Missing scalar types**: INTERVAL, LOBs (BLOB/CLOB/BYTE/TEXT), and
-   DATETIME with fractional (sub-second) qualifiers. BOOLEAN and
-   FLOAT/SMALLFLOAT are fully done, including catalog rows (see item 3
-   above).
+7. **Missing scalar types**: INTERVAL and LOBs (BLOB/CLOB/BYTE/TEXT).
+   BOOLEAN, FLOAT/SMALLFLOAT, and DATETIME (including sub-second FRACTION)
+   are fully done, including catalog rows (see item 3 above).
 8. **No real generated-key retrieval.** The `SQ_INSERTDONE` wire field is
    decoded, but the driver never sends the extra "SGK" request the server
    needs to actually populate it, so every INSERT currently reports a
@@ -303,11 +324,15 @@ write every column type a real database has, and has to actually be
 callable from BOP's own code; catalog-completeness and driver-manager
 polish don't block that.
 
-1. **Remaining scalar types beyond the MVP-8 set - INTERVAL, sub-second
-   DATETIME, then LOBs (both bind and fetch sides). BOOLEAN and
-   FLOAT/SMALLFLOAT are now fully done end to end (bind, fetch, and
-   catalog rows, sqli-layer plus ODBC-layer), each confirmed live and
-   through the real Driver Manager.**
+1. **Remaining scalar types beyond the MVP-8 set - INTERVAL, then LOBs
+   (both bind and fetch sides). BOOLEAN, FLOAT/SMALLFLOAT, and DATETIME
+   (including sub-second FRACTION) are now fully done end to end (bind,
+   fetch, and catalog rows, sqli-layer plus ODBC-layer), each confirmed
+   live - DATETIME/FRACTION through the sqli layer and driver-layer
+   conversions directly (`driver/convert.cpp`/`convert_native.cpp`/
+   `bind_encode.cpp`), not yet through the real Driver Manager, which
+   currently needs the Linux/WSL2 path (see item 5's Windows DM gap) not
+   set up in this environment.**
    Blocking: a real Informix database backup/restore tool can't skip
    columns of a type it doesn't support. LOBs in particular are likely to
    need their own multi-message wire handling, not just another entry in

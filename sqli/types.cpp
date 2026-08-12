@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -364,6 +365,8 @@ struct DatetimeQualifier {
     unsigned totalDigits;
     unsigned start;
     unsigned end;
+    // end - 10 when end is a FRACTION code (11-15), 0 otherwise.
+    unsigned fractionDigits;
 };
 
 std::expected<DatetimeQualifier, Error> parseDatetimeQualifier(std::uint32_t encodedLength) {
@@ -372,14 +375,21 @@ std::expected<DatetimeQualifier, Error> parseDatetimeQualifier(std::uint32_t enc
     unsigned start = (qualifierByte >> 4) & 0xF;
     unsigned end = qualifierByte & 0xF;
 
+    if (end > 15) {
+        return std::unexpected(Error{ErrorKind::Protocol, "DATETIME: malformed qualifier byte"});
+    }
     if (end > 10) {
-        return std::unexpected(
-            Error{ErrorKind::Protocol, "DATETIME: fractional-second qualifiers not yet supported (Phase 3)"});
+        // FRACTION end code: start must be a whole-field code (FRACTION
+        // can't be a start).
+        if (start > 10 || start % 2 != 0) {
+            return std::unexpected(Error{ErrorKind::Protocol, "DATETIME: malformed qualifier byte"});
+        }
+        return DatetimeQualifier{totalDigits, start, end, end - 10};
     }
     if (start > end || start % 2 != 0 || end % 2 != 0) {
         return std::unexpected(Error{ErrorKind::Protocol, "DATETIME: malformed qualifier byte"});
     }
-    return DatetimeQualifier{totalDigits, start, end};
+    return DatetimeQualifier{totalDigits, start, end, 0};
 }
 
 } // namespace
@@ -388,17 +398,20 @@ std::expected<std::optional<DatetimeValue>, Error> decodeDatetime(std::span<cons
                                                                      std::uint32_t encodedLength) {
     auto qualifierR = parseDatetimeQualifier(encodedLength);
     if (!qualifierR) return std::unexpected(qualifierR.error());
-    auto [totalDigits, start, end] = *qualifierR;
+    auto [totalDigits, start, end, fractionDigits] = *qualifierR;
     const auto& kFields = kDatetimeFields;
 
     std::size_t expectedMantissa = 0;
     unsigned expectedDigits = 0;
     for (const auto& f : kFields) {
-        if (f.tu >= start && f.tu <= end) {
+        if (f.tu >= start && f.tu <= std::min(end, 10u)) {
             expectedMantissa += f.mantissaBytes;
             expectedDigits += f.mantissaBytes * 2;
         }
     }
+    std::size_t fractionMantissaBytes = (fractionDigits + 1) / 2;
+    expectedMantissa += fractionMantissaBytes;
+    expectedDigits += fractionDigits;
     if (expectedDigits != totalDigits) {
         return std::unexpected(Error{ErrorKind::Protocol, "DATETIME: qualifier digit count mismatch"});
     }
@@ -415,7 +428,7 @@ std::expected<std::optional<DatetimeValue>, Error> decodeDatetime(std::span<cons
     DatetimeValue result;
     std::size_t idx = 0;
     for (const auto& f : kFields) {
-        if (f.tu < start || f.tu > end) continue;
+        if (f.tu < start || f.tu > std::min(end, 10u)) continue;
         int value = (f.mantissaBytes == 2) ? (digits[idx] * 100 + digits[idx + 1]) : digits[idx];
         idx += f.mantissaBytes;
         switch (f.tu) {
@@ -427,6 +440,19 @@ std::expected<std::optional<DatetimeValue>, Error> decodeDatetime(std::span<cons
             case 10: result.second = value; break;
         }
     }
+    if (fractionDigits > 0) {
+        int fractionValue = 0;
+        for (std::size_t i = 0; i < fractionMantissaBytes; ++i) {
+            int pair = digits[idx + i];
+            bool lastPairIsOdd = (i + 1 == fractionMantissaBytes) && (fractionDigits % 2 != 0);
+            // The trailing digit of an odd-length fraction is padded with a
+            // zero on the wire (e.g. FRACTION(5) .12345 -> [12][34][50]) -
+            // drop that padding digit rather than treating it as real.
+            fractionValue = lastPairIsOdd ? (fractionValue * 10 + pair / 10) : (fractionValue * 100 + pair);
+        }
+        result.fraction = fractionValue;
+        result.fractionDigits = static_cast<int>(fractionDigits);
+    }
     return result;
 }
 
@@ -436,10 +462,11 @@ std::expected<std::vector<std::byte>, Error> encodeDatetime(const DatetimeValue&
     if (!qualifierR) return std::unexpected(qualifierR.error());
     unsigned start = qualifierR->start;
     unsigned end = qualifierR->end;
+    unsigned fractionDigits = qualifierR->fractionDigits;
 
     std::vector<int> mantissa;
     for (const auto& f : kDatetimeFields) {
-        if (f.tu < start || f.tu > end) continue;
+        if (f.tu < start || f.tu > std::min(end, 10u)) continue;
         int fieldValue = 0;
         switch (f.tu) {
             case 0: fieldValue = value.year; break;
@@ -456,15 +483,32 @@ std::expected<std::vector<std::byte>, Error> encodeDatetime(const DatetimeValue&
             mantissa.push_back(fieldValue);
         }
     }
+    // The exponent byte's biased magnitude is fixed to this whole-field
+    // pair count even when FRACTION pairs follow - DATETIME's "decimal
+    // point" always sits right after SECOND (confirmed live: a YEAR TO
+    // FRACTION(5) value's wire exponent encoded 7, the YEAR..SECOND pair
+    // count, not 10, the total mantissa byte count including fraction).
+    auto wholeFieldPairs = static_cast<std::uint16_t>(mantissa.size());
+    if (fractionDigits > 0) {
+        // Zero-pad the fraction value to the qualifier's declared width,
+        // then split into digit pairs left to right - confirmed live
+        // convention (see decodeDatetime's doc comment): a trailing odd
+        // digit is padded with a zero, not left-padded.
+        char buf[8];
+        std::snprintf(buf, sizeof(buf), "%0*d", static_cast<int>(fractionDigits), value.fraction);
+        for (unsigned p = 0; p < fractionDigits; p += 2) {
+            int d1 = buf[p] - '0';
+            int d2 = (p + 1 < fractionDigits) ? (buf[p + 1] - '0') : 0;
+            mantissa.push_back(d1 * 10 + d2);
+        }
+    }
 
-    // Confirmed live (see decodeDatetime's doc comment): the exponent
-    // byte's biased magnitude equals the total mantissa byte count, always
-    // positive - datetimes aren't signed, so there's no complement step
-    // DECIMAL's negative case needs.
-    auto decNdgts = static_cast<std::uint16_t>(mantissa.size());
-    auto exponentByte = static_cast<std::uint8_t>(0x80 | ((64 + decNdgts) & 0x7F));
+    // Always positive - no hundred's-complement step, since datetimes
+    // aren't signed (unlike DECIMAL's negative case).
+    auto exponentByte = static_cast<std::uint8_t>(0x80 | ((64 + wholeFieldPairs) & 0x7F));
 
     std::vector<std::byte> data;
+    auto decNdgts = static_cast<std::uint16_t>(mantissa.size());
     auto lengthField = writeBigEndian<std::uint16_t>(static_cast<std::uint16_t>(decNdgts + 1));
     data.insert(data.end(), lengthField.begin(), lengthField.end());
     data.push_back(std::byte{exponentByte});

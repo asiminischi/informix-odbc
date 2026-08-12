@@ -97,6 +97,9 @@ void printColumnValue(const ifxsqli::ColumnDesc& col, std::span<const std::byte>
             if (!*v) { std::printf("NULL"); return; }
             std::printf("%04d-%02d-%02d %02d:%02d:%02d", (*v)->year, (*v)->month, (*v)->day, (*v)->hour,
                         (*v)->minute, (*v)->second);
+            if ((*v)->fractionDigits > 0) {
+                std::printf(".%0*d", (*v)->fractionDigits, (*v)->fraction);
+            }
             return;
         }
         default:

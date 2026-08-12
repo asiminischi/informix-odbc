@@ -150,28 +150,32 @@ BindEncodeResult encodeBindParam(SQLSMALLINT valueType, SQLSMALLINT parameterTyp
     }
     if (parameterType == SQL_TYPE_TIMESTAMP && (valueType == SQL_C_TYPE_TIMESTAMP || valueType == SQL_C_TIMESTAMP)) {
         const auto& ts = *static_cast<SQL_TIMESTAMP_STRUCT*>(parameterValuePtr);
-        if (ts.fraction != 0) {
-            // FRACTION qualifiers aren't supported yet - see
-            // sqli/types.h's decodeDatetime/encodeDatetime doc comments.
-            // Fail loudly rather than silently truncating a value the
-            // caller explicitly set.
-            return BindEncodeResult{BindEncodeStatus::kUnsupported, {}};
-        }
         ifxsqli::DatetimeValue value{static_cast<int>(ts.year),  static_cast<int>(ts.month), static_cast<int>(ts.day),
                                       static_cast<int>(ts.hour), static_cast<int>(ts.minute), static_cast<int>(ts.second)};
-        // YEAR TO SECOND is hardcoded, not derived from the target
-        // column's actual declared qualifier - the only qualifier
-        // confirmed live so far (see docs/protocol-notes.md's SQ_BIND
-        // notes), and this driver has no column metadata to consult at
-        // bind time regardless (same limitation as DATE/CHAR/VARCHAR).
-        constexpr std::uint32_t kYearToSecond = (14u << 8) | 0x0A;
-        auto encoded = ifxsqli::encodeDatetime(value, kYearToSecond);
+        // The qualifier is hardcoded, not derived from the target column's
+        // actual declared qualifier - this driver has no column metadata
+        // to consult at bind time regardless (same limitation as
+        // DATE/CHAR/VARCHAR). YEAR TO SECOND when there's no sub-second
+        // part, otherwise YEAR TO FRACTION(5) - Informix DATETIME's finest
+        // precision (ten-microsecond resolution). ts.fraction is
+        // nanoseconds (SQL_TIMESTAMP_STRUCT's unit); scaling down by 10^4
+        // truncates, rather than rounds, any sub-ten-microsecond precision
+        // the wire format has no room for.
+        std::uint32_t qualifier;
+        if (ts.fraction != 0) {
+            value.fraction = static_cast<int>(ts.fraction / 10000);
+            value.fractionDigits = 5;
+            qualifier = (19u << 8) | 0x0F;
+        } else {
+            qualifier = (14u << 8) | 0x0A;
+        }
+        auto encoded = ifxsqli::encodeDatetime(value, qualifier);
         if (!encoded) return BindEncodeResult{BindEncodeStatus::kUnsupported, {}};
         ifxsqli::BindParam p;
         p.ifxType = ifxsqli::ifxtype::kDatetime;
         p.isNull = false;
         p.data = std::move(*encoded);
-        p.precisionField = static_cast<std::uint16_t>(kYearToSecond);
+        p.precisionField = static_cast<std::uint16_t>(qualifier);
         return BindEncodeResult{BindEncodeStatus::kOk, std::move(p)};
     }
     return BindEncodeResult{BindEncodeStatus::kUnsupported, {}};
