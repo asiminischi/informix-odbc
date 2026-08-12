@@ -277,19 +277,38 @@ notes:
 
 ## Suggested next steps, in priority order
 
-1. `SQLPrimaryKeys`/`SQLStatistics` (`SQLTables`/`SQLColumns`/
-   `SQLGetTypeInfo` are done).
-2. Windows driver registration (registry helper plus install doc) so the
-   native Windows ODBC DM path is actually usable, not just the DLL - the
-   transaction work this pass had to fall back to WSL2/unixODBC for its
-   real-Driver-Manager verification for the same pre-existing reason.
-3. Remaining scalar types beyond the MVP-8 set (FLOAT/SMALLFLOAT/BOOLEAN/
-   INTERVAL, sub-second DATETIME), then LOBs - both bind and fetch sides.
-4. Unicode (`SQLWCHAR`) support.
-5. SSL and PAM auth.
-6. Thread-safety pass plus connection pooling.
-7. Installer packaging for both platforms.
-8. Broaden `SQLGetInfo`/`SQLGetFunctions` and the SQLSTATE table against a
+Reordered to the lens that actually matters for this driver's purpose -
+being usable as the eventual BOP Informix plugin's data path - rather than
+"most ODBC-spec-complete first." A backup/restore tool has to read and
+write every column type a real database has, and has to actually be
+callable from BOP's own code; catalog-completeness and driver-manager
+polish don't block that.
+
+1. **Remaining scalar types beyond the MVP-8 set - FLOAT/SMALLFLOAT/
+   BOOLEAN/INTERVAL, sub-second DATETIME, then LOBs (both bind and fetch
+   sides).** Blocking: a real Informix database backup/restore tool can't
+   skip columns of a type it doesn't support. LOBs in particular are
+   likely to need their own multi-message wire handling, not just another
+   entry in the existing scalar bind/fetch tables.
+2. **Decide and prototype the BOP integration mechanism** (CGO, subprocess
+   + a small IPC protocol, or something else) - deliberately left
+   undecided when this project started. Nothing else here matters to BOP
+   until there's a concrete way to call into this driver from BOP's own
+   code.
+3. SSL and PAM auth - a backup tool touching production data over
+   plaintext auth is a hard sell for real deployment.
+4. Windows driver registration (registry helper plus install doc) so the
+   native Windows ODBC DM path is actually usable, not just the DLL -
+   only blocking if BOP's Informix plugin runs on native Windows rather
+   than Linux; revisit once the deployment target is known.
+5. `SQLPrimaryKeys`/`SQLStatistics` (`SQLTables`/`SQLColumns`/
+   `SQLGetTypeInfo` are done) - useful for a general-purpose driver, not
+   required for BOP's read-everything/write-everything-transactionally
+   use case.
+6. Unicode (`SQLWCHAR`) support.
+7. Thread-safety pass plus connection pooling.
+8. Installer packaging for both platforms.
+9. Broaden `SQLGetInfo`/`SQLGetFunctions` and the SQLSTATE table against a
    real ODBC conformance trace rather than "whatever `isql` happened to
    need."
 
