@@ -85,6 +85,12 @@ std::expected<CellText, ifxsqli::Error> formatCellAsText(const ifxsqli::ColumnDe
             if (!*v) return CellText{true, {}};
             return CellText{false, formatDatetime(**v)};
         }
+        case ifxtype::kBoolean: {
+            auto v = decodeBoolean(raw);
+            if (!v) return std::unexpected(v.error());
+            if (!*v) return CellText{true, {}};
+            return CellText{false, **v ? "1" : "0"};
+        }
         default:
             return std::unexpected(
                 Error{ErrorKind::Protocol,
