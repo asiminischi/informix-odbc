@@ -59,6 +59,15 @@ std::expected<std::vector<std::vector<std::byte>>, Error> splitRow(std::span<con
             case ifxtype::kChar:               // CHAR(n): fixed width
                 width = col.encodedLength;
                 break;
+            case ifxtype::kBoolean: {
+                // Self-describing, not fixed-width despite encodedLength=1 -
+                // see decodeBoolean's doc comment for the confirmed shape.
+                if (offset >= row.size()) {
+                    return std::unexpected(Error{ErrorKind::Protocol, "row truncated reading boolean null flag"});
+                }
+                width = (row[offset] == std::byte{1}) ? 5 : 6;
+                break;
+            }
             case ifxtype::kSmallInt:
                 width = 2;
                 break;
@@ -269,11 +278,39 @@ std::expected<void, Error> SqliStatement::fetchNextBatch() {
         // Tells the server how to render each column for this fetch
         // direction; required at least once whenever variable-length
         // columns are present (confirmed live - see docs/protocol-notes.md).
+        //
+        // Extended/opaque types (BOOLEAN and friends - anything DESCRIBE gave
+        // a nonzero extendedId) need a different entry shape than plain
+        // scalars: the *extended* type code (not the base ifxType) plus the
+        // owner/type-name pair DESCRIBE reported, echoed straight back -
+        // reverse-engineered from the decompiled IfxSqli.sendType(), which
+        // remaps extendedId {1,3,4,5,other} -> sqltype {43,46,47,45,44} and
+        // writes owner+name (as ifxChar2 fields) before encodedLength for any
+        // such column. Omitting this for BOOLEAN causes the server to
+        // misparse the rest of the request and drop the connection
+        // (confirmed live: a bare SQ_RETURN_TYPE for a BOOLEAN column gets a
+        // lone tag-56 reply followed by the socket closing).
         w.u16(opcode::kReturnType);
         w.u16(1); // direction: 1 = fetch
         w.u16(static_cast<std::uint16_t>(columns_.size()));
         for (const auto& col : columns_) {
-            w.u16(static_cast<std::uint16_t>(col.ifxType));
+            bool extended = col.extendedId != 0 && col.ifxType != ifxtype::kVarchar &&
+                             col.ifxType != ifxtype::kNVarchar;
+            if (extended) {
+                std::uint16_t remapped;
+                switch (col.extendedId) {
+                    case 1: remapped = 43; break;
+                    case 3: remapped = 46; break;
+                    case 4: remapped = 47; break;
+                    case 5: remapped = 45; break;
+                    default: remapped = 44; break;
+                }
+                w.u16(remapped);
+                w.ifxChar2(col.extendedOwnerName);
+                w.ifxChar2(col.extendedTypeName);
+            } else {
+                w.u16(static_cast<std::uint16_t>(col.ifxType));
+            }
             w.u32(col.encodedLength);
         }
         typeSent_ = true;
@@ -407,9 +444,15 @@ std::expected<bool, Error> SqliStatement::processResponseBatch() {
                     columns_[i].notNull = (*colType & 0x100) != 0;
 
                     if (wide) {
-                        if (!readU32(sock)) return std::unexpected(Error{ErrorKind::Transport, "read failed (extended id)"});
-                        if (auto owner = readIfxChar2(sock); !owner) return std::unexpected(owner.error());
-                        if (auto extName = readIfxChar2(sock); !extName) return std::unexpected(extName.error());
+                        auto extId = readU32(sock);
+                        if (!extId) return std::unexpected(Error{ErrorKind::Transport, "read failed (extended id)"});
+                        columns_[i].extendedId = *extId;
+                        auto owner = readIfxChar2(sock);
+                        if (!owner) return std::unexpected(owner.error());
+                        columns_[i].extendedOwnerName = *owner;
+                        auto extName = readIfxChar2(sock);
+                        if (!extName) return std::unexpected(extName.error());
+                        columns_[i].extendedTypeName = *extName;
                         if (!readU16(sock)) return std::unexpected(Error{ErrorKind::Transport, "read failed (reference)"});
                         if (!readU16(sock)) return std::unexpected(Error{ErrorKind::Transport, "read failed (alignment)"});
                         if (!readU32(sock)) return std::unexpected(Error{ErrorKind::Transport, "read failed (source type)"});

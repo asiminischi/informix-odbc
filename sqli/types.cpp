@@ -106,6 +106,18 @@ std::expected<std::optional<std::string>, Error> decodeVarchar(std::span<const s
     return std::string(reinterpret_cast<const char*>(raw.data() + 1), len);
 }
 
+std::expected<std::optional<bool>, Error> decodeBoolean(std::span<const std::byte> raw) {
+    if (raw.empty()) return std::unexpected(Error{ErrorKind::Protocol, "BOOLEAN: empty buffer"});
+    if (raw[0] == std::byte{1}) return std::nullopt;
+    if (raw[0] != std::byte{0}) {
+        return std::unexpected(Error{ErrorKind::Protocol, "BOOLEAN: unrecognized null-flag byte"});
+    }
+    if (raw.size() != 6) return std::unexpected(Error{ErrorKind::Protocol, "BOOLEAN: expected 6 bytes for a value"});
+    auto len = readBigEndian<std::int32_t>(raw.subspan(1, 4));
+    if (len != 1) return std::unexpected(Error{ErrorKind::Protocol, "BOOLEAN: unexpected payload length"});
+    return raw[5] != std::byte{0};
+}
+
 // Confirmed live: DATE's day count is relative to 1899-12-31, which is
 // 25568 days before the Unix epoch (1970-01-01).
 constexpr std::int32_t kIfxEpochToUnixEpochDays = 25568;

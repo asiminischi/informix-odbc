@@ -70,6 +70,13 @@ void printColumnValue(const ifxsqli::ColumnDesc& col, std::span<const std::byte>
             std::printf("%s", (*v)->c_str());
             return;
         }
+        case ifxtype::kBoolean: {
+            auto v = decodeBoolean(bytes);
+            if (!v) { std::printf("<error: %s>", v.error().message.c_str()); return; }
+            if (!*v) { std::printf("NULL"); return; }
+            std::printf("%s", **v ? "true" : "false");
+            return;
+        }
         case ifxtype::kDatetime: {
             auto v = decodeDatetime(bytes, col.encodedLength);
             if (!v) { std::printf("<error: %s>", v.error().message.c_str()); return; }

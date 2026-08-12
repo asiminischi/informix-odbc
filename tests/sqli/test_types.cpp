@@ -117,6 +117,25 @@ TEST_CASE("VARCHAR") {
     CHECK(!null->has_value());
 }
 
+TEST_CASE("BOOLEAN") {
+    // Captured live from a 3-row bool_probe fixture (true/false/NULL) - see
+    // decodeBoolean's doc comment in sqli/types.h for the shape this
+    // confirms (matches the decompiled IfxBoolean.toIfxTuple() byte-for-byte).
+    auto t = decodeBoolean(fromHex("000000000101"));
+    REQUIRE(t.has_value());
+    REQUIRE(t->has_value());
+    CHECK(**t == true);
+
+    auto f = decodeBoolean(fromHex("000000000100"));
+    REQUIRE(f.has_value());
+    REQUIRE(f->has_value());
+    CHECK(**f == false);
+
+    auto null = decodeBoolean(fromHex("0100000000"));
+    REQUIRE(null.has_value());
+    CHECK(!null->has_value());
+}
+
 TEST_CASE("DATE") {
     auto v = decodeDateUnixDays(fromHex("0000b497")); // 2026-07-29, day count 46231
     REQUIRE(v.has_value());

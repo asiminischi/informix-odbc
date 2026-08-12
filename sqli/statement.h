@@ -16,6 +16,14 @@ struct ColumnDesc {
     int ifxType = 0;       // base Informix type code (flag bits already masked off)
     bool notNull = false;
     std::uint32_t encodedLength = 0;
+    // Extended/opaque-type identity (BOOLEAN, blobs, UDTs, ...), only
+    // populated on wide (4-byte-offset) connections - DESCRIBE's wide branch
+    // is the only place the wire sends these. extendedId == 0 means "not an
+    // extended type" (ordinary scalar). Needed to echo the same identity
+    // back in SQ_RETURN_TYPE - see SqliStatement::fetchNextBatch.
+    std::uint32_t extendedId = 0;
+    std::string extendedOwnerName;
+    std::string extendedTypeName;
 };
 
 // One "?" parameter's already-encoded value, ready for SQ_BIND. Building

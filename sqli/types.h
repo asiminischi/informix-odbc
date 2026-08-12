@@ -29,6 +29,15 @@ inline constexpr int kVarchar = 13;
 inline constexpr int kNVarchar = 16;
 inline constexpr int kBigInt = 52;
 inline constexpr int kBigSerial = 53;
+// Confirmed live via DESCRIBE against a BOOLEAN column - notably not 45,
+// the ifxType the decompiled JDBC driver's IfxBoolean constructor sets
+// (that 45 is a JDBC-level/extended-type rendering code, not the SQLI wire
+// base type - see docs/protocol-notes.md's BOOLEAN section). BOOLEAN is an
+// *extended* type (nonzero extendedId in DESCRIBE) even though its wire
+// value is a single byte, which is why fetching it needs the SQ_RETURN_TYPE
+// extended-column encoding (SqliStatement::fetchNextBatch) rather than just
+// a plain scalar entry.
+inline constexpr int kBoolean = 41;
 } // namespace ifxtype
 
 // A decoded calendar DATETIME value. Only whole-second qualifiers (some
@@ -106,6 +115,19 @@ inline constexpr std::uint16_t kBigIntBindPrecision = 0x1300;
 // is the sentinel length=1/data=0x00 (confirmed live; distinct from a real
 // empty string, which is length=0).
 [[nodiscard]] std::expected<std::optional<std::string>, Error> decodeVarchar(std::span<const std::byte> raw);
+
+// BOOLEAN (an extended type, ifxType 41 - see ifxtype::kBoolean): confirmed
+// live against a 3-row fixture (true/false/NULL) that the TUPLE encoding
+// matches the decompiled IfxBoolean.toIfxTuple() shape exactly, byte for
+// byte - NOT a plain 1-byte scalar despite DESCRIBE reporting
+// encodedLength=1. Self-describing, variable width:
+//   NULL:     5 bytes, `01 00 00 00 00` (byte 0 = 1, rest unused padding)
+//   non-NULL: 6 bytes, `00` + 4-byte big-endian length prefix (always 1,
+//             the payload's own byte count) + 1-byte value (0=false,
+//             1=true)
+// `raw` must be the whole 5- or 6-byte slice (splitRow determines which by
+// peeking byte 0, same as this function does).
+[[nodiscard]] std::expected<std::optional<bool>, Error> decodeBoolean(std::span<const std::byte> raw);
 
 // 4-byte big-endian signed day count from epoch 1899-12-31 (confirmed
 // live). NULL is INT32_MIN, same sentinel as INTEGER. Returns the day count

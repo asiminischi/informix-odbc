@@ -13,11 +13,34 @@
 #  include <unistd.h>
 #endif
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace ifxsqli {
 
 namespace {
+
+// Opt-in raw wire trace for protocol debugging (IFX_SQLI_TRACE=1). Prints a
+// hex dump of every send()/recv() to stderr - see docs/protocol-notes.md's
+// "raw byte capture" debugging note.
+bool traceEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("IFX_SQLI_TRACE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
+void traceBytes(const char* direction, std::span<const std::byte> data) {
+    if (!traceEnabled()) return;
+    std::fprintf(stderr, "[trace] %s %zu bytes:", direction, data.size());
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        if (i % 16 == 0) std::fprintf(stderr, "\n  ");
+        std::fprintf(stderr, "%02x ", std::to_integer<unsigned char>(data[i]));
+    }
+    std::fprintf(stderr, "\n");
+}
 
 #if defined(_WIN32)
 struct WinsockInit {
@@ -115,6 +138,7 @@ std::expected<TcpSocket, Error> TcpSocket::connect(const std::string& host, int 
 }
 
 std::expected<void, Error> TcpSocket::writeAll(std::span<const std::byte> data) {
+    traceBytes("SEND", data);
     std::size_t sent = 0;
     while (sent < data.size()) {
 #if defined(_WIN32)
@@ -146,6 +170,7 @@ std::expected<void, Error> TcpSocket::readExact(std::span<std::byte> out) {
         }
         received += static_cast<std::size_t>(n);
     }
+    traceBytes("RECV", out);
     return {};
 }
 
