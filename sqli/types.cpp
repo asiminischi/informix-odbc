@@ -516,22 +516,32 @@ std::expected<std::vector<std::byte>, Error> encodeDatetime(const DatetimeValue&
     return data;
 }
 
-std::expected<std::optional<std::int64_t>, Error> decodeIntervalYearMonth(std::span<const std::byte> raw,
-                                                                             std::uint32_t encodedLength) {
-    unsigned totalDigits = (encodedLength >> 8) & 0xFF;
-    unsigned qualifierByte = encodedLength & 0xFF;
-    unsigned start = (qualifierByte >> 4) & 0xF;
-    unsigned end = qualifierByte & 0xF;
+namespace {
 
-    if (start > end || end > 2) {
-        return std::unexpected(Error{ErrorKind::Protocol, "INTERVAL: not a YEAR-MONTH class qualifier"});
-    }
-    unsigned leadingWidth = totalDigits - (end - start);
-    if (leadingWidth < 1 || leadingWidth > 9) {
-        return std::unexpected(Error{ErrorKind::Protocol, "INTERVAL: malformed qualifier byte"});
-    }
+// Un-normalizes an INTERVAL's packed digits back to a plain, zero-padded
+// `2*expectedMantissa`-char digit string, and returns the sign - the
+// un-normalization machinery shared by both interval classes (see
+// decodeIntervalYearMonth's doc comment in sqli/types.h for the
+// live-capture-derived reasoning: INTERVAL reuses DECIMAL's floating
+// representation, not DATETIME's fixed-point one, so leading zero-pairs
+// may have been stripped and need restoring before the digit string means
+// what the qualifier says it should).
+//
+// Deliberately does NOT trim the result down to the qualifier's actual
+// digit count - unlike YEAR-MONTH's single leading field, DAY-FRACTION has
+// *two* independently-padded regions (the leading field's own front pad
+// when its width is odd, and FRACTION's own back pad when its digit count
+// is odd - see decodeIntervalDayFraction's doc comment), so a single
+// blanket trim on the whole string is wrong. Callers own trimming each
+// field's own raw slice instead.
+struct IntervalDigits {
+    int sign;
+    std::string digits; // 2*expectedMantissa chars, caller trims per field
+};
 
-    std::size_t expectedMantissa = (totalDigits + (end & 1) + 1) / 2;
+std::expected<std::optional<IntervalDigits>, Error> decodeIntervalDigits(std::span<const std::byte> raw,
+                                                                            unsigned totalDigits, unsigned end,
+                                                                            std::size_t expectedMantissa) {
     if (raw.size() != 1 + expectedMantissa) {
         return std::unexpected(Error{ErrorKind::Protocol, "INTERVAL: buffer size doesn't match qualifier"});
     }
@@ -542,14 +552,6 @@ std::expected<std::optional<std::int64_t>, Error> decodeIntervalYearMonth(std::s
     if (!*digitsR) return std::nullopt;
     const auto& digits = **digitsR;
 
-    // Un-normalize: unlike DATETIME, INTERVAL reuses DECIMAL's *floating*
-    // representation - leading zero digit-pairs may have been stripped
-    // (exponent shrinking to match) and the freed slots backfilled with
-    // trailing zero-pairs. unnormalizedExp is what the exponent would be
-    // with nothing stripped (see this function's doc comment in
-    // sqli/types.h for the live capture that confirmed this); the
-    // difference from the actual exponent is how many zero-pairs to
-    // restore at the front before truncating back to the fixed width.
     int unnormalizedExp = (static_cast<int>(totalDigits) + 10 - static_cast<int>(end) + 1) / 2;
     int shift = unnormalizedExp - trueExp;
     if (shift < 0) {
@@ -565,32 +567,131 @@ std::expected<std::optional<std::int64_t>, Error> decodeIntervalYearMonth(std::s
         digitStr += static_cast<char>('0' + d / 10);
         digitStr += static_cast<char>('0' + d % 10);
     }
-    // When totalDigits is odd, expectedMantissa's 2 digits/pair rounds up
-    // one slot too many - drop it from the front (most significant), not
-    // the back: confirmed live via `INTERVAL MONTH(3) TO MONTH` holding
-    // 43 (totalDigits=3, 2 mantissa bytes -> 4 raw digit slots), where the
-    // correct 3-digit field value is "043", not "004".
-    digitStr = digitStr.substr(digitStr.size() - totalDigits);
+    return IntervalDigits{sign, std::move(digitStr)};
+}
 
-    auto parseDigits = [](std::string_view s) {
-        std::int64_t v = 0;
-        for (char c : s) v = v * 10 + (c - '0');
-        return v;
-    };
+std::int64_t parseIntervalDigits(std::string_view s) {
+    std::int64_t v = 0;
+    for (char c : s) v = v * 10 + (c - '0');
+    return v;
+}
+
+// The leading field occupies the first `2*leadingPairBytes` chars of the
+// un-normalized digit string; when its declared width is odd, that raw
+// slice has one extra digit at the front (confirmed live via `INTERVAL
+// MONTH(3) TO MONTH` holding 43: raw slice "0043", correct 3-digit value
+// "043", not "004") - drop it there, not trim the whole string.
+std::string_view trimLeadingField(std::string_view rawSlice, unsigned leadingWidth) {
+    return rawSlice.substr(rawSlice.size() - leadingWidth);
+}
+
+} // namespace
+
+std::expected<std::optional<std::int64_t>, Error> decodeIntervalYearMonth(std::span<const std::byte> raw,
+                                                                             std::uint32_t encodedLength) {
+    unsigned totalDigits = (encodedLength >> 8) & 0xFF;
+    unsigned qualifierByte = encodedLength & 0xFF;
+    unsigned start = (qualifierByte >> 4) & 0xF;
+    unsigned end = qualifierByte & 0xF;
+
+    if (start > end || end > 2) {
+        return std::unexpected(Error{ErrorKind::Protocol, "INTERVAL: not a YEAR-MONTH class qualifier"});
+    }
+    unsigned leadingWidth = totalDigits - (end - start);
+    if (leadingWidth < 1 || leadingWidth > 9) {
+        return std::unexpected(Error{ErrorKind::Protocol, "INTERVAL: malformed qualifier byte"});
+    }
+    // MONTH is a plain trailing field (like DAY-FRACTION's HOUR/MINUTE/
+    // SECOND) only when it's not itself the leading field.
+    unsigned leadingPairBytes = (leadingWidth + 1) / 2;
+    bool hasMonthField = (end == 2 && start != 2);
+    std::size_t expectedMantissa = leadingPairBytes + (hasMonthField ? 1 : 0);
+
+    auto digitsR = decodeIntervalDigits(raw, totalDigits, end, expectedMantissa);
+    if (!digitsR) return std::unexpected(digitsR.error());
+    if (!*digitsR) return std::nullopt;
+    const auto& [sign, digitStr] = **digitsR;
+
+    std::string_view leadingRaw(digitStr.data(), 2 * leadingPairBytes);
+    std::string_view leadingStr = trimLeadingField(leadingRaw, leadingWidth);
 
     std::int64_t months;
     if (start == 2) {
         // MONTH TO MONTH: a single field that's already a total-months
         // value, not years - the decompiled reference's separate branch
         // for this case (no years/12 split).
-        months = parseDigits(digitStr);
+        months = parseIntervalDigits(leadingStr);
     } else {
-        std::int64_t years = parseDigits(std::string_view(digitStr).substr(0, leadingWidth));
-        months = years * 12;
-        if (end == 2) months += parseDigits(std::string_view(digitStr).substr(leadingWidth, 2));
+        months = parseIntervalDigits(leadingStr) * 12;
+        if (hasMonthField) {
+            months += parseIntervalDigits(std::string_view(digitStr).substr(2 * leadingPairBytes, 2));
+        }
     }
     if (sign < 0) months = -months;
     return months;
+}
+
+std::expected<std::optional<IntervalDayFractionValue>, Error> decodeIntervalDayFraction(
+    std::span<const std::byte> raw, std::uint32_t encodedLength) {
+    unsigned totalDigits = (encodedLength >> 8) & 0xFF;
+    unsigned qualifierByte = encodedLength & 0xFF;
+    unsigned start = (qualifierByte >> 4) & 0xF;
+    unsigned end = qualifierByte & 0xF;
+
+    if (start < 4 || start > 10 || start % 2 != 0 || end < start || end > 15) {
+        return std::unexpected(Error{ErrorKind::Protocol, "INTERVAL: not a DAY-FRACTION class qualifier"});
+    }
+    unsigned wholeEnd = std::min(end, 10u);
+    unsigned fractionDigits = end > 10 ? end - 10 : 0;
+    unsigned leadingWidth = totalDigits - (wholeEnd - start) - fractionDigits;
+    if (leadingWidth < 1 || leadingWidth > 9) {
+        return std::unexpected(Error{ErrorKind::Protocol, "INTERVAL: malformed qualifier byte"});
+    }
+    unsigned leadingPairBytes = (leadingWidth + 1) / 2;
+    unsigned wholeFieldCount = (wholeEnd - start) / 2;
+    unsigned fractionPairBytes = (fractionDigits + 1) / 2;
+    std::size_t expectedMantissa = leadingPairBytes + wholeFieldCount + fractionPairBytes;
+
+    auto digitsR = decodeIntervalDigits(raw, totalDigits, end, expectedMantissa);
+    if (!digitsR) return std::unexpected(digitsR.error());
+    if (!*digitsR) return std::nullopt;
+    const auto& [sign, digitStr] = **digitsR;
+
+    IntervalDayFractionValue result;
+    std::string_view leadingRaw(digitStr.data(), 2 * leadingPairBytes);
+    std::int64_t leadingValue = parseIntervalDigits(trimLeadingField(leadingRaw, leadingWidth));
+    switch (start) {
+        case 4: result.day = leadingValue; break;
+        case 6: result.hour = leadingValue; break;
+        case 8: result.minute = leadingValue; break;
+        case 10: result.second = leadingValue; break;
+    }
+    // Every whole field after the leading one is a plain 2-digit 0-99
+    // value (HOUR 0-23, MINUTE/SECOND 0-59) - never wide like the leading
+    // field can be, so no leading-field-style trimming applies here.
+    std::size_t pos = 2 * leadingPairBytes;
+    for (unsigned tu = start + 2; tu <= wholeEnd; tu += 2) {
+        std::int64_t value = parseIntervalDigits(std::string_view(digitStr).substr(pos, 2));
+        pos += 2;
+        switch (tu) {
+            case 6: result.hour = value; break;
+            case 8: result.minute = value; break;
+            case 10: result.second = value; break;
+        }
+    }
+    if (fractionDigits > 0) {
+        // FRACTION's raw slice is `2*fractionPairBytes` chars; when
+        // fractionDigits is odd, the *last* char of that slice is padding
+        // (matching decodeDatetime's own FRACTION convention exactly -
+        // this is a coincidence of two unrelated mechanisms landing on the
+        // same padding side, not shared code: DATETIME never needs
+        // un-normalizing in the first place).
+        std::string_view fracRaw = std::string_view(digitStr).substr(pos, 2 * fractionPairBytes);
+        result.fraction = static_cast<int>(parseIntervalDigits(fracRaw.substr(0, fractionDigits)));
+        result.fractionDigits = static_cast<int>(fractionDigits);
+    }
+    result.negative = sign < 0;
+    return result;
 }
 
 } // namespace ifxsqli

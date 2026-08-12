@@ -59,6 +59,27 @@ std::string formatIntervalYearMonth(std::int64_t months) {
     return buf;
 }
 
+// Same convention as formatIntervalYearMonth: matches Informix's own
+// display, not ISO 8601. `hasDayField` (the qualifier's start code <=
+// DAY) decides whether a leading "day " shows at all - a HOUR-anchored
+// interval's `day` field is always 0 (not "not in the qualifier"), so
+// this can't be inferred from the value alone.
+std::string formatIntervalDayFraction(const ifxsqli::IntervalDayFractionValue& iv, bool hasDayField) {
+    char buf[64];
+    int len = hasDayField
+                  ? std::snprintf(buf, sizeof(buf), "%s%lld %02lld:%02lld:%02lld", iv.negative ? "-" : "",
+                                   static_cast<long long>(iv.day), static_cast<long long>(iv.hour),
+                                   static_cast<long long>(iv.minute), static_cast<long long>(iv.second))
+                  : std::snprintf(buf, sizeof(buf), "%s%lld:%02lld:%02lld", iv.negative ? "-" : "",
+                                   static_cast<long long>(iv.hour), static_cast<long long>(iv.minute),
+                                   static_cast<long long>(iv.second));
+    if (iv.fractionDigits > 0 && len > 0 && static_cast<std::size_t>(len) < sizeof(buf)) {
+        std::snprintf(buf + len, sizeof(buf) - static_cast<std::size_t>(len), ".%0*d", iv.fractionDigits,
+                      iv.fraction);
+    }
+    return buf;
+}
+
 } // namespace
 
 std::expected<CellText, ifxsqli::Error> formatCellAsText(const ifxsqli::ColumnDesc& col,
@@ -137,12 +158,17 @@ std::expected<CellText, ifxsqli::Error> formatCellAsText(const ifxsqli::ColumnDe
             return CellText{false, formatFloat(**v)};
         }
         case ifxtype::kInterval: {
-            // decodeIntervalYearMonth itself rejects DAY-FRACTION-class
-            // qualifiers (not yet supported) with a clean protocol error.
-            auto v = decodeIntervalYearMonth(raw, col.encodedLength);
+            unsigned startCode = (col.encodedLength >> 4) & 0xF;
+            if (startCode <= 2) {
+                auto v = decodeIntervalYearMonth(raw, col.encodedLength);
+                if (!v) return std::unexpected(v.error());
+                if (!*v) return CellText{true, {}};
+                return CellText{false, formatIntervalYearMonth(**v)};
+            }
+            auto v = decodeIntervalDayFraction(raw, col.encodedLength);
             if (!v) return std::unexpected(v.error());
             if (!*v) return CellText{true, {}};
-            return CellText{false, formatIntervalYearMonth(**v)};
+            return CellText{false, formatIntervalDayFraction(**v, /*hasDayField=*/startCode == 4)};
         }
         default:
             return std::unexpected(

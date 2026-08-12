@@ -662,11 +662,11 @@ floating decimal point:
 **INTERVAL(qualifier)** — shares DECIMAL's exact packed base-100-digit-pair
 byte format (same exponent-byte-plus-mantissa shape, same hundred's-complement
 negative encoding) but is a genuinely different codec from DATETIME's, not a
-variant of it, confirmed on the fetch side so far for the YEAR-MONTH class
-only (`sqli::decodeIntervalYearMonth`; DAY-FRACTION, e.g. `DAY TO SECOND`,
-isn't implemented yet). `extendedId=0` in DESCRIBE - a plain scalar like
-DECIMAL/DATETIME, not extended like BOOLEAN. Wire type code `14`, shared by
-both interval classes (matches the decompiled JDBC driver's
+variant of it, confirmed on the fetch side for both interval classes
+(`sqli::decodeIntervalYearMonth`/`decodeIntervalDayFraction`; bind encoding
+isn't implemented yet for either). `extendedId=0` in DESCRIBE - a plain
+scalar like DECIMAL/DATETIME, not extended like BOOLEAN. Wire type code
+`14`, shared by both interval classes (matches the decompiled JDBC driver's
 `IfxIntervalYM`/`IfxIntervalDF`, which both set ifxType 14 - which class a
 given column is comes from the qualifier's start/end codes, not the type
 code).
@@ -723,9 +723,52 @@ code).
   `driver/convert.cpp` too (`SQL_C_CHAR` text fetch, e.g. "3-07" - matching
   Informix's own `dbaccess` display, not ISO 8601), checked directly
   against the same captured bytes without a live connection (see
-  `docs/protocol-notes.md`'s Windows ODBC DM note above for why). DAY-
-  FRACTION class, bind encoding, and catalog rows (`SQLColumns`/
-  `SQLGetTypeInfo`) are all still open.
+  `docs/protocol-notes.md`'s Windows ODBC DM note above for why).
+
+**INTERVAL DAY-FRACTION class** (`sqli::decodeIntervalDayFraction`, qualifier
+start/end both in `{DAY, HOUR, MINUTE, SECOND, FRACTION(1..5)}`, e.g.
+`DAY TO SECOND`, `HOUR TO FRACTION(3)`) shares YEAR-MONTH's un-normalization
+machinery exactly (same DECIMAL-style floating representation, same
+`unnormalizedExp` formula, confirmed to hold unchanged with `end` now a
+FRACTION code up to 15) - but layering DATETIME-style FRACTION digits *on
+top of* a floating-point leading field surfaced a mistake the YEAR-MONTH
+slice's tests didn't catch:
+- **Padding is per-field, not a single global correction on the whole
+  digit string.** The first implementation reused YEAR-MONTH's "drop the
+  front padding digit when totalDigits is odd" fix as a blanket rule and
+  it corrupted the leading field: `INTERVAL DAY(2) TO FRACTION(5)` holding
+  `12 03:04:05.67890` (totalDigits=13, odd) decoded as day=20, hour=30 (an
+  impossible hour) instead of day=12, hour=3. The actual live bytes (`c4
+  0c 03 04 05 43 59 00`) needed **no** un-normalization at all (leading
+  DAY=12 already fills its 2-digit width, `shift=0`) - the "extra" digit
+  came entirely from FRACTION(5)'s own odd digit count, padded at the
+  *end of the FRACTION sub-region specifically* (matching
+  `decodeDatetime`'s FRACTION convention, confirmed independently there),
+  not at the front of the whole mantissa. Truncating from the front
+  dropped a real digit of DAY instead of the padding digit of FRACTION.
+- The fix: compute each field's own raw byte span independently -
+  `ceil(leadingWidth/2)` bytes for the leading field (trim its *own* front
+  padding digit if `leadingWidth` is odd), one byte per subsequent whole
+  field (HOUR/MINUTE/SECOND, always exactly 2 real digits, no padding
+  possible), then `ceil(fractionDigits/2)` bytes for FRACTION (trim its
+  *own* trailing padding digit if `fractionDigits` is odd). Never trim the
+  concatenation of all of them as one string. This also fixes a latent
+  undercount in the mantissa-byte-count formula itself
+  (`sqli/statement.cpp`'s `splitRow` and the shared `decodeIntervalDigits`
+  helper both moved to this per-field sum): the old
+  `ceil(totalDigits/2)`-based formula can undercount by 1 when the leading
+  field and FRACTION are *independently* odd-width but their oddness
+  happens to cancel out in the combined `totalDigits` parity (e.g. `DAY(1)
+  TO FRACTION(3)`, reasoned but not independently live-tested).
+- Confirmed live across four captures covering both signs, DAY- and
+  HOUR-anchored leading fields, even and odd leading widths, with and
+  without un-normalization stripping, and with and without FRACTION -
+  see `tests/sqli/test_types.cpp`'s `INTERVAL DAY TO FRACTION` test for
+  the exact bytes. `driver/convert.cpp`'s `SQL_C_CHAR` text surface
+  (`formatIntervalDayFraction`, e.g. "12 03:04:05.67890") confirmed the
+  same way as YEAR-MONTH's, directly against the captured bytes.
+  MINUTE/SECOND-anchored leading fields, bind encoding, and catalog rows
+  (`SQLColumns`/`SQLGetTypeInfo`) are all still open.
 
 Both algorithms are implemented in `sqli/types.cpp` (`decodeDecimal`,
 `decodeDatetime`), with round-trip unit tests in `tests/sqli/test_types.cpp`
@@ -907,11 +950,9 @@ documented gaps rather than oversights.
   TUPLE/FETCH negotiate differently.
 - DATETIME FRACTION (sub-second precision) is now supported (`YEAR TO
   FRACTION(5)` confirmed live, decode and bind - see the DATETIME(qualifier)
-  section above). INTERVAL's YEAR-MONTH class is now supported on the fetch
-  side (see the INTERVAL(qualifier) section above); DAY-FRACTION class
-  (`DAY TO SECOND` and similar) remains open - it reuses the same packed
-  digits but with day/hour/minute/second/fraction field decomposition
-  instead of a single months value, entirely unverified.
+  section above). INTERVAL is now supported on the fetch side for both
+  classes, YEAR-MONTH and DAY-FRACTION (see the INTERVAL(qualifier)
+  section above); INTERVAL bind encoding remains open for both.
 - DECIMAL/DATETIME qualifiers outside what's been directly tested (precision
   other than 10, qualifiers other than YEAR TO SECOND/YEAR TO FRACTION(5))
   are handled by a general formula derived from - and consistent with - the

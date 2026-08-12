@@ -78,6 +78,26 @@ struct DatetimeValue {
     int fractionDigits = 0;
 };
 
+// A decoded INTERVAL value, DAY-FRACTION class (qualifier start in {DAY,
+// HOUR, MINUTE, SECOND}) - see decodeIntervalDayFraction. Sign is tracked
+// separately, not folded into negative field values (matching ODBC's own
+// SQL_INTERVAL_STRUCT convention: `interval_sign` is a separate flag, and
+// the numeric fields are always non-negative magnitudes).
+struct IntervalDayFractionValue {
+    bool negative = false;
+    // Exactly one of day/hour/minute/second holds the qualifier's
+    // (possibly wide, arbitrary-precision) leading field value - which one
+    // depends on the qualifier's start code. The others hold their own
+    // field's plain value (HOUR 0-23, MINUTE/SECOND 0-59) if the qualifier
+    // includes them, 0 otherwise.
+    std::int64_t day = 0;
+    std::int64_t hour = 0;
+    std::int64_t minute = 0;
+    std::int64_t second = 0;
+    int fraction = 0;       // see DatetimeValue::fraction's doc comment
+    int fractionDigits = 0; // 0 if the qualifier doesn't include FRACTION
+};
+
 // Decodes a fixed-width big-endian two's-complement integer. NULL is the
 // type's MIN_VALUE bit pattern (confirmed live: 0x8000/0x80000000/INT64_MIN).
 [[nodiscard]] std::expected<std::optional<std::int16_t>, Error> decodeSmallInt(std::span<const std::byte> raw);
@@ -361,6 +381,36 @@ struct DecimalBindEncoding {
 // branch), YEAR-anchored qualifiers combine years*12 plus any trailing
 // month field.
 [[nodiscard]] std::expected<std::optional<std::int64_t>, Error> decodeIntervalYearMonth(
+    std::span<const std::byte> raw, std::uint32_t encodedLength);
+
+// Informix INTERVAL(qualifier), DAY-FRACTION class (qualifier start and
+// end both in {DAY, HOUR, MINUTE, SECOND, FRACTION(1..5)} - e.g. `DAY TO
+// SECOND`, `HOUR TO FRACTION(3)`; YEAR-MONTH class isn't accepted here,
+// see decodeIntervalYearMonth for that). Shares decodeIntervalYearMonth's
+// un-normalization machinery (same DECIMAL-style floating representation,
+// same front-padding-slot convention for odd totalDigits) - only the
+// field layout differs: instead of a years/month split, each whole field
+// from the qualifier's start to min(end, SECOND) contributes exactly 2
+// digits (the leading field still gets its variable, qualifier-declared
+// width; every field after it is a plain 0-99 value), and if `end` is a
+// FRACTION code, the remaining digits continue immediately after SECOND
+// exactly the way decodeDatetime's FRACTION support works (including the
+// same odd-digit-count trailing zero-pad convention - this is a genuine
+// coincidence of two different un-normalization schemes, not the same
+// code path: DATETIME's FRACTION never needs un-normalizing in the first
+// place, since DATETIME has no floating representation to begin with).
+//
+// Confirmed live via `INTERVAL DAY(2) TO FRACTION(5)` holding
+// `12 03:04:05.67890` (encodedLength `0x0D4F`: totalDigits=13, start=DAY,
+// end=FRACTION(5)), a maximally diagnostic value with a distinct digit in
+// every field and no un-normalization needed (the leading DAY(2) field's
+// value, 12, already fills its 2-digit width) - bytes
+// `c4 0c 03 04 05 43 59 00`. HOUR/MINUTE/SECOND-anchored leading fields
+// (e.g. `INTERVAL HOUR(5) TO SECOND`) and values needing un-normalization
+// (a leading field with a zero high digit) aren't independently
+// live-tested for this class specifically, only reasoned to follow
+// decodeIntervalYearMonth's already-confirmed mechanism.
+[[nodiscard]] std::expected<std::optional<IntervalDayFractionValue>, Error> decodeIntervalDayFraction(
     std::span<const std::byte> raw, std::uint32_t encodedLength);
 
 } // namespace ifxsqli

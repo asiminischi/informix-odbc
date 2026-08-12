@@ -477,3 +477,92 @@ TEST_CASE("INTERVAL YEAR TO MONTH") {
     REQUIRE(null.has_value());
     CHECK(!null->has_value());
 }
+
+TEST_CASE("INTERVAL DAY TO FRACTION") {
+    // Four live wire captures (IFX_SQLI_TRACE) via ifx_probe, covering both
+    // signs, DAY- and HOUR-anchored leading fields, even and odd leading
+    // widths, with and without un-normalization stripping, and with/
+    // without FRACTION.
+
+    // INTERVAL DAY(2) TO FRACTION(5) holding 12 03:04:05.67890: a
+    // maximally diagnostic value (distinct digit in every field), leading
+    // field DAY=12 already fills its 2-digit width so no stripping
+    // occurs. This is also the case that caught the real bug: a first
+    // implementation applied YEAR-MONTH's whole-string "drop the front
+    // padding digit" fix globally and corrupted the leading DAY field
+    // (produced day=20, hour=30 - an invalid hour) instead of realizing
+    // FRACTION's own trailing pad is independent of the leading field's
+    // front pad.
+    {
+        constexpr std::uint32_t kEncLen = (13u << 8) | 0x4F; // totalDigits=13, DAY(4) to FRACTION(15=F5)
+        auto v = decodeIntervalDayFraction(fromHex("c4 0c 03 04 05 43 59 00"), kEncLen);
+        REQUIRE(v.has_value());
+        REQUIRE(v->has_value());
+        CHECK(!(*v)->negative);
+        CHECK((*v)->day == 12);
+        CHECK((*v)->hour == 3);
+        CHECK((*v)->minute == 4);
+        CHECK((*v)->second == 5);
+        CHECK((*v)->fraction == 67890);
+        CHECK((*v)->fractionDigits == 5);
+    }
+    // INTERVAL DAY(4) TO FRACTION(3) holding -12 03:04:05.678: negative
+    // (hundred's complement, same mechanism DECIMAL/YEAR-MONTH use), and
+    // the leading DAY(4) field's value (12) is small enough that
+    // un-normalization stripping occurs (shift=1) - combined here with
+    // subsequent whole fields and FRACTION in the same value, a
+    // combination the earlier isolated YEAR-MONTH stripping tests didn't
+    // exercise.
+    {
+        constexpr std::uint32_t kEncLen = (13u << 8) | 0x4D; // totalDigits=13, DAY(4) to FRACTION(13=F3)
+        auto v = decodeIntervalDayFraction(fromHex("3b 57 60 5f 5e 20 14 00"), kEncLen);
+        REQUIRE(v.has_value());
+        REQUIRE(v->has_value());
+        CHECK((*v)->negative);
+        CHECK((*v)->day == 12);
+        CHECK((*v)->hour == 3);
+        CHECK((*v)->minute == 4);
+        CHECK((*v)->second == 5);
+        CHECK((*v)->fraction == 678);
+        CHECK((*v)->fractionDigits == 3);
+    }
+    // Same qualifier, positive, day=5 (even smaller leading value, same
+    // stripping mechanism).
+    {
+        constexpr std::uint32_t kEncLen = (13u << 8) | 0x4D;
+        auto v = decodeIntervalDayFraction(fromHex("c4 05 03 04 05 43 50 00"), kEncLen);
+        REQUIRE(v.has_value());
+        REQUIRE(v->has_value());
+        CHECK(!(*v)->negative);
+        CHECK((*v)->day == 5);
+        CHECK((*v)->hour == 3);
+        CHECK((*v)->minute == 4);
+        CHECK((*v)->second == 5);
+        CHECK((*v)->fraction == 678);
+    }
+    // INTERVAL HOUR(3) TO SECOND holding 123:04:05: HOUR (not DAY) is the
+    // leading field here, with an odd leading width (3) that isn't
+    // stripped (123 fills close to its full 3-digit range) - exercises
+    // the front-trim-for-odd-leading-width path combined with subsequent
+    // whole fields, and confirms the start-code dispatch places the
+    // leading value into `hour`, not `day`.
+    {
+        constexpr std::uint32_t kEncLen = (7u << 8) | 0x6A; // totalDigits=7, HOUR(6) to SECOND(10)
+        auto v = decodeIntervalDayFraction(fromHex("c4 01 17 04 05"), kEncLen);
+        REQUIRE(v.has_value());
+        REQUIRE(v->has_value());
+        CHECK((*v)->day == 0);
+        CHECK((*v)->hour == 123);
+        CHECK((*v)->minute == 4);
+        CHECK((*v)->second == 5);
+        CHECK((*v)->fractionDigits == 0);
+    }
+
+    auto null = decodeIntervalDayFraction(fromHex("00 00 00 00 00 00 00 00"), (13u << 8) | 0x4F);
+    REQUIRE(null.has_value());
+    CHECK(!null->has_value());
+
+    // A YEAR-MONTH-class qualifier is rejected, not silently misread.
+    auto wrongClass = decodeIntervalDayFraction(fromHex("c6 03 07 00"), (6u << 8) | 0x02);
+    CHECK(!wrongClass.has_value());
+}

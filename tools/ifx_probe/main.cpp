@@ -103,14 +103,28 @@ void printColumnValue(const ifxsqli::ColumnDesc& col, std::span<const std::byte>
             return;
         }
         case ifxtype::kInterval: {
-            auto v = decodeIntervalYearMonth(bytes, col.encodedLength);
+            unsigned startCode = (col.encodedLength >> 4) & 0xF;
+            if (startCode <= 2) {
+                auto v = decodeIntervalYearMonth(bytes, col.encodedLength);
+                if (!v) { std::printf("<error: %s>", v.error().message.c_str()); return; }
+                if (!*v) { std::printf("NULL"); return; }
+                std::int64_t months = **v;
+                bool negative = months < 0;
+                if (negative) months = -months;
+                std::printf("%s%lld-%02lld months", negative ? "-" : "", static_cast<long long>(months / 12),
+                            static_cast<long long>(months % 12));
+                return;
+            }
+            auto v = decodeIntervalDayFraction(bytes, col.encodedLength);
             if (!v) { std::printf("<error: %s>", v.error().message.c_str()); return; }
             if (!*v) { std::printf("NULL"); return; }
-            std::int64_t months = **v;
-            bool negative = months < 0;
-            if (negative) months = -months;
-            std::printf("%s%lld-%02lld months", negative ? "-" : "", static_cast<long long>(months / 12),
-                        static_cast<long long>(months % 12));
+            const auto& iv = **v;
+            std::printf("%s%lld %02lld:%02lld:%02lld", iv.negative ? "-" : "", static_cast<long long>(iv.day),
+                        static_cast<long long>(iv.hour), static_cast<long long>(iv.minute),
+                        static_cast<long long>(iv.second));
+            if (iv.fractionDigits > 0) {
+                std::printf(".%0*d", iv.fractionDigits, iv.fraction);
+            }
             return;
         }
         default:

@@ -4,6 +4,7 @@
 #include "sqli/protocol.h"
 #include "sqli/types.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 
@@ -100,10 +101,25 @@ std::expected<std::vector<std::vector<std::byte>>, Error> splitRow(std::span<con
                 width = 1 + (totalDigits + 1) / 2;
                 break;
             }
-            case ifxtype::kInterval: {  // 1 exponent byte + mantissa bytes (see decodeIntervalYearMonth)
+            case ifxtype::kInterval: {
+                // 1 exponent byte + mantissa bytes, counted per field (see
+                // decodeIntervalDayFraction's doc comment): the leading
+                // field and FRACTION each round up their own width
+                // independently, so a single ceil(totalDigits/2) can
+                // undercount by 1 when both the leading field and
+                // FRACTION are independently odd-width (their oddness
+                // could cancel out in the combined totalDigits parity).
                 unsigned totalDigits = (col.encodedLength >> 8) & 0xFF;
-                unsigned end = col.encodedLength & 0xF;
-                width = 1 + (totalDigits + (end & 1) + 1) / 2;
+                unsigned qualifierByte = col.encodedLength & 0xFF;
+                unsigned start = (qualifierByte >> 4) & 0xF;
+                unsigned end = qualifierByte & 0xF;
+                unsigned wholeEnd = std::min(end, 10u);
+                unsigned fractionDigits = end > 10 ? end - 10 : 0;
+                unsigned leadingWidth = totalDigits - (wholeEnd - start) - fractionDigits;
+                unsigned leadingPairBytes = (leadingWidth + 1) / 2;
+                unsigned wholeFieldCount = (wholeEnd - start) / 2;
+                unsigned fractionPairBytes = (fractionDigits + 1) / 2;
+                width = 1 + leadingPairBytes + wholeFieldCount + fractionPairBytes;
                 break;
             }
             default:
