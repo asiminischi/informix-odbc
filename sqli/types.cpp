@@ -146,6 +146,15 @@ std::expected<std::optional<bool>, Error> decodeBoolean(std::span<const std::byt
     return raw[5] != std::byte{0};
 }
 
+std::vector<std::byte> encodeBoolean(bool v) {
+    auto lengthBytes = writeBigEndian<std::int32_t>(1);
+    std::vector<std::byte> out;
+    out.reserve(5);
+    out.insert(out.end(), lengthBytes.begin(), lengthBytes.end());
+    out.push_back(v ? std::byte{1} : std::byte{0});
+    return out;
+}
+
 // Confirmed live: DATE's day count is relative to 1899-12-31, which is
 // 25568 days before the Unix epoch (1970-01-01).
 constexpr std::int32_t kIfxEpochToUnixEpochDays = 25568;

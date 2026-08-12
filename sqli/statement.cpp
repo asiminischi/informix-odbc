@@ -139,6 +139,14 @@ void writeBindBlock(ByteWriter& w, const std::vector<BindParam>& params) {
     w.u16(static_cast<std::uint16_t>(params.size()));
     for (const auto& p : params) {
         w.u16(static_cast<std::uint16_t>(p.ifxType));
+        // Extended-type owner/name (confirmed live for BOOLEAN, hangs the
+        // connection if omitted) - written unconditionally whenever
+        // present, even for a NULL bind, matching the decompiled
+        // sendBind's ordering (owner/name before the null check).
+        if (p.extendedOwnerName && p.extendedTypeName) {
+            w.ifxChar2(*p.extendedOwnerName);
+            w.ifxChar2(*p.extendedTypeName);
+        }
         if (p.isNull) {
             w.u16(static_cast<std::uint16_t>(-1));
             w.u16(0);

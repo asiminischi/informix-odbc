@@ -44,6 +44,12 @@ inline constexpr int kBigSerial = 53;
 // extended-column encoding (SqliStatement::fetchNextBatch) rather than just
 // a plain scalar entry.
 inline constexpr int kBoolean = 41;
+// The *remapped* extended-type code SQ_RETURN_TYPE and SQ_BIND expect for a
+// BOOLEAN column/parameter (matches the decompiled JDBC driver's own
+// ifxType for IfxBoolean) - confirmed live for SQ_RETURN_TYPE; distinct
+// from kBoolean (41), the plain DESCRIBE/TUPLE base type code. Use this,
+// not kBoolean, when building a BindParam for a BOOLEAN "?" parameter.
+inline constexpr int kBooleanBindType = 45;
 } // namespace ifxtype
 
 // A decoded calendar DATETIME value. Only whole-second qualifiers (some
@@ -156,6 +162,21 @@ inline constexpr std::uint16_t kBigIntBindPrecision = 0x1300;
 // `raw` must be the whole 5- or 6-byte slice (splitRow determines which by
 // peeking byte 0, same as this function does).
 [[nodiscard]] std::expected<std::optional<bool>, Error> decodeBoolean(std::span<const std::byte> raw);
+
+// SQ_BIND encoding for a non-NULL BOOLEAN value: a 4-byte big-endian length
+// prefix (always 1, the payload's own byte count) followed by the 1-byte
+// value (0=false, 1=true) - the decompiled IfxBoolean.toIfx() ->
+// IfxBaseType.toIfx()'s shape (distinct from decodeBoolean's TUPLE-format
+// 5/6-byte shape, which additionally has its own leading null-flag byte
+// that SQ_BIND signals via the indicator field instead - see BindParam's
+// doc comment). Use with ifxtype::kBooleanBindType (45, not kBoolean) and
+// set extendedOwnerName="informix"/extendedTypeName="boolean" on the
+// BindParam (confirmed live via DESCRIBE - see ColumnDesc::extendedOwnerName).
+// precisionField is an unconfirmed hypothesis (1, mirroring the payload
+// byte count) - IfxBoolean doesn't override getEncodedLength() the way the
+// hardcoded-constant integer types do, so there's no traced reference value.
+[[nodiscard]] std::vector<std::byte> encodeBoolean(bool v);
+inline constexpr std::uint16_t kBooleanBindPrecision = 1;
 
 // 4-byte big-endian signed day count from epoch 1899-12-31 (confirmed
 // live). NULL is INT32_MIN, same sentinel as INTEGER. Returns the day count

@@ -33,11 +33,24 @@ struct ColumnDesc {
 // just serializes whatever it's given. `data` is empty and unused when
 // `isNull` (SQ_BIND signals NULL via the indicator field alone - see
 // encodeInteger's doc comment in sqli/types.h).
+//
+// extendedOwnerName/extendedTypeName: only needed for extended/opaque types
+// (BOOLEAN and friends) - confirmed live that omitting them for a BOOLEAN
+// bind hangs the connection (the server waits for bytes that never come,
+// the same "still-missing request field" failure mode documented in
+// docs/protocol-notes.md). When set, SqliStatement::execute writes them as
+// two ifxChar2 fields right after the type code, before the indicator -
+// see the decompiled IfxSqli.sendBind's `isUSVER()`-gated branch. `ifxType`
+// for an extended-type bind is the *remapped* code (e.g. 45 for BOOLEAN,
+// matching what SQ_RETURN_TYPE needs - see ifxtype::kBooleanBindType),
+// not the plain DESCRIBE/TUPLE base type code.
 struct BindParam {
     int ifxType = 0;
     bool isNull = false;
     std::vector<std::byte> data;
     std::uint16_t precisionField = 0;
+    std::optional<std::string> extendedOwnerName;
+    std::optional<std::string> extendedTypeName;
 };
 
 // One prepared statement's cursor lifecycle: prepare -> execute (opens a

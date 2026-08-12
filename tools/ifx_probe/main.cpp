@@ -162,8 +162,9 @@ int main(int argc, char** argv) {
 
         std::printf("columns:\n");
         for (const auto& col : stmt->columns()) {
-            std::printf("  %-20s type=%d%s encodedLength=%u\n", col.name.c_str(), col.ifxType,
-                        col.notNull ? " NOT NULL" : "", col.encodedLength);
+            std::printf("  %-20s type=%d%s encodedLength=%u extendedId=%u owner=\"%s\" name=\"%s\"\n",
+                        col.name.c_str(), col.ifxType, col.notNull ? " NOT NULL" : "", col.encodedLength,
+                        col.extendedId, col.extendedOwnerName.c_str(), col.extendedTypeName.c_str());
         }
 
         if (auto r = stmt->execute(); !r) {

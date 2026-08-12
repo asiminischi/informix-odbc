@@ -112,16 +112,22 @@ void check(const char* label, bool condition) {
     }
     auto insertStmt = SqliStatement::prepare(
         *conn, "insert into bind_probe (col_smallint, col_integer, col_bigint, col_date, col_decimal,"
-               " col_datetime, col_float, col_smallfloat) values (?, ?, ?, ?, ?, ?, ?, ?)");
+               " col_datetime, col_float, col_smallfloat, col_boolean) values (?, ?, ?, ?, ?, ?, ?, ?, ?)");
     if (!insertStmt) {
         std::fprintf(stderr, "prepare insert failed: %s\n", insertStmt.error().message.c_str());
         return false;
     }
+    // BOOLEAN's NULL bind still needs the extended owner/name fields
+    // (confirmed live that omitting them hangs the connection, same as a
+    // non-NULL BOOLEAN bind - see BindParam's doc comment and
+    // driver/statement.cpp's buildBindParams NULL branch, which has the
+    // same special case for the ODBC-surface path).
     std::vector<BindParam> params2{
         BindParam{ifxtype::kSmallInt, true, {}, 0}, BindParam{ifxtype::kInteger, true, {}, 0},
         BindParam{ifxtype::kBigInt, true, {}, 0},   BindParam{ifxtype::kDate, true, {}, 0},
         BindParam{ifxtype::kDecimal, true, {}, 0},  BindParam{ifxtype::kDatetime, true, {}, 0},
-        BindParam{ifxtype::kFloat, true, {}, 0},    BindParam{ifxtype::kSmallFloat, true, {}, 0}};
+        BindParam{ifxtype::kFloat, true, {}, 0},    BindParam{ifxtype::kSmallFloat, true, {}, 0},
+        BindParam{ifxtype::kBooleanBindType, true, {}, 0, std::string("informix"), std::string("boolean")}};
     if (auto r = insertStmt->execute(params2); !r) {
         std::fprintf(stderr, "execute insert failed: %s\n", r.error().message.c_str());
         return false;
@@ -131,7 +137,7 @@ void check(const char* label, bool condition) {
 
     auto selectStmt = SqliStatement::prepare(
         *conn, "select col_smallint, col_integer, col_bigint, col_date, col_decimal, col_datetime,"
-               " col_float, col_smallfloat"
+               " col_float, col_smallfloat, col_boolean"
                " from bind_probe where col_char is null and col_varchar is null");
     if (!selectStmt) {
         std::fprintf(stderr, "prepare select failed: %s\n", selectStmt.error().message.c_str());
@@ -154,6 +160,7 @@ void check(const char* label, bool condition) {
     auto datetimeVal = decodeDatetime((**row)[5], (14u << 8) | 0x0A);
     auto floatVal = decodeFloat((**row)[6]);
     auto smallfloatVal = decodeSmallFloat((**row)[7]);
+    auto booleanVal = decodeBoolean((**row)[8]);
     if (auto r = selectStmt->close(); !r) return false;
     if (auto r = selectStmt->release(); !r) return false;
     if (auto r = conn->executeCommand("delete from bind_probe where col_char is null and col_varchar is null");
@@ -161,7 +168,7 @@ void check(const char* label, bool condition) {
         return false;
     if (auto r = conn->disconnectOrderly(); !r) return false;
     if (!smallintVal || !integerVal || !bigintVal || !dateVal || !decimalVal || !datetimeVal || !floatVal ||
-        !smallfloatVal) {
+        !smallfloatVal || !booleanVal) {
         std::fprintf(stderr, "decode failed\n");
         return false;
     }
@@ -173,6 +180,7 @@ void check(const char* label, bool condition) {
     check("NULL bound with real ifxType round-trips (DATETIME)", !datetimeVal->has_value());
     check("NULL bound with real ifxType round-trips (FLOAT)", !floatVal->has_value());
     check("NULL bound with real ifxType round-trips (SMALLFLOAT)", !smallfloatVal->has_value());
+    check("NULL bound with real ifxType round-trips (BOOLEAN)", !booleanVal->has_value());
     return true;
 }
 
@@ -189,7 +197,8 @@ void check(const char* label, bool condition) {
     if (auto r = setup->executeCommand(
             "create table bind_probe (col_smallint smallint, col_integer integer, col_bigint bigint,"
             " col_char char(20), col_varchar varchar(32), col_date date, col_decimal decimal(10,2),"
-            " col_datetime datetime year to second, col_float float, col_smallfloat smallfloat)");
+            " col_datetime datetime year to second, col_float float, col_smallfloat smallfloat,"
+            " col_boolean boolean)");
         !r) {
         std::fprintf(stderr, "create table failed: %s\n", r.error().message.c_str());
         return false;
@@ -205,7 +214,7 @@ void check(const char* label, bool condition) {
         return false;
     }
 
-    auto insertStmt = SqliStatement::prepare(*conn, "insert into bind_probe values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    auto insertStmt = SqliStatement::prepare(*conn, "insert into bind_probe values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
     if (!insertStmt) {
         std::fprintf(stderr, "prepare insert failed: %s\n", insertStmt.error().message.c_str());
         return false;
@@ -245,6 +254,8 @@ void check(const char* label, bool condition) {
                                  static_cast<std::uint16_t>(kYearToSecond)});
     params2.push_back(BindParam{ifxtype::kFloat, false, encodeFloat(3.14159), kFloatBindPrecision});
     params2.push_back(BindParam{ifxtype::kSmallFloat, false, encodeSmallFloat(2.5f), kSmallFloatBindPrecision});
+    params2.push_back(BindParam{ifxtype::kBooleanBindType, false, encodeBoolean(true), kBooleanBindPrecision,
+                                 std::string("informix"), std::string("boolean")});
     if (auto r = insertStmt->execute(params2); !r) {
         std::fprintf(stderr, "execute insert failed: %s\n", r.error().message.c_str());
         return false;
@@ -254,7 +265,8 @@ void check(const char* label, bool condition) {
 
     auto selectStmt = SqliStatement::prepare(*conn,
                                               "select col_smallint, col_integer, col_bigint, col_char, col_varchar,"
-                                              " col_date, col_decimal, col_datetime, col_float, col_smallfloat"
+                                              " col_date, col_decimal, col_datetime, col_float, col_smallfloat,"
+                                              " col_boolean"
                                               " from bind_probe");
     if (!selectStmt) {
         std::fprintf(stderr, "prepare select failed: %s\n", selectStmt.error().message.c_str());
@@ -284,8 +296,9 @@ void check(const char* label, bool condition) {
     auto datetimeVal = decodeDatetime((**row)[7], kYearToSecond);
     auto floatVal = decodeFloat((**row)[8]);
     auto smallfloatVal = decodeSmallFloat((**row)[9]);
+    auto booleanVal = decodeBoolean((**row)[10]);
     if (!smallintVal || !integerVal || !bigintVal || !charVal || !varcharVal || !dateVal || !decimalVal ||
-        !datetimeVal || !floatVal || !smallfloatVal) {
+        !datetimeVal || !floatVal || !smallfloatVal || !booleanVal) {
         std::fprintf(stderr, "decode failed\n");
         return false;
     }
@@ -306,6 +319,7 @@ void check(const char* label, bool condition) {
                                              (*datetimeVal)->second == 56);
     check("bound FLOAT round-trips", floatVal->has_value() && **floatVal == 3.14159);
     check("bound SMALLFLOAT round-trips", smallfloatVal->has_value() && **smallfloatVal == 2.5f);
+    check("bound BOOLEAN round-trips", booleanVal->has_value() && **booleanVal == true);
 
     if (auto r = selectStmt->close(); !r) return false;
     if (auto r = selectStmt->release(); !r) return false;
