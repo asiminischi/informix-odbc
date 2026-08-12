@@ -211,10 +211,16 @@ Roughly in the order they'd bite a real application:
      unverified-but-reference-consistent until an ODBC-surface
      (`SQLBindParameter`) test harness exists to exercise it end-to-end.
 
-   This is still just the 8-type MVP set, not the full type system BOP's
-   Informix plugin eventually needs (LOB, FLOAT/SMALLFLOAT, BOOLEAN,
-   INTERVAL, sub-second DATETIME all remain unimplemented on both the
-   bind and fetch sides).
+   This is still mostly just the 8-type MVP set, not the full type system
+   BOP's Informix plugin eventually needs (LOB, FLOAT/SMALLFLOAT, INTERVAL,
+   sub-second DATETIME all remain unimplemented on both the bind and fetch
+   sides). BOOLEAN's fetch side is done as of this pass - it turned out to
+   be an extended/opaque type (nonzero `extendedId` in DESCRIBE, a
+   self-describing 5/6-byte TUPLE shape) rather than a plain fixed-width
+   scalar, needing SQ_RETURN_TYPE's extended-column encoding as well as a
+   decoder; see `sqli/types.h`'s `decodeBoolean` doc comment. Its bind side
+   (`SQ_BIND`/`encodeBoolean`) and `SQLColumns`/`SQLGetTypeInfo` catalog
+   rows are not done yet.
 4. **No DSN-based connect (`SQLConnect`).** Only `SQLDriverConnect` with an
    explicit keyword string works today. Fine for `isql -k`, but many
    GUI/ODBC-Admin tools default to the DSN path.
@@ -228,9 +234,10 @@ Roughly in the order they'd bite a real application:
    Linux/WSL2 + unixODBC + `isql`.
 6. **No Unicode.** ANSI (`SQL_C_CHAR`) only; no `SQLWCHAR`/`W`-suffixed
    functions.
-7. **Missing scalar types**: FLOAT/SMALLFLOAT, BOOLEAN, INTERVAL, LOBs
-   (BLOB/CLOB/BYTE/TEXT), and DATETIME with fractional (sub-second)
-   qualifiers.
+7. **Missing scalar types**: FLOAT/SMALLFLOAT, INTERVAL, LOBs (BLOB/CLOB/
+   BYTE/TEXT), and DATETIME with fractional (sub-second) qualifiers.
+   BOOLEAN's fetch side is done; its bind side and catalog rows are not
+   (see item 3 above).
 8. **No real generated-key retrieval.** The `SQ_INSERTDONE` wire field is
    decoded, but the driver never sends the extra "SGK" request the server
    needs to actually populate it, so every INSERT currently reports a
@@ -285,11 +292,14 @@ callable from BOP's own code; catalog-completeness and driver-manager
 polish don't block that.
 
 1. **Remaining scalar types beyond the MVP-8 set - FLOAT/SMALLFLOAT/
-   BOOLEAN/INTERVAL, sub-second DATETIME, then LOBs (both bind and fetch
-   sides).** Blocking: a real Informix database backup/restore tool can't
-   skip columns of a type it doesn't support. LOBs in particular are
-   likely to need their own multi-message wire handling, not just another
-   entry in the existing scalar bind/fetch tables.
+   INTERVAL, sub-second DATETIME, then LOBs (both bind and fetch sides).
+   BOOLEAN's fetch side is done (sqli-layer decode plus ODBC-layer
+   SQL_C_CHAR surfacing); its bind side (`SQ_BIND`/`encodeBoolean`) and
+   catalog rows (`SQLColumns`/`SQLGetTypeInfo`) still need doing.**
+   Blocking: a real Informix database backup/restore tool can't skip
+   columns of a type it doesn't support. LOBs in particular are likely to
+   need their own multi-message wire handling, not just another entry in
+   the existing scalar bind/fetch tables.
 2. **Decide and prototype the BOP integration mechanism** (CGO, subprocess
    + a small IPC protocol, or something else) - deliberately left
    undecided when this project started. Nothing else here matters to BOP
