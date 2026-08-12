@@ -753,6 +753,180 @@ bool runCatalogTest(SQLHDBC dbc, const std::string& database) {
     return ok;
 }
 
+// Verifies SQLColumns (driver/catalog.cpp): DATA_TYPE/TYPE_NAME/
+// COLUMN_SIZE/DECIMAL_DIGITS/NULLABLE/IS_NULLABLE per column, derived from
+// syscolumns.coltype/collength - see that file's buildColumnsSql doc
+// comment for the packed-field decoding this relies on (confirmed live
+// separately via isql before this test existed).
+bool runColumnsTest(SQLHDBC dbc, const std::string& database) {
+    bool ok = true;
+    auto expectEq = [&ok](const char* label, bool cond) {
+        std::printf("  [%s] %s\n", cond ? "ok" : "FAIL", label);
+        if (!cond) ok = false;
+    };
+
+    ok &= execDirect(dbc, "drop table if exists columns_probe");
+    ok &= execDirect(dbc,
+                      "create table columns_probe (c_smallint smallint, c_integer integer not null,"
+                      " c_char char(20), c_decimal decimal(10,2), c_date date,"
+                      " c_datetime datetime year to second)");
+    if (!ok) {
+        std::printf("[columns] fixture setup failed, aborting columns test\n");
+        return false;
+    }
+
+    struct ColRow {
+        char name[128] = {};
+        SQLLEN nameInd = 0;
+        SQLSMALLINT dataType = 0;
+        SQLLEN dataTypeInd = 0;
+        char typeName[64] = {};
+        SQLLEN typeNameInd = 0;
+        SQLINTEGER columnSize = 0;
+        SQLLEN columnSizeInd = 0;
+        SQLSMALLINT decimalDigits = 0;
+        SQLLEN decimalDigitsInd = 0;
+        SQLSMALLINT nullable = 0;
+        SQLLEN nullableInd = 0;
+        char isNullable[8] = {};
+        SQLLEN isNullableInd = 0;
+        SQLINTEGER ordinalPosition = 0;
+        SQLLEN ordinalPositionInd = 0;
+        SQLSMALLINT sqlDataType = 0;
+        SQLLEN sqlDataTypeInd = 0;
+        SQLSMALLINT sqlDatetimeSub = 0;
+        SQLLEN sqlDatetimeSubInd = 0;
+    };
+
+    // All four columns, in declared order, checking every field this
+    // driver derives from syscolumns.
+    {
+        SQLHSTMT stmt = SQL_NULL_HSTMT;
+        SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt);
+        SQLRETURN rc = SQLColumns(stmt, nullptr, 0, nullptr, 0,
+                                   reinterpret_cast<SQLCHAR*>(const_cast<char*>("columns_probe")), SQL_NTS, nullptr, 0);
+        expectEq("SQLColumns(TableName=columns_probe) succeeds", rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) printDiag(SQL_HANDLE_STMT, stmt, "SQLColumns");
+
+        ColRow row;
+        SQLBindCol(stmt, 4, SQL_C_CHAR, row.name, sizeof(row.name), &row.nameInd);
+        SQLBindCol(stmt, 5, SQL_C_SSHORT, &row.dataType, 0, &row.dataTypeInd);
+        SQLBindCol(stmt, 6, SQL_C_CHAR, row.typeName, sizeof(row.typeName), &row.typeNameInd);
+        SQLBindCol(stmt, 7, SQL_C_SLONG, &row.columnSize, 0, &row.columnSizeInd);
+        SQLBindCol(stmt, 9, SQL_C_SSHORT, &row.decimalDigits, 0, &row.decimalDigitsInd);
+        SQLBindCol(stmt, 11, SQL_C_SSHORT, &row.nullable, 0, &row.nullableInd);
+        SQLBindCol(stmt, 17, SQL_C_SLONG, &row.ordinalPosition, 0, &row.ordinalPositionInd);
+        SQLBindCol(stmt, 18, SQL_C_CHAR, row.isNullable, sizeof(row.isNullable), &row.isNullableInd);
+        SQLBindCol(stmt, 14, SQL_C_SSHORT, &row.sqlDataType, 0, &row.sqlDataTypeInd);
+        SQLBindCol(stmt, 15, SQL_C_SSHORT, &row.sqlDatetimeSub, 0, &row.sqlDatetimeSubInd);
+
+        rc = SQLFetch(stmt);
+        if (rc != SQL_SUCCESS) printDiag(SQL_HANDLE_STMT, stmt, "columns-row1");
+        expectEq("row 1 (c_smallint) found", rc == SQL_SUCCESS);
+        expectEq("c_smallint: COLUMN_NAME", std::string("c_smallint") == row.name);
+        expectEq("c_smallint: DATA_TYPE == SQL_SMALLINT", row.dataType == SQL_SMALLINT);
+        expectEq("c_smallint: TYPE_NAME == smallint", std::string("smallint") == row.typeName);
+        expectEq("c_smallint: COLUMN_SIZE == 5", row.columnSize == 5);
+        expectEq("c_smallint: DECIMAL_DIGITS is NULL", row.decimalDigitsInd == SQL_NULL_DATA);
+        expectEq("c_smallint: NULLABLE == SQL_NULLABLE", row.nullable == SQL_NULLABLE);
+        expectEq("c_smallint: IS_NULLABLE == YES", std::string("YES") == row.isNullable);
+        expectEq("c_smallint: ORDINAL_POSITION == 1", row.ordinalPosition == 1);
+        expectEq("c_smallint: SQL_DATA_TYPE == SQL_SMALLINT", row.sqlDataType == SQL_SMALLINT);
+        expectEq("c_smallint: SQL_DATETIME_SUB is NULL", row.sqlDatetimeSubInd == SQL_NULL_DATA);
+
+        rc = SQLFetch(stmt);
+        expectEq("row 2 (c_integer) found", rc == SQL_SUCCESS);
+        expectEq("c_integer: DATA_TYPE == SQL_INTEGER", row.dataType == SQL_INTEGER);
+        expectEq("c_integer: NULLABLE == SQL_NO_NULLS", row.nullable == SQL_NO_NULLS);
+        expectEq("c_integer: IS_NULLABLE == NO", std::string("NO") == row.isNullable);
+        expectEq("c_integer: ORDINAL_POSITION == 2", row.ordinalPosition == 2);
+
+        rc = SQLFetch(stmt);
+        expectEq("row 3 (c_char) found", rc == SQL_SUCCESS);
+        expectEq("c_char: DATA_TYPE == SQL_CHAR", row.dataType == SQL_CHAR);
+        expectEq("c_char: COLUMN_SIZE == 20", row.columnSize == 20);
+
+        rc = SQLFetch(stmt);
+        expectEq("row 4 (c_decimal) found", rc == SQL_SUCCESS);
+        expectEq("c_decimal: DATA_TYPE == SQL_DECIMAL", row.dataType == SQL_DECIMAL);
+        expectEq("c_decimal: COLUMN_SIZE == 10 (precision)", row.columnSize == 10);
+        expectEq("c_decimal: DECIMAL_DIGITS == 2 (scale)",
+                  row.decimalDigitsInd != SQL_NULL_DATA && row.decimalDigits == 2);
+
+        rc = SQLFetch(stmt);
+        expectEq("row 5 (c_date) found", rc == SQL_SUCCESS);
+        expectEq("c_date: DATA_TYPE == SQL_TYPE_DATE", row.dataType == SQL_TYPE_DATE);
+        expectEq("c_date: TYPE_NAME == date", std::string("date") == row.typeName);
+        expectEq("c_date: COLUMN_SIZE == 10", row.columnSize == 10);
+        expectEq("c_date: SQL_DATA_TYPE == SQL_DATETIME", row.sqlDataType == SQL_DATETIME);
+        expectEq("c_date: SQL_DATETIME_SUB == SQL_CODE_DATE",
+                  row.sqlDatetimeSubInd != SQL_NULL_DATA && row.sqlDatetimeSub == SQL_CODE_DATE);
+
+        rc = SQLFetch(stmt);
+        expectEq("row 6 (c_datetime) found", rc == SQL_SUCCESS);
+        expectEq("c_datetime: DATA_TYPE == SQL_TYPE_TIMESTAMP", row.dataType == SQL_TYPE_TIMESTAMP);
+        expectEq("c_datetime: TYPE_NAME == datetime", std::string("datetime") == row.typeName);
+        expectEq("c_datetime: COLUMN_SIZE == 19", row.columnSize == 19);
+        expectEq("c_datetime: SQL_DATA_TYPE == SQL_DATETIME", row.sqlDataType == SQL_DATETIME);
+        expectEq("c_datetime: SQL_DATETIME_SUB == SQL_CODE_TIMESTAMP",
+                  row.sqlDatetimeSubInd != SQL_NULL_DATA && row.sqlDatetimeSub == SQL_CODE_TIMESTAMP);
+
+        rc = SQLFetch(stmt);
+        expectEq("exactly 6 columns for columns_probe", rc == SQL_NO_DATA);
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+    }
+
+    // ColumnName filter.
+    {
+        SQLHSTMT stmt = SQL_NULL_HSTMT;
+        SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt);
+        SQLRETURN rc =
+            SQLColumns(stmt, nullptr, 0, nullptr, 0,
+                       reinterpret_cast<SQLCHAR*>(const_cast<char*>("columns_probe")), SQL_NTS,
+                       reinterpret_cast<SQLCHAR*>(const_cast<char*>("c_int%")), SQL_NTS);
+        expectEq("SQLColumns(ColumnName=c_int%) succeeds", rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        char name[128] = {};
+        SQLLEN nameInd = 0;
+        SQLBindCol(stmt, 4, SQL_C_CHAR, name, sizeof(name), &nameInd);
+        rc = SQLFetch(stmt);
+        expectEq("ColumnName=c_int% finds exactly c_integer",
+                  rc == SQL_SUCCESS && nameInd != SQL_NULL_DATA && std::string("c_integer") == name);
+        rc = SQLFetch(stmt);
+        expectEq("ColumnName=c_int% finds only that one column", rc == SQL_NO_DATA);
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+    }
+
+    // TABLE_CAT/TABLE_SCHEM sanity, and a mismatched CatalogName returning
+    // zero rows, same convention as SQLTables.
+    {
+        SQLHSTMT stmt = SQL_NULL_HSTMT;
+        SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt);
+        SQLRETURN rc = SQLColumns(stmt, nullptr, 0, nullptr, 0,
+                                   reinterpret_cast<SQLCHAR*>(const_cast<char*>("columns_probe")), SQL_NTS,
+                                   reinterpret_cast<SQLCHAR*>(const_cast<char*>("c_smallint")), SQL_NTS);
+        char cat[128] = {}, schem[128] = {};
+        SQLLEN catInd = 0, schemInd = 0;
+        SQLBindCol(stmt, 1, SQL_C_CHAR, cat, sizeof(cat), &catInd);
+        SQLBindCol(stmt, 2, SQL_C_CHAR, schem, sizeof(schem), &schemInd);
+        rc = SQLFetch(stmt);
+        expectEq("TABLE_CAT == connected database", rc == SQL_SUCCESS && catInd != SQL_NULL_DATA && database == cat);
+        expectEq("TABLE_SCHEM == informix", schemInd != SQL_NULL_DATA && std::string("informix") == schem);
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+
+        SQLHSTMT stmt2 = SQL_NULL_HSTMT;
+        SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt2);
+        rc = SQLColumns(stmt2, reinterpret_cast<SQLCHAR*>(const_cast<char*>("no_such_database")), SQL_NTS, nullptr, 0,
+                         reinterpret_cast<SQLCHAR*>(const_cast<char*>("columns_probe")), SQL_NTS, nullptr, 0);
+        expectEq("SQLColumns(CatalogName=no_such_database) succeeds", rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        rc = SQLFetch(stmt2);
+        expectEq("mismatched CatalogName returns zero rows", rc == SQL_NO_DATA);
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt2);
+    }
+
+    execDirect(dbc, "drop table if exists columns_probe");
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -875,6 +1049,10 @@ int main(int argc, char** argv) {
     bool catalogOk = runCatalogTest(dbc, database);
     std::printf("catalog test: %s\n", catalogOk ? "PASS" : "FAIL");
 
+    std::printf("--- Phase 7: SQLColumns ---\n");
+    bool columnsOk = runColumnsTest(dbc, database);
+    std::printf("columns test: %s\n", columnsOk ? "PASS" : "FAIL");
+
     rc = SQLDisconnect(dbc);
     std::printf("SQLDisconnect rc=%d\n", static_cast<int>(rc));
     printDiag(SQL_HANDLE_DBC, dbc, "dbc");
@@ -883,5 +1061,5 @@ int main(int argc, char** argv) {
     SQLFreeHandle(SQL_HANDLE_ENV, env);
     std::printf("done.\n");
     bool disconnectOk = (rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
-    return (disconnectOk && nativeOk && diagOk && bindOk && txnOk && catalogOk) ? 0 : 1;
+    return (disconnectOk && nativeOk && diagOk && bindOk && txnOk && catalogOk && columnsOk) ? 0 : 1;
 }

@@ -709,13 +709,13 @@ iterating on guessed field counts.
 
 ## Catalog functions
 
-**Status: SQLTables done and confirmed live** (`driver/catalog.cpp`) -
-`tools/odbc_dm_probe`'s `runCatalogTest` through the real Driver Manager,
-plus `isql`'s `help` (all tables/views in a live multi-table database,
-correct TABLE_TYPE per row). SQLColumns is not implemented yet - `isql
-help <table>` calls SQLColumns, not SQLTables, and confirmed live to fail
-("Could not SQLColumns") until it lands, not something this pass claims
-to cover.
+**Status: SQLTables and SQLColumns both done and confirmed live**
+(`driver/catalog.cpp`) - `tools/odbc_dm_probe`'s `runCatalogTest`/
+`runColumnsTest` through the real Driver Manager, plus `isql`'s `help`
+(all tables/views in a live multi-table database, correct TABLE_TYPE per
+row) and `help <table>` (correct DATA_TYPE/TYPE_NAME/COLUMN_SIZE/
+DECIMAL_DIGITS/NULLABLE/IS_NULLABLE per column, including a `SERIAL`
+column correctly reported as `integer`/NOT NULL).
 
 This isn't a new protocol-level mechanism - it's a SQL query synthesized
 against `systables` and run through the exact same prepare/execute/fetch
@@ -748,14 +748,36 @@ behavior discovered along the way, not SQLI protocol behavior:
   lazy `SQ_BEGIN`, unlike `driver/statement.cpp`'s `doExecute` for
   DML/SELECT) - confirmed live to work the same under
   `SQL_ATTR_AUTOCOMMIT_OFF` as under the default `ON`.
+- `syscolumns.coltype` packs the NOT NULL flag as bit `0x100` over the base
+  type - confirmed live (`262` for a `SERIAL NOT NULL` column = `6` +
+  `256`), the same encoding already relied on at the wire level (see the
+  Scalar type wire encodings section above). `syscolumns.collength` packs
+  `(precision << 8) | scale` for `DECIMAL` (confirmed live: `2562` for
+  `DECIMAL(10,2)` = `10*256 + 2`) and a qualifier value for `DATETIME`
+  (confirmed live: `3594` for `YEAR TO SECOND` = `(14 << 8) | 0x0A`,
+  matching `driver/bind_encode.cpp`'s `kYearToSecond` exactly) - both the
+  same packed-field conventions this driver's wire-level code already
+  decodes, not something newly discovered about the protocol itself.
+- Informix's arithmetic functions (`trunc()`, `mod()`) return `DECIMAL`,
+  not `INTEGER`, even when both arguments are integers - and a `CASE`
+  expression mixing an integer-literal branch with a `trunc()`/`mod()`
+  branch gets typed `DECIMAL` for *all* branches, not just that one.
+  Confirmed live the hard way: a `SQLColumns` column computed this way
+  came back as `07006` ("restricted data type attribute violation") on
+  `SQL_C_SSHORT`/`SQL_C_SLONG` fetches - the same `DECIMAL`-vs-integer-
+  family gap `count(*)` hit earlier (see the Transactions section's
+  `countRows` note) - even though the *value* was correct. Worked around
+  with an explicit `cast(... as integer)` around the whole `CASE`, not
+  just the offending branch.
 
-Scope: the plain filtering case (`isql help` and ordinary schema
-browsing) - catalog/schema/table-name filtering via `LIKE`,
-table-type filtering via an `IN` list. Not implemented: the ODBC "special
-value" enumeration modes (`CatalogName="%"` alone to list catalogs,
-`SchemaName="%"` alone to list schemas) - see `driver/catalog.cpp`'s top
-comment for why this is a deliberate, documented gap rather than an
-oversight.
+Scope: the plain filtering case (`isql help`/`help <table>` and ordinary
+schema browsing) - catalog/schema/table-name/column-name filtering via
+`LIKE`, table-type filtering via an `IN` list. Not implemented: the ODBC
+"special value" enumeration modes (`CatalogName="%"` alone to list
+catalogs, `SchemaName="%"` alone to list schemas) and `COLUMN_DEF`
+(always `NULL`, no default-value introspection) - see
+`driver/catalog.cpp`'s top comment for why these are deliberate,
+documented gaps rather than oversights.
 
 ## Open questions / risks
 
