@@ -214,23 +214,25 @@ Roughly in the order they'd bite a real application:
    This is still mostly just the 8-type MVP set, not the full type system
    BOP's Informix plugin eventually needs (LOB, INTERVAL, sub-second
    DATETIME all remain unimplemented on both the bind and fetch sides).
-   BOOLEAN and FLOAT/SMALLFLOAT are now fully done (bind and fetch).
-   BOOLEAN turned out to be an extended/opaque type (nonzero `extendedId`
-   in DESCRIBE, owner="informix"/name="boolean") rather than a plain
-   fixed-width scalar, on *both* sides independently: fetch needed
-   SQ_RETURN_TYPE's extended-column encoding plus a self-describing
-   5/6-byte TUPLE decoder (`decodeBoolean`), and bind needed SQ_BIND's
-   own, separately-traced extended-type framing (the owner/name fields
-   written as two `ifxChar2`s right after the type code, for every bind
-   of that type including NULL ones - confirmed live that omitting them
-   hangs the connection) plus the JDBC-matching remapped type code 45
-   (`ifxtype::kBooleanBindType`, not 41/`kBoolean`) and `encodeBoolean`.
-   FLOAT/SMALLFLOAT needed neither - plain fixed-width IEEE 754 values
-   (wire ifxType matches the decompiled JDBC driver's codes exactly, no
-   extended-type framing on either side); see `decodeFloat`/
-   `decodeSmallFloat`/`encodeFloat`/`encodeSmallFloat`.
-   `SQLColumns`/`SQLGetTypeInfo` catalog rows for all three types are not
-   done yet.
+   BOOLEAN and FLOAT/SMALLFLOAT are now fully done end to end (bind,
+   fetch, and catalog). BOOLEAN turned out to be an extended/opaque type
+   (nonzero `extendedId` in DESCRIBE, owner="informix"/name="boolean")
+   rather than a plain fixed-width scalar, on the wire protocol layer
+   only: fetch needed SQ_RETURN_TYPE's extended-column encoding plus a
+   self-describing 5/6-byte TUPLE decoder (`decodeBoolean`), and bind
+   needed SQ_BIND's own, separately-traced extended-type framing (the
+   owner/name fields written as two `ifxChar2`s right after the type
+   code, for every bind of that type including NULL ones - confirmed
+   live that omitting them hangs the connection) plus the JDBC-matching
+   remapped type code 45 (`ifxtype::kBooleanBindType`, not 41/
+   `kBoolean`) and `encodeBoolean`. The catalog layer needed none of
+   that - confirmed live that `syscolumns.coltype` uses the same base
+   type code (41) as DESCRIBE's wire ifxType, so `SQLColumns`/
+   `SQLGetTypeInfo` support was just three ordinary `kTypeMap` rows.
+   FLOAT/SMALLFLOAT needed no extended-type handling anywhere - plain
+   fixed-width IEEE 754 values (wire ifxType matches the decompiled JDBC
+   driver's codes exactly); see `decodeFloat`/`decodeSmallFloat`/
+   `encodeFloat`/`encodeSmallFloat`.
 4. **No DSN-based connect (`SQLConnect`).** Only `SQLDriverConnect` with an
    explicit keyword string works today. Fine for `isql -k`, but many
    GUI/ODBC-Admin tools default to the DSN path.
@@ -246,8 +248,8 @@ Roughly in the order they'd bite a real application:
    functions.
 7. **Missing scalar types**: INTERVAL, LOBs (BLOB/CLOB/BYTE/TEXT), and
    DATETIME with fractional (sub-second) qualifiers. BOOLEAN and
-   FLOAT/SMALLFLOAT are fully done; catalog rows for all three are not
-   done (see item 3 above).
+   FLOAT/SMALLFLOAT are fully done, including catalog rows (see item 3
+   above).
 8. **No real generated-key retrieval.** The `SQ_INSERTDONE` wire field is
    decoded, but the driver never sends the extra "SGK" request the server
    needs to actually populate it, so every INSERT currently reports a
@@ -303,10 +305,9 @@ polish don't block that.
 
 1. **Remaining scalar types beyond the MVP-8 set - INTERVAL, sub-second
    DATETIME, then LOBs (both bind and fetch sides). BOOLEAN and
-   FLOAT/SMALLFLOAT are now fully done (bind and fetch, sqli-layer plus
-   ODBC-layer), each confirmed live and through the real Driver Manager.
-   Catalog rows (`SQLColumns`/`SQLGetTypeInfo`) for all three still need
-   doing.**
+   FLOAT/SMALLFLOAT are now fully done end to end (bind, fetch, and
+   catalog rows, sqli-layer plus ODBC-layer), each confirmed live and
+   through the real Driver Manager.**
    Blocking: a real Informix database backup/restore tool can't skip
    columns of a type it doesn't support. LOBs in particular are likely to
    need their own multi-message wire handling, not just another entry in
