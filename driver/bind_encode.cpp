@@ -57,6 +57,28 @@ BindEncodeResult encodeBindParam(SQLSMALLINT valueType, SQLSMALLINT parameterTyp
         p.precisionField = ifxsqli::kBigIntBindPrecision;
         return BindEncodeResult{BindEncodeStatus::kOk, std::move(p)};
     }
+    if (parameterType == SQL_DOUBLE && (valueType == SQL_C_DOUBLE || valueType == SQL_C_DEFAULT)) {
+        ifxsqli::BindParam p;
+        p.ifxType = ifxsqli::ifxtype::kFloat;
+        p.isNull = false;
+        p.data = ifxsqli::encodeFloat(*static_cast<SQLDOUBLE*>(parameterValuePtr));
+        p.precisionField = ifxsqli::kFloatBindPrecision;
+        return BindEncodeResult{BindEncodeStatus::kOk, std::move(p)};
+    }
+    // SQL_C_FLOAT isn't in isNativeTargetType's gate (statement.cpp's
+    // SQLBindParameter never reaches here with it), so SMALLFLOAT binds
+    // via the already-permitted wider SQL_C_DOUBLE, narrowed here - a
+    // standard ODBC pattern (drivers commonly accept a wider C type bound
+    // to a narrower SQL type) that avoids touching the shared native-type
+    // gate and its fetch-direction implications.
+    if (parameterType == SQL_REAL && (valueType == SQL_C_DOUBLE || valueType == SQL_C_DEFAULT)) {
+        ifxsqli::BindParam p;
+        p.ifxType = ifxsqli::ifxtype::kSmallFloat;
+        p.isNull = false;
+        p.data = ifxsqli::encodeSmallFloat(static_cast<float>(*static_cast<SQLDOUBLE*>(parameterValuePtr)));
+        p.precisionField = ifxsqli::kSmallFloatBindPrecision;
+        return BindEncodeResult{BindEncodeStatus::kOk, std::move(p)};
+    }
     if ((parameterType == SQL_CHAR || parameterType == SQL_VARCHAR) &&
         (valueType == SQL_C_CHAR || valueType == SQL_C_DEFAULT)) {
         std::string_view s = charBindValue(parameterValuePtr, strLenOrInd);
@@ -135,6 +157,10 @@ std::optional<int> ifxTypeForParameterType(SQLSMALLINT parameterType) {
             return ifxsqli::ifxtype::kSmallInt;
         case SQL_BIGINT:
             return ifxsqli::ifxtype::kBigInt;
+        case SQL_DOUBLE:
+            return ifxsqli::ifxtype::kFloat;
+        case SQL_REAL:
+            return ifxsqli::ifxtype::kSmallFloat;
         case SQL_CHAR:
             return ifxsqli::ifxtype::kChar;
         case SQL_VARCHAR:
