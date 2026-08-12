@@ -214,19 +214,21 @@ Roughly in the order they'd bite a real application:
    This is still mostly just the 8-type MVP set, not the full type system
    BOP's Informix plugin eventually needs (LOB, INTERVAL, sub-second
    DATETIME all remain unimplemented on both the bind and fetch sides).
-   BOOLEAN's fetch side is done - it turned out to be an extended/opaque
-   type (nonzero `extendedId` in DESCRIBE, a self-describing 5/6-byte
-   TUPLE shape) rather than a plain fixed-width scalar, needing
-   SQ_RETURN_TYPE's extended-column encoding as well as a decoder; see
-   `sqli/types.h`'s `decodeBoolean` doc comment. Its bind side
-   (`SQ_BIND`/`encodeBoolean`) is not done - SQ_BIND's own extended-type
-   framing (a distinct, separately-traced code path in the decompiled
-   reference's `sendBind`, gated on a server-version flag this driver
-   doesn't check yet) hasn't been investigated. FLOAT/SMALLFLOAT are both
-   fully done (bind and fetch) - unlike BOOLEAN, these are plain
-   fixed-width IEEE 754 values (wire ifxType matches the decompiled JDBC
-   driver's codes exactly, no extended-type framing on either side); see
-   `decodeFloat`/`decodeSmallFloat`/`encodeFloat`/`encodeSmallFloat`.
+   BOOLEAN and FLOAT/SMALLFLOAT are now fully done (bind and fetch).
+   BOOLEAN turned out to be an extended/opaque type (nonzero `extendedId`
+   in DESCRIBE, owner="informix"/name="boolean") rather than a plain
+   fixed-width scalar, on *both* sides independently: fetch needed
+   SQ_RETURN_TYPE's extended-column encoding plus a self-describing
+   5/6-byte TUPLE decoder (`decodeBoolean`), and bind needed SQ_BIND's
+   own, separately-traced extended-type framing (the owner/name fields
+   written as two `ifxChar2`s right after the type code, for every bind
+   of that type including NULL ones - confirmed live that omitting them
+   hangs the connection) plus the JDBC-matching remapped type code 45
+   (`ifxtype::kBooleanBindType`, not 41/`kBoolean`) and `encodeBoolean`.
+   FLOAT/SMALLFLOAT needed neither - plain fixed-width IEEE 754 values
+   (wire ifxType matches the decompiled JDBC driver's codes exactly, no
+   extended-type framing on either side); see `decodeFloat`/
+   `decodeSmallFloat`/`encodeFloat`/`encodeSmallFloat`.
    `SQLColumns`/`SQLGetTypeInfo` catalog rows for all three types are not
    done yet.
 4. **No DSN-based connect (`SQLConnect`).** Only `SQLDriverConnect` with an
@@ -243,9 +245,9 @@ Roughly in the order they'd bite a real application:
 6. **No Unicode.** ANSI (`SQL_C_CHAR`) only; no `SQLWCHAR`/`W`-suffixed
    functions.
 7. **Missing scalar types**: INTERVAL, LOBs (BLOB/CLOB/BYTE/TEXT), and
-   DATETIME with fractional (sub-second) qualifiers. FLOAT/SMALLFLOAT are
-   fully done; BOOLEAN's fetch side is done but its bind side isn't;
-   catalog rows for all three are not done (see item 3 above).
+   DATETIME with fractional (sub-second) qualifiers. BOOLEAN and
+   FLOAT/SMALLFLOAT are fully done; catalog rows for all three are not
+   done (see item 3 above).
 8. **No real generated-key retrieval.** The `SQ_INSERTDONE` wire field is
    decoded, but the driver never sends the extra "SGK" request the server
    needs to actually populate it, so every INSERT currently reports a
@@ -300,12 +302,9 @@ callable from BOP's own code; catalog-completeness and driver-manager
 polish don't block that.
 
 1. **Remaining scalar types beyond the MVP-8 set - INTERVAL, sub-second
-   DATETIME, then LOBs (both bind and fetch sides). FLOAT/SMALLFLOAT are
-   fully done (bind and fetch, sqli-layer plus ODBC-layer). BOOLEAN's
-   fetch side is done; its bind side (`SQ_BIND`/`encodeBoolean`) needs
-   its own investigation - SQ_BIND has a separate extended-type code path
-   from SQ_RETURN_TYPE's (see the decompiled `sendBind`'s `isUSVER()`-
-   gated branch), so the RETURN_TYPE fix doesn't carry over directly.
+   DATETIME, then LOBs (both bind and fetch sides). BOOLEAN and
+   FLOAT/SMALLFLOAT are now fully done (bind and fetch, sqli-layer plus
+   ODBC-layer), each confirmed live and through the real Driver Manager.
    Catalog rows (`SQLColumns`/`SQLGetTypeInfo`) for all three still need
    doing.**
    Blocking: a real Informix database backup/restore tool can't skip
