@@ -189,7 +189,24 @@ std::optional<std::vector<ifxsqli::BindParam>> buildBindParams(OdbcStatement* s)
         const auto& binding = it->second;
         bool isNull = binding.strLenOrIndPtr && *binding.strLenOrIndPtr == SQL_NULL_DATA;
         if (isNull) {
+            // SQ_BIND's ifxType field should be the target column's real
+            // type, not a placeholder, per the decompiled JDBC reference's
+            // sendBind() (see ifxTypeForParameterType's doc comment) - it
+            // is never hardcoded to CHAR/type-0 for a NULL there. Leaving
+            // this defaulted to 0 (kChar/CHAR) regardless of the bound
+            // ParameterType matched the reference's shape less closely,
+            // though it was never independently shown live to misbehave
+            // (see ifxTypeForParameterType's doc comment for why: nothing
+            // exercises SQLBindParameter through the ODBC surface yet).
+            auto ifxType = ifxTypeForParameterType(binding.parameterType);
+            if (!ifxType) {
+                postDriverError(s->diag, "HYC00",
+                                "SQLBindParameter: unsupported ParameterType for NULL parameter #" +
+                                    std::to_string(i));
+                return std::nullopt;
+            }
             ifxsqli::BindParam p;
+            p.ifxType = *ifxType;
             p.isNull = true;
             params.push_back(std::move(p));
             continue;

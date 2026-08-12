@@ -98,6 +98,77 @@ void check(const char* label, bool condition) {
     return true;
 }
 
+// Confirms SQ_BIND's NULL path: binds a NULL indicator (-1) into every
+// non-char column with the column's real ifxType attached (mirroring the
+// fix in driver/statement.cpp's buildBindParams, which used to leave
+// ifxType defaulted to 0/kChar for every NULL regardless of the target
+// column). Runs on its own connection/table row so it doesn't interact
+// with run()'s or checkDecimalRoundTrip's rows.
+[[nodiscard]] bool checkNullBind(const std::string& host, int port, const ConnectParams& params) {
+    auto conn = SqliConnection::connect(host, port, params);
+    if (!conn) {
+        std::fprintf(stderr, "connect failed: %s\n", conn.error().message.c_str());
+        return false;
+    }
+    auto insertStmt = SqliStatement::prepare(
+        *conn, "insert into bind_probe (col_smallint, col_integer, col_bigint, col_date, col_decimal,"
+               " col_datetime) values (?, ?, ?, ?, ?, ?)");
+    if (!insertStmt) {
+        std::fprintf(stderr, "prepare insert failed: %s\n", insertStmt.error().message.c_str());
+        return false;
+    }
+    std::vector<BindParam> params2{
+        BindParam{ifxtype::kSmallInt, true, {}, 0}, BindParam{ifxtype::kInteger, true, {}, 0},
+        BindParam{ifxtype::kBigInt, true, {}, 0},   BindParam{ifxtype::kDate, true, {}, 0},
+        BindParam{ifxtype::kDecimal, true, {}, 0},  BindParam{ifxtype::kDatetime, true, {}, 0}};
+    if (auto r = insertStmt->execute(params2); !r) {
+        std::fprintf(stderr, "execute insert failed: %s\n", r.error().message.c_str());
+        return false;
+    }
+    if (auto r = insertStmt->close(); !r) return false;
+    if (auto r = insertStmt->release(); !r) return false;
+
+    auto selectStmt = SqliStatement::prepare(
+        *conn, "select col_smallint, col_integer, col_bigint, col_date, col_decimal, col_datetime"
+               " from bind_probe where col_char is null and col_varchar is null");
+    if (!selectStmt) {
+        std::fprintf(stderr, "prepare select failed: %s\n", selectStmt.error().message.c_str());
+        return false;
+    }
+    if (auto r = selectStmt->execute(); !r) {
+        std::fprintf(stderr, "execute select failed: %s\n", r.error().message.c_str());
+        return false;
+    }
+    auto row = selectStmt->fetchRow();
+    if (!row || !*row) {
+        std::fprintf(stderr, "fetchRow failed or no row\n");
+        return false;
+    }
+    auto smallintVal = decodeSmallInt((**row)[0]);
+    auto integerVal = decodeInteger((**row)[1]);
+    auto bigintVal = decodeBigInt((**row)[2]);
+    auto dateVal = decodeDateUnixDays((**row)[3]);
+    auto decimalVal = decodeDecimal((**row)[4], 10, 2);
+    auto datetimeVal = decodeDatetime((**row)[5], (14u << 8) | 0x0A);
+    if (auto r = selectStmt->close(); !r) return false;
+    if (auto r = selectStmt->release(); !r) return false;
+    if (auto r = conn->executeCommand("delete from bind_probe where col_char is null and col_varchar is null");
+        !r)
+        return false;
+    if (auto r = conn->disconnectOrderly(); !r) return false;
+    if (!smallintVal || !integerVal || !bigintVal || !dateVal || !decimalVal || !datetimeVal) {
+        std::fprintf(stderr, "decode failed\n");
+        return false;
+    }
+    check("NULL bound with real ifxType round-trips (SMALLINT)", !smallintVal->has_value());
+    check("NULL bound with real ifxType round-trips (INTEGER)", !integerVal->has_value());
+    check("NULL bound with real ifxType round-trips (BIGINT)", !bigintVal->has_value());
+    check("NULL bound with real ifxType round-trips (DATE)", !dateVal->has_value());
+    check("NULL bound with real ifxType round-trips (DECIMAL)", !decimalVal->has_value());
+    check("NULL bound with real ifxType round-trips (DATETIME)", !datetimeVal->has_value());
+    return true;
+}
+
 [[nodiscard]] bool run(const std::string& host, int port, const ConnectParams& params) {
     auto setup = SqliConnection::connect(host, port, params);
     if (!setup) {
@@ -261,6 +332,10 @@ int main() {
         return 1;
     }
     if (!checkDecimalRoundTrip(host, port, params, "0.00")) {
+        std::printf("\nbind integration test FAILED to complete (see error above)\n");
+        return 1;
+    }
+    if (!checkNullBind(host, port, params)) {
         std::printf("\nbind integration test FAILED to complete (see error above)\n");
         return 1;
     }

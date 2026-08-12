@@ -9,7 +9,8 @@ This is a working prototype, not a production-grade driver yet. The protocol
 layer and a real ODBC surface both round-trip correctly against a live
 Informix server today, confirmed via `isql` through the actual unixODBC
 Driver Manager, not just unit tests. Transactions and all 8 MVP
-bind-parameter types are done and confirmed live. But large, expected pieces
+bind-parameter types are done and confirmed live, including NULL binds
+(fixed two framing/type bugs this pass - see gap 3 below). But large, expected pieces
 of a production ODBC driver are still missing outright: `SQLEndTran` isn't
 wired to the now-working transaction primitive yet, catalog functions
 (`SQLTables`/`SQLColumns`/...), Unicode, Windows driver registration, LOBs,
@@ -129,6 +130,31 @@ Roughly in the order they'd bite a real application:
    `IfxVarChar.toIfxTuple()` (a bulk-load path, not `sendBind`'s) and
    concluded the encoded buffer was fixed at the declared column width;
    the real bind path (`toIfx()`) turned out to be identical to CHAR's.
+
+   NULL parameter binding got two changes this pass, with different
+   verification strength:
+   - **Confirmed live, and a real bug**: `sqli/statement.cpp`'s
+     `writeBindBlock` omitted a NULL parameter's `precisionField` entirely
+     instead of sending `0`, which desynced the wire (and hung the
+     connection) whenever a NULL wasn't the bind block's last parameter -
+     invisible in every round trip tried before now because the only NULLs
+     bound so far were either the sole parameter or the last one. See
+     `docs/protocol-notes.md`'s SQ_BIND section and
+     `tests/integration/test_bind.cpp`'s `checkNullBind`, which
+     specifically binds a NULL ahead of other parameters to exercise it.
+   - **Brought into line with the decompiled reference, not independently
+     shown to be a live bug**: `driver/statement.cpp`'s `buildBindParams`
+     used to leave a NULL bind's `ifxType` defaulted to 0/CHAR regardless
+     of the target column's real type; it now resolves the real type via
+     `ifxTypeForParameterType`. This path lives in the ODBC driver DLL,
+     which no integration test drives yet (`checkNullBind` calls
+     `SqliStatement::execute` directly with hand-built `BindParam`s,
+     bypassing `buildBindParams` entirely) - it was never demonstrated
+     that a type-0 NULL into a typed column actually misbehaves live, only
+     that the reference always sends the real type. Treat this as
+     unverified-but-reference-consistent until an ODBC-surface
+     (`SQLBindParameter`) test harness exists to exercise it end-to-end.
+
    This is still just the 8-type MVP set, not the full type system BOP's
    Informix plugin eventually needs (LOB, FLOAT/SMALLFLOAT, BOOLEAN,
    INTERVAL, sub-second DATETIME all remain unimplemented on both the

@@ -127,4 +127,28 @@ BindEncodeResult encodeBindParam(SQLSMALLINT valueType, SQLSMALLINT parameterTyp
     return BindEncodeResult{BindEncodeStatus::kUnsupported, {}};
 }
 
+std::optional<int> ifxTypeForParameterType(SQLSMALLINT parameterType) {
+    switch (parameterType) {
+        case SQL_INTEGER:
+            return ifxsqli::ifxtype::kInteger;
+        case SQL_SMALLINT:
+            return ifxsqli::ifxtype::kSmallInt;
+        case SQL_BIGINT:
+            return ifxsqli::ifxtype::kBigInt;
+        case SQL_CHAR:
+            return ifxsqli::ifxtype::kChar;
+        case SQL_VARCHAR:
+            return ifxsqli::ifxtype::kVarchar;
+        case SQL_TYPE_DATE:
+            return ifxsqli::ifxtype::kDate;
+        case SQL_DECIMAL:
+        case SQL_NUMERIC:
+            return ifxsqli::ifxtype::kDecimal;
+        case SQL_TYPE_TIMESTAMP:
+            return ifxsqli::ifxtype::kDatetime;
+        default:
+            return std::nullopt;
+    }
+}
+
 } // namespace ifxodbc

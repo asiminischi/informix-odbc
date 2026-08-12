@@ -20,6 +20,8 @@
 
 #include "sqli/statement.h"
 
+#include <optional>
+
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -53,5 +55,21 @@ struct BindEncodeResult {
 // ignore it entirely.
 [[nodiscard]] BindEncodeResult encodeBindParam(SQLSMALLINT valueType, SQLSMALLINT parameterType,
                                                 SQLPOINTER parameterValuePtr, SQLLEN strLenOrInd);
+
+// Maps SQLBindParameter's ParameterType to the Informix wire type SQ_BIND
+// needs, independent of any value - needed for NULL binds, which carry no
+// value to dispatch encodeBindParam on but still must advertise the real
+// target type. The decompiled JDBC reference's sendBind() always sends the
+// bound value's actual ifxType even when isNull() (see IfxSqli.java: the
+// `ival.isNull()` branch reads `type` from the same `ival.getIfxType()`
+// call every other branch uses) - it is never hardcoded to CHAR/type-0 for
+// a NULL, so this brings the driver in line with the reference. Not
+// independently confirmed live that a type-0 NULL actually misbehaves
+// against this server - no integration test drives SQLBindParameter
+// through the ODBC surface yet, only sqli::SqliStatement::execute()
+// directly with hand-built BindParams. Returns nullopt for a
+// ParameterType this driver doesn't support at all, same as
+// encodeBindParam's kUnsupported.
+[[nodiscard]] std::optional<int> ifxTypeForParameterType(SQLSMALLINT parameterType);
 
 } // namespace ifxodbc

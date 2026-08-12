@@ -366,15 +366,32 @@ no-cursor branches - right after `statementId`, only when the statement has
 bound parameters; confirmed live for `SQL_INTEGER`/`SQL_SMALLINT`/
 `SQL_BIGINT`, see `tests/integration/test_bind.cpp`): `u16(5)`, `u16(count)`,
 then per parameter: `ifxType`(u16), `indicator`(u16: `0xFFFF`/-1 for NULL,
-`0` for a real value). **Only when non-NULL**: `precisionField`(u16) then the
-encoded value bytes, padded to even length (same even-alignment rule as
-every other variable-length field in this protocol, confirmed via
-`IfxDataOutputStream.writePadded`: a plain `write(bytes)` plus a single
-0-byte pad if odd, **no length prefix of its own**, so any field whose
-byte count isn't implicit from the type alone must carry that information
-via `precisionField` or an embedded length inside the value bytes. A NULL
-parameter sends nothing beyond the indicator, no precision field, no data
-bytes at all.
+`0` for a real value), then `precisionField`(u16) - **sent unconditionally,
+NULL or not** - and, only when non-NULL, the encoded value bytes, padded to
+even length (same even-alignment rule as every other variable-length field
+in this protocol, confirmed via `IfxDataOutputStream.writePadded`: a plain
+`write(bytes)` plus a single 0-byte pad if odd, **no length prefix of its
+own**, so any field whose byte count isn't implicit from the type alone
+must carry that information via `precisionField` or an embedded length
+inside the value bytes.
+
+A NULL parameter's `precisionField` was originally believed to be omitted
+entirely (only `ifxType` + indicator, nothing more) - wrong, and it stayed
+wrong through several live-confirmed round trips because every NULL bound
+so far was either the sole parameter or the last one in its bind block,
+both cases where a missing 2-byte field gets silently absorbed by whatever
+follows instead of producing a visible failure. Binding a NULL ahead of
+another parameter (e.g. `[NULL smallint, non-null integer]`) hung the
+connection - same failure mode as the SQ_RBWORK savepoint-id omission
+above: the server sat waiting for 2 bytes that never arrived. Re-reading
+`IfxSqli.sendBind`'s `ival.isNull()` branch shows it writes
+`writeSmallInt((short)0)` for the precision field right after the `-1`
+indicator, matching every other parameter's shape (`type`, `indicator`,
+`precision`, `[data]`) rather than truncating it early. Fixed in
+`writeBindBlock`; confirmed live via `checkNullBind` in
+`tests/integration/test_bind.cpp`, which specifically binds a NULL as the
+*first* of several parameters to exercise the case the earlier, narrower
+tests couldn't reach.
 
 `precisionField`'s meaning is type-specific metadata:
 - **INTEGER/SMALLINT/BIGINT**: a hardcoded constant, confirmed via the

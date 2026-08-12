@@ -105,13 +105,24 @@ std::expected<std::vector<std::vector<std::byte>>, Error> splitRow(std::span<con
 }
 
 // SQ_BIND: u16(5), u16(count), then per parameter: u16(ifxType),
-// u16(indicator: -1 = NULL, 0 = has a value), and - only when non-NULL -
-// u16(precisionField) followed by the pre-encoded value bytes (padded to
-// even length, matching every other variable-length field in this
-// protocol). Confirmed against the decompiled JDBC driver's IfxSqli.
-// sendBind: for a NULL parameter, no precision/data fields are sent at
-// all (the indicator alone conveys NULL - encodeInteger et al. are never
-// even asked to produce a "NULL value").
+// u16(indicator: -1 = NULL, 0 = has a value), then u16(precisionField) -
+// always sent, NULL or not - and - only when non-NULL - the pre-encoded
+// value bytes (padded to even length, matching every other variable-length
+// field in this protocol).
+//
+// A NULL parameter's precisionField was originally believed to be omitted
+// entirely (the indicator alone conveys NULL), but that was never actually
+// confirmed live for a NULL that isn't the bind block's last parameter -
+// the only NULL binds exercised so far were either the sole parameter or
+// the last one, both cases where an omitted 2-byte field gets silently
+// absorbed by whatever follows instead of causing a visible failure. A
+// NULL bound ahead of another parameter hung the connection (same failure
+// mode as the SQ_RBWORK savepoint-id omission - see docs/protocol-notes.md's
+// Transactions section): the server was left waiting for 2 bytes that never
+// arrived. Re-reading IfxSqli.sendBind's isNull() branch shows it writes a
+// precision field of 0 right after the -1 indicator, matching every other
+// parameter's shape (type, indicator, precision, [data]) rather than
+// truncating it - confirmed live after adding it back.
 void writeBindBlock(ByteWriter& w, const std::vector<BindParam>& params) {
     w.u16(opcode::kBind);
     w.u16(static_cast<std::uint16_t>(params.size()));
@@ -119,6 +130,7 @@ void writeBindBlock(ByteWriter& w, const std::vector<BindParam>& params) {
         w.u16(static_cast<std::uint16_t>(p.ifxType));
         if (p.isNull) {
             w.u16(static_cast<std::uint16_t>(-1));
+            w.u16(0);
             continue;
         }
         w.u16(0);
