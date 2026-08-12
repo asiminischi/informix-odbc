@@ -63,6 +63,8 @@ SQLSMALLINT sqlTypeFor(int ifxType) {
         case kDate: return SQL_TYPE_DATE;
         case kDatetime: return SQL_TYPE_TIMESTAMP;
         case kBoolean: return SQL_BIT;
+        case kFloat: return SQL_DOUBLE;
+        case kSmallFloat: return SQL_REAL;
         default: return SQL_VARCHAR; // unknown types still round-trip as text (driver/convert.h's default case)
     }
 }
@@ -82,6 +84,8 @@ SQLULEN columnSizeFor(const ifxsqli::ColumnDesc& col) {
         case kDate: return 10;      // "YYYY-MM-DD"
         case kDatetime: return 19;  // "YYYY-MM-DD HH:MM:SS"
         case kBoolean: return 1;
+        case kFloat: return 15;      // SQL_DOUBLE's standard COLUMN_SIZE (ODBC spec)
+        case kSmallFloat: return 7;  // SQL_REAL's standard COLUMN_SIZE (ODBC spec)
         default: return 0;
     }
 }

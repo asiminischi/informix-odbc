@@ -26,6 +26,21 @@ std::string formatDatetime(const ifxsqli::DatetimeValue& dt) {
     return buf;
 }
 
+// %.17g/%.9g round-trip double/float exactly (the minimum digit counts that
+// guarantee it per IEEE 754), unlike std::to_string's fixed 6-decimal-place
+// default which would silently truncate.
+std::string formatDouble(double d) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.17g", d);
+    return buf;
+}
+
+std::string formatFloat(float f) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%.9g", f);
+    return buf;
+}
+
 } // namespace
 
 std::expected<CellText, ifxsqli::Error> formatCellAsText(const ifxsqli::ColumnDesc& col,
@@ -90,6 +105,18 @@ std::expected<CellText, ifxsqli::Error> formatCellAsText(const ifxsqli::ColumnDe
             if (!v) return std::unexpected(v.error());
             if (!*v) return CellText{true, {}};
             return CellText{false, **v ? "1" : "0"};
+        }
+        case ifxtype::kFloat: {
+            auto v = decodeFloat(raw);
+            if (!v) return std::unexpected(v.error());
+            if (!*v) return CellText{true, {}};
+            return CellText{false, formatDouble(**v)};
+        }
+        case ifxtype::kSmallFloat: {
+            auto v = decodeSmallFloat(raw);
+            if (!v) return std::unexpected(v.error());
+            if (!*v) return CellText{true, {}};
+            return CellText{false, formatFloat(**v)};
         }
         default:
             return std::unexpected(
