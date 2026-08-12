@@ -125,7 +125,7 @@ IFXODBC_EXPORT SQLRETURN SQL_API SQLGetFunctions(SQLHDBC ConnectionHandle, SQLUS
         SQL_API_SQLBINDCOL,         SQL_API_SQLFETCH,           SQL_API_SQLGETDATA,
         SQL_API_SQLFREESTMT,        SQL_API_SQLROWCOUNT,        SQL_API_SQLSETSTMTATTR,
         SQL_API_SQLGETSTMTATTR,     SQL_API_SQLCANCEL,          SQL_API_SQLBINDPARAMETER,
-        SQL_API_SQLENDTRAN,
+        SQL_API_SQLENDTRAN,         SQL_API_SQLTABLES,
     };
     auto isImplemented = [](SQLUSMALLINT id) {
         for (auto f : kImplemented) {

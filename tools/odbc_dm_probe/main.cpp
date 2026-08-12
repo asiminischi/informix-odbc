@@ -613,6 +613,146 @@ bool runTransactionTest(SQLHENV env, SQLHDBC dbc, const std::string& connStr) {
     return ok;
 }
 
+// Verifies SQLTables (driver/catalog.cpp): a synthesized query against
+// systables run through the same prepare/execute/fetch pipeline every
+// other statement uses, not a separate in-memory result-set mechanism -
+// see that file's top comment for the exact scope (plain filtering, not
+// the ODBC catalog/schema "list everything" enumeration modes).
+bool runCatalogTest(SQLHDBC dbc, const std::string& database) {
+    bool ok = true;
+    auto expectEq = [&ok](const char* label, bool cond) {
+        std::printf("  [%s] %s\n", cond ? "ok" : "FAIL", label);
+        if (!cond) ok = false;
+    };
+
+    ok &= execDirect(dbc, "drop view if exists catalog_probe_v");
+    ok &= execDirect(dbc, "drop table if exists catalog_probe");
+    ok &= execDirect(dbc, "create table catalog_probe (id integer)");
+    ok &= execDirect(dbc, "create view catalog_probe_v as select id from catalog_probe");
+    if (!ok) {
+        std::printf("[catalog] fixture setup failed, aborting catalog test\n");
+        return false;
+    }
+
+    // One row's shape, in full: TABLE_CAT/TABLE_SCHEM/TABLE_TYPE content,
+    // not just that catalog_probe shows up at all.
+    {
+        SQLHSTMT stmt = SQL_NULL_HSTMT;
+        SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt);
+        SQLRETURN rc = SQLTables(stmt, nullptr, 0, nullptr, 0,
+                                  reinterpret_cast<SQLCHAR*>(const_cast<char*>("catalog_probe")), SQL_NTS, nullptr, 0);
+        expectEq("SQLTables(TableName=catalog_probe) succeeds", rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) printDiag(SQL_HANDLE_STMT, stmt, "SQLTables");
+
+        char cat[128] = {}, schem[128] = {}, name[128] = {}, type[128] = {};
+        SQLLEN catInd = 0, schemInd = 0, nameInd = 0, typeInd = 0;
+        SQLBindCol(stmt, 1, SQL_C_CHAR, cat, sizeof(cat), &catInd);
+        SQLBindCol(stmt, 2, SQL_C_CHAR, schem, sizeof(schem), &schemInd);
+        SQLBindCol(stmt, 3, SQL_C_CHAR, name, sizeof(name), &nameInd);
+        SQLBindCol(stmt, 4, SQL_C_CHAR, type, sizeof(type), &typeInd);
+
+        rc = SQLFetch(stmt);
+        expectEq("row found for TableName=catalog_probe", rc == SQL_SUCCESS);
+        expectEq("TABLE_CAT == connected database", catInd != SQL_NULL_DATA && database == cat);
+        expectEq("TABLE_SCHEM == informix (owner)", schemInd != SQL_NULL_DATA && std::string("informix") == schem);
+        expectEq("TABLE_NAME == catalog_probe", nameInd != SQL_NULL_DATA && std::string("catalog_probe") == name);
+        expectEq("TABLE_TYPE == TABLE", typeInd != SQL_NULL_DATA && std::string("TABLE") == type);
+        rc = SQLFetch(stmt);
+        expectEq("exactly one row for TableName=catalog_probe", rc == SQL_NO_DATA);
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+    }
+
+    // Wildcard pattern (LIKE, not exact match).
+    {
+        SQLHSTMT stmt = SQL_NULL_HSTMT;
+        SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt);
+        SQLRETURN rc = SQLTables(stmt, nullptr, 0, nullptr, 0,
+                                  reinterpret_cast<SQLCHAR*>(const_cast<char*>("catalog\\_probe%")), SQL_NTS, nullptr, 0);
+        expectEq("SQLTables(TableName=catalog\\_probe%) succeeds", rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        char name[128] = {};
+        SQLLEN nameInd = 0;
+        SQLBindCol(stmt, 3, SQL_C_CHAR, name, sizeof(name), &nameInd);
+        int rowCount = 0;
+        while ((rc = SQLFetch(stmt)) == SQL_SUCCESS) ++rowCount;
+        expectEq("wildcard pattern matches both catalog_probe and catalog_probe_v", rowCount == 2);
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+    }
+
+    // TableType filter: VIEW only should return catalog_probe_v, not
+    // catalog_probe.
+    {
+        SQLHSTMT stmt = SQL_NULL_HSTMT;
+        SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt);
+        SQLRETURN rc = SQLTables(stmt, nullptr, 0, nullptr, 0,
+                                  reinterpret_cast<SQLCHAR*>(const_cast<char*>("catalog%")), SQL_NTS,
+                                  reinterpret_cast<SQLCHAR*>(const_cast<char*>("VIEW")), SQL_NTS);
+        expectEq("SQLTables(TableType=VIEW) succeeds", rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        char name[128] = {};
+        SQLLEN nameInd = 0;
+        SQLBindCol(stmt, 3, SQL_C_CHAR, name, sizeof(name), &nameInd);
+        rc = SQLFetch(stmt);
+        expectEq("TableType=VIEW filter finds exactly catalog_probe_v",
+                  rc == SQL_SUCCESS && nameInd != SQL_NULL_DATA && std::string("catalog_probe_v") == name);
+        rc = SQLFetch(stmt);
+        expectEq("TableType=VIEW filter finds only that one row", rc == SQL_NO_DATA);
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+    }
+
+    // A system table (owner=informix, tabid<=99) is labeled SYSTEM TABLE,
+    // not TABLE.
+    {
+        SQLHSTMT stmt = SQL_NULL_HSTMT;
+        SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt);
+        SQLRETURN rc = SQLTables(stmt, nullptr, 0, nullptr, 0,
+                                  reinterpret_cast<SQLCHAR*>(const_cast<char*>("systables")), SQL_NTS, nullptr, 0);
+        char type[128] = {};
+        SQLLEN typeInd = 0;
+        SQLBindCol(stmt, 4, SQL_C_CHAR, type, sizeof(type), &typeInd);
+        rc = SQLFetch(stmt);
+        expectEq("systables is reported as SYSTEM TABLE",
+                  rc == SQL_SUCCESS && typeInd != SQL_NULL_DATA && std::string("SYSTEM TABLE") == type);
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+    }
+
+    // A CatalogName that doesn't match the connected database returns zero
+    // rows rather than erroring or ignoring the filter.
+    {
+        SQLHSTMT stmt = SQL_NULL_HSTMT;
+        SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt);
+        SQLRETURN rc =
+            SQLTables(stmt, reinterpret_cast<SQLCHAR*>(const_cast<char*>("no_such_database")), SQL_NTS, nullptr, 0,
+                      reinterpret_cast<SQLCHAR*>(const_cast<char*>("catalog_probe")), SQL_NTS, nullptr, 0);
+        expectEq("SQLTables(CatalogName=no_such_database) succeeds", rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        rc = SQLFetch(stmt);
+        expectEq("mismatched CatalogName returns zero rows", rc == SQL_NO_DATA);
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+    }
+
+    // Catalog reads work the same under manual-commit mode as under
+    // autocommit - they deliberately don't open a transaction of their own
+    // (see driver/catalog.cpp's runCatalogQuery), a state this pipeline
+    // didn't have to account for before SQLEndTran existed.
+    {
+        SQLRETURN rc = SQLSetConnectAttr(dbc, SQL_ATTR_AUTOCOMMIT, reinterpret_cast<SQLPOINTER>(SQL_AUTOCOMMIT_OFF), 0);
+        expectEq("SQLSetConnectAttr(AUTOCOMMIT_OFF) for catalog-under-transaction check succeeds", rc == SQL_SUCCESS);
+        SQLHSTMT stmt = SQL_NULL_HSTMT;
+        SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt);
+        rc = SQLTables(stmt, nullptr, 0, nullptr, 0,
+                        reinterpret_cast<SQLCHAR*>(const_cast<char*>("catalog_probe")), SQL_NTS, nullptr, 0);
+        expectEq("SQLTables succeeds under SQL_ATTR_AUTOCOMMIT_OFF", rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        rc = SQLFetch(stmt);
+        expectEq("SQLTables still finds catalog_probe under autocommit off", rc == SQL_SUCCESS);
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+        rc = SQLEndTran(SQL_HANDLE_DBC, dbc, SQL_COMMIT);
+        expectEq("SQLEndTran after the autocommit-off catalog check succeeds", rc == SQL_SUCCESS);
+        SQLSetConnectAttr(dbc, SQL_ATTR_AUTOCOMMIT, reinterpret_cast<SQLPOINTER>(SQL_AUTOCOMMIT_ON), 0);
+    }
+
+    execDirect(dbc, "drop view if exists catalog_probe_v");
+    execDirect(dbc, "drop table if exists catalog_probe");
+    return ok;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -731,6 +871,10 @@ int main(int argc, char** argv) {
     bool txnOk = runTransactionTest(env, dbc, connStr);
     std::printf("transaction test: %s\n", txnOk ? "PASS" : "FAIL");
 
+    std::printf("--- Phase 7: SQLTables ---\n");
+    bool catalogOk = runCatalogTest(dbc, database);
+    std::printf("catalog test: %s\n", catalogOk ? "PASS" : "FAIL");
+
     rc = SQLDisconnect(dbc);
     std::printf("SQLDisconnect rc=%d\n", static_cast<int>(rc));
     printDiag(SQL_HANDLE_DBC, dbc, "dbc");
@@ -739,5 +883,5 @@ int main(int argc, char** argv) {
     SQLFreeHandle(SQL_HANDLE_ENV, env);
     std::printf("done.\n");
     bool disconnectOk = (rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
-    return (disconnectOk && nativeOk && diagOk && bindOk && txnOk) ? 0 : 1;
+    return (disconnectOk && nativeOk && diagOk && bindOk && txnOk && catalogOk) ? 0 : 1;
 }

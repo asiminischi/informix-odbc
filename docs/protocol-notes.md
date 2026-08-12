@@ -707,6 +707,56 @@ parse. A raw byte capture (write the request, then read whatever comes back
 without parsing it) resolves this class of bug in one round trip instead of
 iterating on guessed field counts.
 
+## Catalog functions
+
+**Status: SQLTables done and confirmed live** (`driver/catalog.cpp`) -
+`tools/odbc_dm_probe`'s `runCatalogTest` through the real Driver Manager,
+plus `isql`'s `help` (all tables/views in a live multi-table database,
+correct TABLE_TYPE per row). SQLColumns is not implemented yet - `isql
+help <table>` calls SQLColumns, not SQLTables, and confirmed live to fail
+("Could not SQLColumns") until it lands, not something this pass claims
+to cover.
+
+This isn't a new protocol-level mechanism - it's a SQL query synthesized
+against `systables` and run through the exact same prepare/execute/fetch
+pipeline (`SqliStatement`) every other statement uses, so nothing here
+needed new wire-level work. What's worth recording is Informix SQL
+behavior discovered along the way, not SQLI protocol behavior:
+
+- `systables.owner` is a space-padded fixed-width `CHAR` column, not
+  `VARCHAR` - confirmed live via `owner || '|'` showing padding before the
+  pipe. `systables.tabname` is not padded (already `VARCHAR`).
+- A `CASE` expression's result type is inferred from its widest branch and
+  padded like any other fixed-width `CHAR` - the `CASE` computing
+  TABLE_TYPE (`'TABLE'`/`'VIEW'`/`'SYSTEM TABLE'`) came back padded to 12
+  characters (`'SYSTEM TABLE'`'s width) for shorter results, confirmed the
+  same way. Both are worked around with `trim()` in the generated SQL
+  rather than trimmed in C++ after the fact, since the padding is
+  Informix's doing, not this driver's decode layer doing anything wrong.
+- `tabid <= 99` reliably identifies Informix's own system catalog tables
+  (owner `informix`, `tabtype` `'T'`) as distinct from ordinary user
+  tables with the same `tabtype` - confirmed live across `systables`
+  (`tabid`=1) through `sysxtdtypes` and friends. A few internal pseudo-rows
+  (`" GL_COLLATE"`, `" GL_CTYPE"`, `" VERSION"`) carry a blank `tabtype`
+  and are excluded by the `tabtype in ('T', 'V')` filter rather than
+  surfaced as a table of unknown type.
+- Informix supports derived tables (`FROM (SELECT ...) alias`) - needed
+  because TABLE_TYPE is computed by the inner query and then filtered on
+  by name in the outer one; a single-level `SELECT` can't reference its
+  own column alias in its own `WHERE` clause.
+- Catalog reads deliberately don't open a transaction of their own (no
+  lazy `SQ_BEGIN`, unlike `driver/statement.cpp`'s `doExecute` for
+  DML/SELECT) - confirmed live to work the same under
+  `SQL_ATTR_AUTOCOMMIT_OFF` as under the default `ON`.
+
+Scope: the plain filtering case (`isql help` and ordinary schema
+browsing) - catalog/schema/table-name filtering via `LIKE`,
+table-type filtering via an `IN` list. Not implemented: the ODBC "special
+value" enumeration modes (`CatalogName="%"` alone to list catalogs,
+`SchemaName="%"` alone to list schemas) - see `driver/catalog.cpp`'s top
+comment for why this is a deliberate, documented gap rather than an
+oversight.
+
 ## Open questions / risks
 
 - Whether `has4ByteOffsets()`'s constituent capability bits (see "Narrow vs. wide

@@ -46,6 +46,7 @@ SQLRETURN connectWithAttrs(OdbcConnection& conn, const std::map<std::string, std
     }
     conn.sqli.emplace(std::move(*result));
     conn.connected = true;
+    conn.database = params.database;
     return SQL_SUCCESS;
 }
 

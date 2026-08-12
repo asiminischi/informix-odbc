@@ -12,11 +12,13 @@ the actual unixODBC Driver Manager, not just unit tests. Transactions
 (including `SQLEndTran`/`SQL_ATTR_AUTOCOMMIT` now actually driving
 begin/commit/rollback, not just the underlying primitives) and all 8 MVP
 bind-parameter types are done and confirmed live, including NULL binds
-(fixed two framing/type bugs this pass - see gap 3 below). But large,
-expected pieces of a production ODBC driver are still missing outright:
-catalog functions (`SQLTables`/`SQLColumns`/...), Unicode, Windows driver
-registration, LOBs, and more. See "Gaps to close before production-grade"
-below for the concrete list.
+(fixed two framing/type bugs this pass - see gap 3 below). `SQLTables` is
+done and confirmed live via `isql help` against a real multi-table
+database; `SQLColumns` is next. But large, expected pieces of
+a production ODBC driver are still missing outright: `SQLColumns` and the
+rest of catalog introspection, Unicode, Windows driver registration, LOBs,
+and more. See "Gaps to close before production-grade" below for the
+concrete list.
 
 ## What's done (verified live, not just "compiles")
 
@@ -126,11 +128,26 @@ Roughly in the order they'd bite a real application:
    `SQL_TC_DML` (DML confirmed transactional; DDL-inside-a-transaction
    behavior hasn't been checked, so not claiming `SQL_TC_ALL`/
    `SQL_TC_DDL_COMMIT` yet).
-2. **No catalog functions.** `SQLTables`, `SQLColumns`, `SQLGetTypeInfo`,
-   `SQLPrimaryKeys`, `SQLStatistics`, etc. don't exist. Most real ODBC
-   clients (BI tools, admin GUIs, even some ORM schema-introspection code)
-   need at least `SQLTables`/`SQLColumns` to do anything beyond a
-   hand-typed query.
+2. **Catalog functions: `SQLTables` ~~missing~~ - done; `SQLColumns`/
+   `SQLGetTypeInfo`/`SQLPrimaryKeys`/`SQLStatistics` still missing.**
+   `SQLTables` (`driver/catalog.cpp`) is implemented by synthesizing a SQL
+   query against `systables` and running it through the same prepare/
+   execute/fetch pipeline every other statement uses - confirmed live
+   through the real Driver Manager (`tools/odbc_dm_probe`'s
+   `runCatalogTest`) and `isql`'s `help` against a live multi-table
+   database. `help <table>` calls SQLColumns, not SQLTables, and is
+   confirmed live to still fail until that lands - not something this pass
+   claims to cover. See `docs/protocol-notes.md`'s Catalog functions
+   section for what the live testing surfaced: `systables.owner` and a
+   `CASE` expression's inferred type both turn out to be space-padded
+   fixed-width `CHAR` on this server, worked around with `trim()`. Scoped
+   to the plain filtering case those tools actually use (catalog/schema/
+   table-name `LIKE` patterns, table-type `IN`-list filtering) - the ODBC
+   catalog/schema-listing "special value" enumeration modes are a
+   documented, deliberate gap, not an oversight (see that file's top
+   comment). `SQLColumns` is next; most real ODBC clients (BI tools, admin
+   GUIs, ORM schema-introspection code) need it alongside `SQLTables` to
+   do anything beyond a hand-typed query.
 3. **~~Bind parameters cover N of 8 MVP types~~ - done.** All 8 MVP types
    (`SQL_INTEGER`/`SQL_SMALLINT`/`SQL_BIGINT`/`SQL_CHAR`/`SQL_VARCHAR`/
    `SQL_TYPE_DATE`/`SQL_DECIMAL`/`SQL_TYPE_TIMESTAMP`) are confirmed live
@@ -245,8 +262,8 @@ notes:
 
 ## Suggested next steps, in priority order
 
-1. Catalog functions: `SQLTables`/`SQLColumns` first (unblocks the most
-   client tooling), then `SQLGetTypeInfo`/`SQLPrimaryKeys`/`SQLStatistics`.
+1. `SQLColumns` (`SQLTables` is done), then `SQLGetTypeInfo`/
+   `SQLPrimaryKeys`/`SQLStatistics`.
 2. Windows driver registration (registry helper plus install doc) so the
    native Windows ODBC DM path is actually usable, not just the DLL - the
    transaction work this pass had to fall back to WSL2/unixODBC for its

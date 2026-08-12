@@ -90,6 +90,14 @@ struct OdbcConnection {
     std::optional<ifxsqli::SqliConnection> sqli;
     bool connected = false;
 
+    // The DATABASE= connection-string keyword this connection was opened
+    // with (empty if none was given). SqliConnection itself doesn't retain
+    // it - only driver/connect.cpp's connectWithAttrs sees the parsed
+    // ConnectParams - so it's captured here for driver/catalog.cpp's
+    // SQLTables/SQLColumns, which report it as TABLE_CAT and use it to
+    // recognize a caller asking about a different (unsupported) catalog.
+    std::string database;
+
     // ODBC connection attributes this driver tracks but doesn't yet act on
     // (SQLSetConnectAttr/SQLGetConnectAttr round-trip them so callers that
     // set-then-get don't see a spurious failure - see Phase 4 slice 1 notes
