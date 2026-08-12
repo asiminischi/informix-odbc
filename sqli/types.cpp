@@ -112,6 +112,12 @@ std::expected<std::optional<float>, Error> decodeSmallFloat(std::span<const std:
     return std::bit_cast<float>(bits);
 }
 
+std::vector<std::byte> encodeFloat(double v) { return writeBigEndian<std::int64_t>(std::bit_cast<std::int64_t>(v)); }
+
+std::vector<std::byte> encodeSmallFloat(float v) {
+    return writeBigEndian<std::int32_t>(std::bit_cast<std::int32_t>(v));
+}
+
 std::expected<std::optional<std::string>, Error> decodeChar(std::span<const std::byte> raw) {
     if (raw.empty()) return std::unexpected(Error{ErrorKind::Protocol, "CHAR: empty buffer"});
     if (raw[0] == std::byte{0}) return std::nullopt;

@@ -112,7 +112,7 @@ void check(const char* label, bool condition) {
     }
     auto insertStmt = SqliStatement::prepare(
         *conn, "insert into bind_probe (col_smallint, col_integer, col_bigint, col_date, col_decimal,"
-               " col_datetime) values (?, ?, ?, ?, ?, ?)");
+               " col_datetime, col_float, col_smallfloat) values (?, ?, ?, ?, ?, ?, ?, ?)");
     if (!insertStmt) {
         std::fprintf(stderr, "prepare insert failed: %s\n", insertStmt.error().message.c_str());
         return false;
@@ -120,7 +120,8 @@ void check(const char* label, bool condition) {
     std::vector<BindParam> params2{
         BindParam{ifxtype::kSmallInt, true, {}, 0}, BindParam{ifxtype::kInteger, true, {}, 0},
         BindParam{ifxtype::kBigInt, true, {}, 0},   BindParam{ifxtype::kDate, true, {}, 0},
-        BindParam{ifxtype::kDecimal, true, {}, 0},  BindParam{ifxtype::kDatetime, true, {}, 0}};
+        BindParam{ifxtype::kDecimal, true, {}, 0},  BindParam{ifxtype::kDatetime, true, {}, 0},
+        BindParam{ifxtype::kFloat, true, {}, 0},    BindParam{ifxtype::kSmallFloat, true, {}, 0}};
     if (auto r = insertStmt->execute(params2); !r) {
         std::fprintf(stderr, "execute insert failed: %s\n", r.error().message.c_str());
         return false;
@@ -129,7 +130,8 @@ void check(const char* label, bool condition) {
     if (auto r = insertStmt->release(); !r) return false;
 
     auto selectStmt = SqliStatement::prepare(
-        *conn, "select col_smallint, col_integer, col_bigint, col_date, col_decimal, col_datetime"
+        *conn, "select col_smallint, col_integer, col_bigint, col_date, col_decimal, col_datetime,"
+               " col_float, col_smallfloat"
                " from bind_probe where col_char is null and col_varchar is null");
     if (!selectStmt) {
         std::fprintf(stderr, "prepare select failed: %s\n", selectStmt.error().message.c_str());
@@ -150,13 +152,16 @@ void check(const char* label, bool condition) {
     auto dateVal = decodeDateUnixDays((**row)[3]);
     auto decimalVal = decodeDecimal((**row)[4], 10, 2);
     auto datetimeVal = decodeDatetime((**row)[5], (14u << 8) | 0x0A);
+    auto floatVal = decodeFloat((**row)[6]);
+    auto smallfloatVal = decodeSmallFloat((**row)[7]);
     if (auto r = selectStmt->close(); !r) return false;
     if (auto r = selectStmt->release(); !r) return false;
     if (auto r = conn->executeCommand("delete from bind_probe where col_char is null and col_varchar is null");
         !r)
         return false;
     if (auto r = conn->disconnectOrderly(); !r) return false;
-    if (!smallintVal || !integerVal || !bigintVal || !dateVal || !decimalVal || !datetimeVal) {
+    if (!smallintVal || !integerVal || !bigintVal || !dateVal || !decimalVal || !datetimeVal || !floatVal ||
+        !smallfloatVal) {
         std::fprintf(stderr, "decode failed\n");
         return false;
     }
@@ -166,6 +171,8 @@ void check(const char* label, bool condition) {
     check("NULL bound with real ifxType round-trips (DATE)", !dateVal->has_value());
     check("NULL bound with real ifxType round-trips (DECIMAL)", !decimalVal->has_value());
     check("NULL bound with real ifxType round-trips (DATETIME)", !datetimeVal->has_value());
+    check("NULL bound with real ifxType round-trips (FLOAT)", !floatVal->has_value());
+    check("NULL bound with real ifxType round-trips (SMALLFLOAT)", !smallfloatVal->has_value());
     return true;
 }
 
@@ -182,7 +189,7 @@ void check(const char* label, bool condition) {
     if (auto r = setup->executeCommand(
             "create table bind_probe (col_smallint smallint, col_integer integer, col_bigint bigint,"
             " col_char char(20), col_varchar varchar(32), col_date date, col_decimal decimal(10,2),"
-            " col_datetime datetime year to second)");
+            " col_datetime datetime year to second, col_float float, col_smallfloat smallfloat)");
         !r) {
         std::fprintf(stderr, "create table failed: %s\n", r.error().message.c_str());
         return false;
@@ -198,7 +205,7 @@ void check(const char* label, bool condition) {
         return false;
     }
 
-    auto insertStmt = SqliStatement::prepare(*conn, "insert into bind_probe values (?, ?, ?, ?, ?, ?, ?, ?)");
+    auto insertStmt = SqliStatement::prepare(*conn, "insert into bind_probe values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
     if (!insertStmt) {
         std::fprintf(stderr, "prepare insert failed: %s\n", insertStmt.error().message.c_str());
         return false;
@@ -236,6 +243,8 @@ void check(const char* label, bool condition) {
     params2.push_back(BindParam{ifxtype::kDecimal, false, decimalEncoded->data, decimalEncoded->scale});
     params2.push_back(BindParam{ifxtype::kDatetime, false, *datetimeEncoded,
                                  static_cast<std::uint16_t>(kYearToSecond)});
+    params2.push_back(BindParam{ifxtype::kFloat, false, encodeFloat(3.14159), kFloatBindPrecision});
+    params2.push_back(BindParam{ifxtype::kSmallFloat, false, encodeSmallFloat(2.5f), kSmallFloatBindPrecision});
     if (auto r = insertStmt->execute(params2); !r) {
         std::fprintf(stderr, "execute insert failed: %s\n", r.error().message.c_str());
         return false;
@@ -245,7 +254,8 @@ void check(const char* label, bool condition) {
 
     auto selectStmt = SqliStatement::prepare(*conn,
                                               "select col_smallint, col_integer, col_bigint, col_char, col_varchar,"
-                                              " col_date, col_decimal, col_datetime from bind_probe");
+                                              " col_date, col_decimal, col_datetime, col_float, col_smallfloat"
+                                              " from bind_probe");
     if (!selectStmt) {
         std::fprintf(stderr, "prepare select failed: %s\n", selectStmt.error().message.c_str());
         return false;
@@ -272,8 +282,10 @@ void check(const char* label, bool condition) {
     auto dateVal = decodeDateUnixDays((**row)[5]);
     auto decimalVal = decodeDecimal((**row)[6], 10, 2);
     auto datetimeVal = decodeDatetime((**row)[7], kYearToSecond);
+    auto floatVal = decodeFloat((**row)[8]);
+    auto smallfloatVal = decodeSmallFloat((**row)[9]);
     if (!smallintVal || !integerVal || !bigintVal || !charVal || !varcharVal || !dateVal || !decimalVal ||
-        !datetimeVal) {
+        !datetimeVal || !floatVal || !smallfloatVal) {
         std::fprintf(stderr, "decode failed\n");
         return false;
     }
@@ -292,6 +304,8 @@ void check(const char* label, bool condition) {
                                              (*datetimeVal)->month == 7 && (*datetimeVal)->day == 29 &&
                                              (*datetimeVal)->hour == 12 && (*datetimeVal)->minute == 34 &&
                                              (*datetimeVal)->second == 56);
+    check("bound FLOAT round-trips", floatVal->has_value() && **floatVal == 3.14159);
+    check("bound SMALLFLOAT round-trips", smallfloatVal->has_value() && **smallfloatVal == 2.5f);
 
     if (auto r = selectStmt->close(); !r) return false;
     if (auto r = selectStmt->release(); !r) return false;

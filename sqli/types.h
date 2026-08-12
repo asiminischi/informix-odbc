@@ -68,10 +68,22 @@ struct DatetimeValue {
 // byte packing of Double.doubleToLongBits/Float.floatToIntBits, the same
 // convention as the integer types' plain big-endian encoding above). NULL is
 // all-0xFF bytes (confirmed via IfxFloat/IfxSmallFloat's isIfxNull - notably
-// NOT the MIN_VALUE-bit-pattern convention the integer types use). Bind-side
-// (SQ_BIND/encodeFloat) is not implemented yet - fetch/decode only.
+// NOT the MIN_VALUE-bit-pattern convention the integer types use).
 [[nodiscard]] std::expected<std::optional<double>, Error> decodeFloat(std::span<const std::byte> raw);
 [[nodiscard]] std::expected<std::optional<float>, Error> decodeSmallFloat(std::span<const std::byte> raw);
+
+// SQ_BIND encoders: same plain big-endian IEEE 754 bytes as the TUPLE
+// decoders above (IfxFloat/IfxSmallFloat.toIfx() -> JavaToIfxDouble/
+// JavaToIfxReal, byte-identical to the fetch-direction encoding - unlike
+// DECIMAL/DATETIME). Unlike the hardcoded-constant precision fields for
+// INTEGER/SMALLINT/BIGINT, IfxFloat/IfxSmallFloat don't override
+// getEncodedLength(), so there's no equivalent traced constant - the byte
+// width (8/4) is a first hypothesis pending a live check, same approach
+// that worked for DATE's precisionField.
+[[nodiscard]] std::vector<std::byte> encodeFloat(double v);
+[[nodiscard]] std::vector<std::byte> encodeSmallFloat(float v);
+inline constexpr std::uint16_t kFloatBindPrecision = 8;
+inline constexpr std::uint16_t kSmallFloatBindPrecision = 4;
 
 // Encodes a value for SQ_BIND (a prepared statement's "?" parameters) -
 // confirmed via the decompiled JDBC driver's IfxInteger.toIfx()/
