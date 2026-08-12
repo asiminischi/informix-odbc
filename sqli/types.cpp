@@ -90,6 +90,28 @@ std::expected<std::optional<std::int64_t>, Error> decodeBigInt(std::span<const s
     return v;
 }
 
+std::expected<std::optional<double>, Error> decodeFloat(std::span<const std::byte> raw) {
+    if (raw.size() != 8) return std::unexpected(Error{ErrorKind::Protocol, "FLOAT: expected 8 bytes"});
+    bool allOnes = true;
+    for (auto b : raw) {
+        if (b != std::byte{0xFF}) { allOnes = false; break; }
+    }
+    if (allOnes) return std::nullopt;
+    auto bits = readBigEndian<std::uint64_t>(raw);
+    return std::bit_cast<double>(bits);
+}
+
+std::expected<std::optional<float>, Error> decodeSmallFloat(std::span<const std::byte> raw) {
+    if (raw.size() != 4) return std::unexpected(Error{ErrorKind::Protocol, "SMALLFLOAT: expected 4 bytes"});
+    bool allOnes = true;
+    for (auto b : raw) {
+        if (b != std::byte{0xFF}) { allOnes = false; break; }
+    }
+    if (allOnes) return std::nullopt;
+    auto bits = readBigEndian<std::uint32_t>(raw);
+    return std::bit_cast<float>(bits);
+}
+
 std::expected<std::optional<std::string>, Error> decodeChar(std::span<const std::byte> raw) {
     if (raw.empty()) return std::unexpected(Error{ErrorKind::Protocol, "CHAR: empty buffer"});
     if (raw[0] == std::byte{0}) return std::nullopt;

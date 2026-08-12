@@ -136,6 +136,40 @@ TEST_CASE("BOOLEAN") {
     CHECK(!null->has_value());
 }
 
+TEST_CASE("FLOAT") {
+    // Captured live from a 3-row float_probe fixture (3.14159/-0.001/NULL).
+    auto v = decodeFloat(fromHex("400921f9f01b866e"));
+    REQUIRE(v.has_value());
+    REQUIRE(v->has_value());
+    CHECK(**v == doctest::Approx(3.14159));
+
+    auto v2 = decodeFloat(fromHex("bf50624dd2f1a9fc"));
+    REQUIRE(v2.has_value());
+    REQUIRE(v2->has_value());
+    CHECK(**v2 == doctest::Approx(-0.001));
+
+    auto null = decodeFloat(fromHex("ffffffffffffffff"));
+    REQUIRE(null.has_value());
+    CHECK(!null->has_value());
+}
+
+TEST_CASE("SMALLFLOAT") {
+    // Captured live from the same float_probe fixture (2.5/-100.25/NULL).
+    auto v = decodeSmallFloat(fromHex("40200000"));
+    REQUIRE(v.has_value());
+    REQUIRE(v->has_value());
+    CHECK(**v == doctest::Approx(2.5f));
+
+    auto v2 = decodeSmallFloat(fromHex("c2c88000"));
+    REQUIRE(v2.has_value());
+    REQUIRE(v2->has_value());
+    CHECK(**v2 == doctest::Approx(-100.25f));
+
+    auto null = decodeSmallFloat(fromHex("ffffffff"));
+    REQUIRE(null.has_value());
+    CHECK(!null->has_value());
+}
+
 TEST_CASE("DATE") {
     auto v = decodeDateUnixDays(fromHex("0000b497")); // 2026-07-29, day count 46231
     REQUIRE(v.has_value());

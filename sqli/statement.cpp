@@ -74,10 +74,12 @@ std::expected<std::vector<std::vector<std::byte>>, Error> splitRow(std::span<con
             case ifxtype::kInteger:
             case ifxtype::kSerial:
             case ifxtype::kDate:
+            case ifxtype::kSmallFloat:
                 width = 4;
                 break;
             case ifxtype::kBigInt:
             case ifxtype::kBigSerial:
+            case ifxtype::kFloat:
                 width = 8;
                 break;
             case ifxtype::kVarchar:

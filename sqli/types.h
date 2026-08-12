@@ -21,6 +21,12 @@ namespace ifxtype {
 inline constexpr int kChar = 0;
 inline constexpr int kSmallInt = 1;
 inline constexpr int kInteger = 2;
+// Confirmed live via DESCRIBE against FLOAT/SMALLFLOAT columns - matches
+// the decompiled JDBC driver's ifxType exactly (unlike BOOLEAN). Plain
+// fixed-width IEEE 754 values (IfxFloat/IfxSmallFloat extend IfxObject,
+// not IfxBaseType - no extended-type framing, no SQ_RETURN_TYPE surprise).
+inline constexpr int kFloat = 3;       // 8-byte IEEE 754 double
+inline constexpr int kSmallFloat = 4;  // 4-byte IEEE 754 single
 inline constexpr int kDecimal = 5;
 inline constexpr int kSerial = 6;
 inline constexpr int kDate = 7;
@@ -56,6 +62,16 @@ struct DatetimeValue {
 [[nodiscard]] std::expected<std::optional<std::int16_t>, Error> decodeSmallInt(std::span<const std::byte> raw);
 [[nodiscard]] std::expected<std::optional<std::int32_t>, Error> decodeInteger(std::span<const std::byte> raw);
 [[nodiscard]] std::expected<std::optional<std::int64_t>, Error> decodeBigInt(std::span<const std::byte> raw);
+
+// FLOAT/SMALLFLOAT: plain big-endian IEEE 754 bit pattern (confirmed via the
+// decompiled JavaToIfxType.JavaToIfxDouble/JavaToIfxReal - manual big-endian
+// byte packing of Double.doubleToLongBits/Float.floatToIntBits, the same
+// convention as the integer types' plain big-endian encoding above). NULL is
+// all-0xFF bytes (confirmed via IfxFloat/IfxSmallFloat's isIfxNull - notably
+// NOT the MIN_VALUE-bit-pattern convention the integer types use). Bind-side
+// (SQ_BIND/encodeFloat) is not implemented yet - fetch/decode only.
+[[nodiscard]] std::expected<std::optional<double>, Error> decodeFloat(std::span<const std::byte> raw);
+[[nodiscard]] std::expected<std::optional<float>, Error> decodeSmallFloat(std::span<const std::byte> raw);
 
 // Encodes a value for SQ_BIND (a prepared statement's "?" parameters) -
 // confirmed via the decompiled JDBC driver's IfxInteger.toIfx()/

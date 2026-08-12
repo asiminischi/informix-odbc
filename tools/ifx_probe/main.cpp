@@ -39,6 +39,20 @@ void printColumnValue(const ifxsqli::ColumnDesc& col, std::span<const std::byte>
             std::printf("%lld", static_cast<long long>(**v));
             return;
         }
+        case ifxtype::kFloat: {
+            auto v = decodeFloat(bytes);
+            if (!v) { std::printf("<error: %s>", v.error().message.c_str()); return; }
+            if (!*v) { std::printf("NULL"); return; }
+            std::printf("%g", **v);
+            return;
+        }
+        case ifxtype::kSmallFloat: {
+            auto v = decodeSmallFloat(bytes);
+            if (!v) { std::printf("<error: %s>", v.error().message.c_str()); return; }
+            if (!*v) { std::printf("NULL"); return; }
+            std::printf("%g", static_cast<double>(**v));
+            return;
+        }
         case ifxtype::kChar: {
             auto v = decodeChar(bytes);
             if (!v) { std::printf("<error: %s>", v.error().message.c_str()); return; }
