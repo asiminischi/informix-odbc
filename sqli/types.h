@@ -35,6 +35,12 @@ inline constexpr int kVarchar = 13;
 inline constexpr int kNVarchar = 16;
 inline constexpr int kBigInt = 52;
 inline constexpr int kBigSerial = 53;
+// Confirmed live via DESCRIBE against an INTERVAL YEAR TO MONTH column -
+// matches the decompiled JDBC driver's IfxIntervalYM/IfxIntervalDF exactly
+// (both interval classes share this one wire type code; which class a
+// given column is comes from the qualifier's start/end codes, not the
+// type code). extendedId=0 (a plain scalar, not extended like BOOLEAN).
+inline constexpr int kInterval = 14;
 // Confirmed live via DESCRIBE against a BOOLEAN column - notably not 45,
 // the ifxType the decompiled JDBC driver's IfxBoolean constructor sets
 // (that 45 is a JDBC-level/extended-type rendering code, not the SQLI wire
@@ -299,5 +305,62 @@ struct DecimalBindEncoding {
 // matched on the first live attempt.
 [[nodiscard]] std::expected<std::vector<std::byte>, Error> encodeDatetime(const DatetimeValue& value,
                                                                             std::uint32_t encodedLength);
+
+// Informix INTERVAL(qualifier), YEAR-MONTH class only (qualifier start and
+// end both in {YEAR, MONTH} - i.e. `YEAR TO YEAR`, `YEAR TO MONTH`, or
+// `MONTH TO MONTH`; DAY-FRACTION class, e.g. `DAY TO SECOND`, isn't
+// supported yet). `encodedLength` is packed as (totalDigits << 8) |
+// qualifierByte same as DATETIME's, except totalDigits ("length" in
+// Informix's own terminology) is *not* a fixed per-field digit count -
+// INTERVAL's leading field has a user-declared width of 1-9 digits
+// (`INTERVAL YEAR(4) TO MONTH`), so totalDigits = leadingWidth +
+// (end - start), and leadingWidth has to be recovered by subtracting
+// (end - start) back out.
+//
+// Genuinely different from decodeDatetime despite sharing DECIMAL's packed
+// base-100-digit-pair mantissa byte format: DATETIME is fixed-point (the
+// exponent always marks the same place value, no matter the value), but
+// INTERVAL reuses DECIMAL's *floating* representation outright - leading
+// zero digit-pairs are stripped and the exponent shrinks to match,
+// trailing zero-pairs then pad back out to the qualifier's fixed mantissa
+// width. Confirmed live via two YEAR TO MONTH captures sharing no
+// coincidence: `INTERVAL YEAR(2) TO MONTH` holding 47-07 (leading field
+// already fills its 2-digit width, so no stripping occurs) decoded with
+// exponent 0xC7's biased magnitude matching the *unnormalized* formula
+// `(totalDigits + 10 - end + 1) / 2` directly (mantissa `[47, 7]`); but
+// `INTERVAL YEAR(4) TO MONTH` holding 3-07 (leading field's high digit
+// pair is zero) decoded with a *smaller* exponent than that formula
+// predicts - the leading zero pair was stripped, exponent dropped by
+// exactly 1, and mantissa `[3, 7, 0]` has the stripped pair's slot
+// backfilled with a trailing zero pair rather than left as-is. Un-shifting
+// this (prepending `unnormalizedExponent - actualExponent` zero-pairs then
+// truncating back to the fixed mantissa width) recovers the intended
+// digit string in both cases. Also confirmed for the negative case (same
+// hundred's-complement DECIMAL's negative mantissas use - `decodePackedDigits`
+// with `allowNegative=true`), though only via a plain-text INSERT/SELECT
+// round trip through dbaccess, not yet through this driver's own bind path.
+// Leading-field widths that make totalDigits odd need one more thing:
+// expectedMantissa's ceil(totalDigits/2) rounds up one digit slot too many,
+// and that extra slot is padding at the *front* (most significant), not
+// the back - opposite of decodeDatetime's FRACTION padding, which sits at
+// the very end of the byte stream. Confirmed live via `INTERVAL MONTH(3)
+// TO MONTH` holding 43 (totalDigits=3, so 2 mantissa bytes/4 digit slots):
+// the correct reconstructed field is "043", not "004" - dropping the front
+// slot is what gives the right answer; the initial implementation dropped
+// the back slot and silently produced 4 instead of 43, caught only because
+// this specific case was live-tested rather than assumed from the FRACTION
+// precedent. Also confirmed for the YEAR-anchored, no-month-remainder case
+// (`INTERVAL YEAR(3) TO YEAR` holding 43, i.e. 43 years == 516 months).
+// NULL is all-zero bytes, matching DECIMAL/DATETIME's convention - a
+// genuine zero value is NOT all-zero bytes (confirmed live via `INTERVAL
+// MONTH(3) TO MONTH` holding 0): like DECIMAL's own canonical zero, it's
+// exponent 0x80 (sign bit set, magnitude 0) with an all-zero mantissa. The
+// returned value is total months (negative for a negative interval);
+// MONTH TO MONTH intervals are a single field with no years/months split
+// (confirmed via the decompiled JDBC reference's separate `start == MONTH`
+// branch), YEAR-anchored qualifiers combine years*12 plus any trailing
+// month field.
+[[nodiscard]] std::expected<std::optional<std::int64_t>, Error> decodeIntervalYearMonth(
+    std::span<const std::byte> raw, std::uint32_t encodedLength);
 
 } // namespace ifxsqli

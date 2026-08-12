@@ -100,6 +100,12 @@ std::expected<std::vector<std::vector<std::byte>>, Error> splitRow(std::span<con
                 width = 1 + (totalDigits + 1) / 2;
                 break;
             }
+            case ifxtype::kInterval: {  // 1 exponent byte + mantissa bytes (see decodeIntervalYearMonth)
+                unsigned totalDigits = (col.encodedLength >> 8) & 0xFF;
+                unsigned end = col.encodedLength & 0xF;
+                width = 1 + (totalDigits + (end & 1) + 1) / 2;
+                break;
+            }
             default:
                 return std::unexpected(
                     Error{ErrorKind::Protocol,

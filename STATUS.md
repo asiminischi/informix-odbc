@@ -255,6 +255,27 @@ Roughly in the order they'd bite a real application:
    (truncating, not rounding). See `sqli/types.h`'s decodeDatetime/
    encodeDatetime doc comments and `docs/protocol-notes.md`'s
    DATETIME(qualifier) section for the full byte-level writeup.
+
+   INTERVAL's YEAR-MONTH class (`YEAR TO YEAR`, `YEAR TO MONTH`, `MONTH TO
+   MONTH`) is now done on the fetch side, sqli layer plus
+   `driver/convert.cpp`'s `SQL_C_CHAR` text surface (`sqli::
+   decodeIntervalYearMonth`), confirmed live for all three qualifier shapes
+   and both signs (six wire captures, `tests/sqli/test_types.cpp`). DAY-
+   FRACTION class (`DAY TO SECOND` and similar), bind encoding, and catalog
+   rows remain unimplemented - see item 7 below. INTERVAL turned out to
+   share DECIMAL's exact packed-digit byte format but *not* DATETIME's
+   fixed-point exponent convention - it reuses DECIMAL's floating
+   representation outright (leading zero digit-pairs stripped, exponent
+   shrinks, trailing zero-pairs pad back to the fixed width), which a first
+   pass got wrong before a live capture with a non-full-width leading field
+   (`INTERVAL YEAR(4) TO MONTH` holding `3-07`, where the leading field's
+   high digit-pair is zero) caught it. A second, unrelated gotcha at the
+   odd/even digit-count boundary (`INTERVAL MONTH(3) TO MONTH` holding
+   `43`) needed the padding slot dropped from the front, not the back -
+   opposite of DATETIME FRACTION's own padding convention, and also only
+   caught because that specific qualifier shape got live-tested rather
+   than assumed. See `docs/protocol-notes.md`'s INTERVAL(qualifier)
+   section for the full byte-level writeup.
 4. **No DSN-based connect (`SQLConnect`).** Only `SQLDriverConnect` with an
    explicit keyword string works today. Fine for `isql -k`, but many
    GUI/ODBC-Admin tools default to the DSN path.
@@ -268,9 +289,11 @@ Roughly in the order they'd bite a real application:
    Linux/WSL2 + unixODBC + `isql`.
 6. **No Unicode.** ANSI (`SQL_C_CHAR`) only; no `SQLWCHAR`/`W`-suffixed
    functions.
-7. **Missing scalar types**: INTERVAL and LOBs (BLOB/CLOB/BYTE/TEXT).
-   BOOLEAN, FLOAT/SMALLFLOAT, and DATETIME (including sub-second FRACTION)
-   are fully done, including catalog rows (see item 3 above).
+7. **Missing scalar types**: INTERVAL DAY-FRACTION class, INTERVAL bind
+   encoding and catalog rows (YEAR-MONTH class fetch is done, see item 3
+   above), and LOBs (BLOB/CLOB/BYTE/TEXT). BOOLEAN, FLOAT/SMALLFLOAT, and
+   DATETIME (including sub-second FRACTION) are fully done, including
+   catalog rows.
 8. **No real generated-key retrieval.** The `SQ_INSERTDONE` wire field is
    decoded, but the driver never sends the extra "SGK" request the server
    needs to actually populate it, so every INSERT currently reports a
@@ -324,15 +347,16 @@ write every column type a real database has, and has to actually be
 callable from BOP's own code; catalog-completeness and driver-manager
 polish don't block that.
 
-1. **Remaining scalar types beyond the MVP-8 set - INTERVAL, then LOBs
-   (both bind and fetch sides). BOOLEAN, FLOAT/SMALLFLOAT, and DATETIME
-   (including sub-second FRACTION) are now fully done end to end (bind,
-   fetch, and catalog rows, sqli-layer plus ODBC-layer), each confirmed
-   live - DATETIME/FRACTION through the sqli layer and driver-layer
-   conversions directly (`driver/convert.cpp`/`convert_native.cpp`/
-   `bind_encode.cpp`), not yet through the real Driver Manager, which
-   currently needs the Linux/WSL2 path (see item 5's Windows DM gap) not
-   set up in this environment.**
+1. **Remaining scalar types beyond the MVP-8 set - INTERVAL DAY-FRACTION
+   class plus INTERVAL bind/catalog (YEAR-MONTH class fetch is done), then
+   LOBs (both bind and fetch sides). BOOLEAN, FLOAT/SMALLFLOAT, and
+   DATETIME (including sub-second FRACTION) are fully done end to end
+   (bind, fetch, and catalog rows, sqli-layer plus ODBC-layer). All of
+   this confirmed live - DATETIME/FRACTION and INTERVAL/YEAR-MONTH through
+   the sqli layer and driver-layer conversions directly (`driver/
+   convert.cpp`/`convert_native.cpp`/`bind_encode.cpp`), not yet through
+   the real Driver Manager, which currently needs the Linux/WSL2 path (see
+   item 5's Windows DM gap) not set up in this environment.**
    Blocking: a real Informix database backup/restore tool can't skip
    columns of a type it doesn't support. LOBs in particular are likely to
    need their own multi-message wire handling, not just another entry in

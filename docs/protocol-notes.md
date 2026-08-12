@@ -659,6 +659,74 @@ floating decimal point:
   within YEAR..FRACTION(5) (e.g. `MONTH TO DAY`, `SECOND TO FRACTION(3)`)
   follow the same confirmed mechanism but aren't independently live-tested.
 
+**INTERVAL(qualifier)** — shares DECIMAL's exact packed base-100-digit-pair
+byte format (same exponent-byte-plus-mantissa shape, same hundred's-complement
+negative encoding) but is a genuinely different codec from DATETIME's, not a
+variant of it, confirmed on the fetch side so far for the YEAR-MONTH class
+only (`sqli::decodeIntervalYearMonth`; DAY-FRACTION, e.g. `DAY TO SECOND`,
+isn't implemented yet). `extendedId=0` in DESCRIBE - a plain scalar like
+DECIMAL/DATETIME, not extended like BOOLEAN. Wire type code `14`, shared by
+both interval classes (matches the decompiled JDBC driver's
+`IfxIntervalYM`/`IfxIntervalDF`, which both set ifxType 14 - which class a
+given column is comes from the qualifier's start/end codes, not the type
+code).
+- `encodedLength` is packed the same `(topByte << 8) | qualifierByte` shape
+  DATETIME uses, but `topByte` ("length" in Informix's own terminology)
+  is *not* a fixed per-field digit count the way DATETIME's totalDigits is -
+  INTERVAL's leading field has a user-declared width of 1-9 digits
+  (`INTERVAL YEAR(4) TO MONTH`), so `topByte = leadingWidth + (end - start)`,
+  and `leadingWidth` has to be recovered by subtracting `(end - start)` back
+  out. Confirmed live: `INTERVAL YEAR(4) TO MONTH` → `encodedLength = 0x0602`
+  (topByte 6, qualifier `0x02`, leadingWidth `6-2=4`); `INTERVAL YEAR(2) TO
+  MONTH` → `0x0402` (leadingWidth `4-2=2`); `INTERVAL MONTH(3) TO MONTH` →
+  `0x0322` (start and end both MONTH, leadingWidth `3-0=3`); `INTERVAL
+  YEAR(3) TO YEAR` → `0x0300` (leadingWidth `3-0=3`, no MONTH field at all).
+- Mantissa byte count is `ceil((topByte + (end&1) + 1) / 2)`-shaped (the
+  `(end&1)` term matters once DAY-FRACTION's odd FRACTION end codes are in
+  play; always 0 for YEAR-MONTH's even end codes) - confirmed matching the
+  captured byte counts above (3, 2, 2, and 2 bytes respectively).
+- The genuinely different part from DATETIME: **INTERVAL reuses DECIMAL's
+  floating representation outright**, not DATETIME's fixed-point one -
+  leading zero digit-pairs are stripped and the exponent shrinks to match,
+  then trailing zero-pairs backfill the freed slots to pad back out to the
+  qualifier's fixed mantissa width. This wasn't obvious going in and cost a
+  wrong first guess: `INTERVAL YEAR(2) TO MONTH` holding `47-07` (leading
+  field already fills its 2-digit width, nothing to strip) decoded with
+  exponent `0xC6`'s biased magnitude (`6`) matching the *unnormalized*
+  formula `(topByte + 10 - end + 1) / 2` directly, mantissa `[47, 7]` -  but
+  `INTERVAL YEAR(4) TO MONTH` holding `3-07` (leading field's high digit
+  pair is zero) decoded with the *same* exponent `0xC6` even though its
+  unnormalized formula predicts `7` - the leading zero pair was stripped,
+  and the mantissa `[3, 7, 0]` has the freed slot backfilled with a
+  trailing zero pair rather than left as `[0, 3, 7]`. Un-shifting this
+  (prepending `unnormalizedExp - actualExp` zero-pairs, then truncating
+  back to the fixed mantissa width) recovers the intended digit string.
+- A second, independent gotcha at the same odd/even boundary: when
+  `topByte` is odd, the fixed mantissa width has one more digit slot than
+  there are real digits, and that padding slot sits at the *front* (most
+  significant), not the back - confirmed live via `INTERVAL MONTH(3) TO
+  MONTH` holding `43`: the raw reconstructed 4-digit string is `0043`, and
+  the correct 3-digit field is `043` (`= 43`), not `004` (`= 4`). The
+  initial implementation dropped the back digit instead (reasoning from
+  DATETIME FRACTION's padding, which *is* at the back) and silently
+  produced `4`, caught only because this specific qualifier shape was
+  live-tested rather than assumed.
+- Value semantics, confirmed via the decompiled JDBC reference's separate
+  branches: `MONTH TO MONTH` (`start == MONTH`) is a single field that's
+  already a total-months value, no years/12 split. Any YEAR-anchored
+  qualifier (`start == YEAR`) splits into `years * 12`, plus a trailing
+  `MONTH` field's remainder if `end == MONTH`. Confirmed live for all three
+  qualifier shapes (`YEAR TO YEAR`, `YEAR TO MONTH`, `MONTH TO MONTH`) and
+  both signs (six total captures - see `tests/sqli/test_types.cpp`'s
+  `INTERVAL YEAR TO MONTH` test for the exact bytes).
+- Confirmed live for `sqli::decodeIntervalYearMonth`'s caller in
+  `driver/convert.cpp` too (`SQL_C_CHAR` text fetch, e.g. "3-07" - matching
+  Informix's own `dbaccess` display, not ISO 8601), checked directly
+  against the same captured bytes without a live connection (see
+  `docs/protocol-notes.md`'s Windows ODBC DM note above for why). DAY-
+  FRACTION class, bind encoding, and catalog rows (`SQLColumns`/
+  `SQLGetTypeInfo`) are all still open.
+
 Both algorithms are implemented in `sqli/types.cpp` (`decodeDecimal`,
 `decodeDatetime`), with round-trip unit tests in `tests/sqli/test_types.cpp`
 reproducing the exact captured bytes above, and exercised live end-to-end via
@@ -839,9 +907,11 @@ documented gaps rather than oversights.
   TUPLE/FETCH negotiate differently.
 - DATETIME FRACTION (sub-second precision) is now supported (`YEAR TO
   FRACTION(5)` confirmed live, decode and bind - see the DATETIME(qualifier)
-  section above). INTERVAL remains an open question: it reuses
-  DECIMAL/DATETIME-style packed digits but *can* be negative (unlike
-  DATETIME) — entirely unverified, out of MVP scope.
+  section above). INTERVAL's YEAR-MONTH class is now supported on the fetch
+  side (see the INTERVAL(qualifier) section above); DAY-FRACTION class
+  (`DAY TO SECOND` and similar) remains open - it reuses the same packed
+  digits but with day/hour/minute/second/fraction field decomposition
+  instead of a single months value, entirely unverified.
 - DECIMAL/DATETIME qualifiers outside what's been directly tested (precision
   other than 10, qualifiers other than YEAR TO SECOND/YEAR TO FRACTION(5))
   are handled by a general formula derived from - and consistent with - the

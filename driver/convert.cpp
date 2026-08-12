@@ -45,6 +45,20 @@ std::string formatFloat(float f) {
     return buf;
 }
 
+// Matches Informix's own text rendering (dbaccess's display of the same
+// value, e.g. "3-07" or "-3-07"), not ISO 8601 - months is always shown
+// zero-padded to 2 digits regardless of whether the qualifier includes a
+// MONTH field (YEAR TO YEAR intervals decode with months%12 == 0, which
+// still prints as "-00").
+std::string formatIntervalYearMonth(std::int64_t months) {
+    bool negative = months < 0;
+    if (negative) months = -months;
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%s%lld-%02lld", negative ? "-" : "", static_cast<long long>(months / 12),
+                  static_cast<long long>(months % 12));
+    return buf;
+}
+
 } // namespace
 
 std::expected<CellText, ifxsqli::Error> formatCellAsText(const ifxsqli::ColumnDesc& col,
@@ -121,6 +135,14 @@ std::expected<CellText, ifxsqli::Error> formatCellAsText(const ifxsqli::ColumnDe
             if (!v) return std::unexpected(v.error());
             if (!*v) return CellText{true, {}};
             return CellText{false, formatFloat(**v)};
+        }
+        case ifxtype::kInterval: {
+            // decodeIntervalYearMonth itself rejects DAY-FRACTION-class
+            // qualifiers (not yet supported) with a clean protocol error.
+            auto v = decodeIntervalYearMonth(raw, col.encodedLength);
+            if (!v) return std::unexpected(v.error());
+            if (!*v) return CellText{true, {}};
+            return CellText{false, formatIntervalYearMonth(**v)};
         }
         default:
             return std::unexpected(

@@ -377,3 +377,103 @@ TEST_CASE("DATETIME YEAR TO FRACTION(5) bind encoding") {
     CHECK((*decoded)->fraction == 12345);
     CHECK((*decoded)->fractionDigits == 5);
 }
+
+TEST_CASE("INTERVAL YEAR TO MONTH") {
+    // Four live wire captures (IFX_SQLI_TRACE) via ifx_probe against
+    // throwaway fixture tables, covering every YEAR-MONTH-class qualifier
+    // shape and both signs:
+
+    // INTERVAL YEAR(4) TO MONTH holding 3-07 (3 years, 7 months): the
+    // leading field's high digit-pair is zero, so the wire's floating
+    // representation strips it - exponent 0xC6's biased magnitude (6) is
+    // one less than the unnormalized formula's 7 (see types.h's doc
+    // comment for the exact math), and the mantissa's freed slot is
+    // backfilled with a trailing zero pair: [3,7,0], not the naive
+    // [0,3,7].
+    {
+        constexpr std::uint32_t kEncLen = (6u << 8) | 0x02; // totalDigits=6, YEAR(0) to MONTH(2)
+        auto v = decodeIntervalYearMonth(fromHex("c6 03 07 00"), kEncLen);
+        REQUIRE(v.has_value());
+        REQUIRE(v->has_value());
+        CHECK(**v == 43); // 3*12 + 7
+    }
+    // Same qualifier and magnitude, negative: hundred's-complement decodes
+    // to the identical digit array and exponent as the positive case above
+    // (confirmed live - this is what the sign bit alone should flip).
+    {
+        constexpr std::uint32_t kEncLen = (6u << 8) | 0x02;
+        auto v = decodeIntervalYearMonth(fromHex("39 60 5d 00"), kEncLen);
+        REQUIRE(v.has_value());
+        REQUIRE(v->has_value());
+        CHECK(**v == -43);
+    }
+    // INTERVAL YEAR(2) TO MONTH holding 47-07: the leading field (47)
+    // fills its full 2-digit width, so no stripping occurs - exponent's
+    // biased magnitude matches the unnormalized formula directly, and the
+    // mantissa is the field values as-is: [47, 7].
+    {
+        constexpr std::uint32_t kEncLen = (4u << 8) | 0x02; // totalDigits=4, YEAR(0) to MONTH(2)
+        auto v = decodeIntervalYearMonth(fromHex("c6 2f 07"), kEncLen);
+        REQUIRE(v.has_value());
+        REQUIRE(v->has_value());
+        CHECK(**v == 571); // 47*12 + 7
+    }
+    // INTERVAL MONTH(3) TO MONTH holding 43: a single total-months field,
+    // no years/12 split (the decompiled reference's separate start==MONTH
+    // branch). totalDigits=3 is odd - this is the case that caught a real
+    // bug: the extra padding digit slot from ceil(3/2)*2=4 raw digits has
+    // to be dropped from the *front* ("043" -> 43), not the back ("004"
+    // -> 4, wrong).
+    {
+        constexpr std::uint32_t kEncLen = (3u << 8) | 0x22; // totalDigits=3, MONTH(2) to MONTH(2)
+        auto v = decodeIntervalYearMonth(fromHex("c5 2b 00"), kEncLen);
+        REQUIRE(v.has_value());
+        REQUIRE(v->has_value());
+        CHECK(**v == 43);
+    }
+    {
+        constexpr std::uint32_t kEncLen = (3u << 8) | 0x22;
+        auto v = decodeIntervalYearMonth(fromHex("3a 39 00"), kEncLen);
+        REQUIRE(v.has_value());
+        REQUIRE(v->has_value());
+        CHECK(**v == -43);
+    }
+    // INTERVAL YEAR(3) TO YEAR holding 43 (years, no month remainder field
+    // at all - end==YEAR not MONTH) = 516 months. Also odd totalDigits,
+    // confirming the front-padding fix generalizes beyond MONTH TO MONTH.
+    {
+        constexpr std::uint32_t kEncLen = (3u << 8) | 0x00; // totalDigits=3, YEAR(0) to YEAR(0)
+        auto v = decodeIntervalYearMonth(fromHex("c6 2b 00"), kEncLen);
+        REQUIRE(v.has_value());
+        REQUIRE(v->has_value());
+        CHECK(**v == 516); // 43*12
+    }
+    // A genuine zero value, distinct from NULL: like DECIMAL, INTERVAL's
+    // canonical zero is exponent 0x80 (sign bit set, magnitude 0) with an
+    // all-zero mantissa, not all-zero bytes - confirmed live via `INTERVAL
+    // MONTH(3) TO MONTH` holding 0. Worth checking explicitly: the
+    // all-zero-bytes NULL check below could otherwise have silently
+    // swallowed a real zero if this convention didn't hold.
+    {
+        constexpr std::uint32_t kEncLen = (3u << 8) | 0x22; // totalDigits=3, MONTH(2) to MONTH(2)
+        auto v = decodeIntervalYearMonth(fromHex("80 00 00"), kEncLen);
+        REQUIRE(v.has_value());
+        REQUIRE(v->has_value());
+        CHECK(**v == 0);
+    }
+    // Multi-pair stripping: INTERVAL YEAR(4) TO MONTH holding 0-05 (zero
+    // years, both leading digit-pairs zero) - a bigger un-normalization
+    // shift than the single-pair case above, confirmed to still land on
+    // the right digits.
+    {
+        constexpr std::uint32_t kEncLen = (6u << 8) | 0x02; // totalDigits=6, YEAR(0) to MONTH(2)
+        auto v = decodeIntervalYearMonth(fromHex("c5 05 00 00"), kEncLen);
+        REQUIRE(v.has_value());
+        REQUIRE(v->has_value());
+        CHECK(**v == 5);
+    }
+
+    auto null = decodeIntervalYearMonth(fromHex("00 00 00 00"), (6u << 8) | 0x02);
+    REQUIRE(null.has_value());
+    CHECK(!null->has_value());
+}

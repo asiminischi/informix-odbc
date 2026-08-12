@@ -516,4 +516,81 @@ std::expected<std::vector<std::byte>, Error> encodeDatetime(const DatetimeValue&
     return data;
 }
 
+std::expected<std::optional<std::int64_t>, Error> decodeIntervalYearMonth(std::span<const std::byte> raw,
+                                                                             std::uint32_t encodedLength) {
+    unsigned totalDigits = (encodedLength >> 8) & 0xFF;
+    unsigned qualifierByte = encodedLength & 0xFF;
+    unsigned start = (qualifierByte >> 4) & 0xF;
+    unsigned end = qualifierByte & 0xF;
+
+    if (start > end || end > 2) {
+        return std::unexpected(Error{ErrorKind::Protocol, "INTERVAL: not a YEAR-MONTH class qualifier"});
+    }
+    unsigned leadingWidth = totalDigits - (end - start);
+    if (leadingWidth < 1 || leadingWidth > 9) {
+        return std::unexpected(Error{ErrorKind::Protocol, "INTERVAL: malformed qualifier byte"});
+    }
+
+    std::size_t expectedMantissa = (totalDigits + (end & 1) + 1) / 2;
+    if (raw.size() != 1 + expectedMantissa) {
+        return std::unexpected(Error{ErrorKind::Protocol, "INTERVAL: buffer size doesn't match qualifier"});
+    }
+
+    int sign = 0, trueExp = 0;
+    auto digitsR = decodePackedDigits(raw, /*allowNegative=*/true, &sign, &trueExp);
+    if (!digitsR) return std::unexpected(digitsR.error());
+    if (!*digitsR) return std::nullopt;
+    const auto& digits = **digitsR;
+
+    // Un-normalize: unlike DATETIME, INTERVAL reuses DECIMAL's *floating*
+    // representation - leading zero digit-pairs may have been stripped
+    // (exponent shrinking to match) and the freed slots backfilled with
+    // trailing zero-pairs. unnormalizedExp is what the exponent would be
+    // with nothing stripped (see this function's doc comment in
+    // sqli/types.h for the live capture that confirmed this); the
+    // difference from the actual exponent is how many zero-pairs to
+    // restore at the front before truncating back to the fixed width.
+    int unnormalizedExp = (static_cast<int>(totalDigits) + 10 - static_cast<int>(end) + 1) / 2;
+    int shift = unnormalizedExp - trueExp;
+    if (shift < 0) {
+        return std::unexpected(Error{ErrorKind::Protocol, "INTERVAL: exponent exceeds qualifier width"});
+    }
+    std::vector<int> fullPairs(static_cast<std::size_t>(shift), 0);
+    fullPairs.insert(fullPairs.end(), digits.begin(), digits.end());
+    fullPairs.resize(expectedMantissa, 0);
+
+    std::string digitStr;
+    digitStr.reserve(fullPairs.size() * 2);
+    for (int d : fullPairs) {
+        digitStr += static_cast<char>('0' + d / 10);
+        digitStr += static_cast<char>('0' + d % 10);
+    }
+    // When totalDigits is odd, expectedMantissa's 2 digits/pair rounds up
+    // one slot too many - drop it from the front (most significant), not
+    // the back: confirmed live via `INTERVAL MONTH(3) TO MONTH` holding
+    // 43 (totalDigits=3, 2 mantissa bytes -> 4 raw digit slots), where the
+    // correct 3-digit field value is "043", not "004".
+    digitStr = digitStr.substr(digitStr.size() - totalDigits);
+
+    auto parseDigits = [](std::string_view s) {
+        std::int64_t v = 0;
+        for (char c : s) v = v * 10 + (c - '0');
+        return v;
+    };
+
+    std::int64_t months;
+    if (start == 2) {
+        // MONTH TO MONTH: a single field that's already a total-months
+        // value, not years - the decompiled reference's separate branch
+        // for this case (no years/12 split).
+        months = parseDigits(digitStr);
+    } else {
+        std::int64_t years = parseDigits(std::string_view(digitStr).substr(0, leadingWidth));
+        months = years * 12;
+        if (end == 2) months += parseDigits(std::string_view(digitStr).substr(leadingWidth, 2));
+    }
+    if (sign < 0) months = -months;
+    return months;
+}
+
 } // namespace ifxsqli
