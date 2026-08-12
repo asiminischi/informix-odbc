@@ -96,6 +96,15 @@ struct OdbcConnection {
     // in the plan for why this matters for a clean DM handshake).
     SQLUINTEGER autoCommit = SQL_AUTOCOMMIT_ON;
     SQLUINTEGER loginTimeoutSec = 0;
+
+    // True between a lazily-issued SQ_BEGIN (see driver/statement.cpp's
+    // doExecute, which opens one on the first statement after autocommit
+    // was turned off, or after the previous SQLEndTran) and the matching
+    // SQ_CMMTWORK/SQ_RBWORK. Always false while autoCommit is
+    // SQL_AUTOCOMMIT_ON - see driver/transaction.cpp's SQLEndTran and
+    // driver/connect.cpp's SQLSetConnectAttr/SQLDisconnect for the other
+    // three places this gets resolved.
+    bool transactionOpen = false;
 };
 
 // A statement's lifecycle, mirroring what the ODBC spec calls "prepared"

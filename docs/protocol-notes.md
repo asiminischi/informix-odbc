@@ -673,6 +673,29 @@ This is the same tag `disconnectOrderly` already tolerates around `SQ_EXIT`,
 now confirmed to also lead the reply to all three transaction-control
 opcodes specifically (not just as a drain-before-close heuristic).
 
+**ODBC-layer wiring** (`SQLEndTran`/`SQL_ATTR_AUTOCOMMIT`, `driver/`, not the
+protocol layer above): confirmed live through the real Driver Manager
+(`tools/odbc_dm_probe`'s `runTransactionTest`, run via WSL2/unixODBC - the
+native Windows DM refuses to load this driver at all without registry
+registration, a separate, pre-existing, unrelated gap - see `STATUS.md`).
+`driver/statement.cpp`'s `doExecute` lazily issues `SQ_BEGIN` on the first
+statement after `SQL_ATTR_AUTOCOMMIT` goes off; `SQLEndTran` calls the
+matching commit/rollback; turning autocommit back on commits whatever's
+open; `SQLDisconnect` rolls back anything left unresolved. One specific
+question worth recording since it wasn't obvious which way it would go:
+**a commit does not close an already-open SELECT cursor** on this server -
+this driver never declares cursors `WITH HOLD`, so a server-side close on
+commit was plausible (and would have desynced the next fetch the same way
+this project's other framing bugs have), but fetching more rows after
+`SQLEndTran(SQL_COMMIT)` on a statement with an open cursor keeps working
+with no client-side state reset needed. Getting this far through
+unixODBC's Driver Manager also required two unrelated fixes:
+`driver/info.cpp`'s `SQLGetFunctions` had never listed `SQL_API_SQLENDTRAN`
+as implemented, and `SQLGetInfo(SQL_TXN_CAPABLE)` still reported
+`SQL_TC_NONE` from before any transaction support existed - unixODBC
+checks both before it will even attempt to call `SQLEndTran`, returning
+`IM001` itself without reaching this driver's code at all otherwise.
+
 **Debugging note for future protocol work**: when a live round-trip hangs
 with no error on either side, check `onstat -g ses` / `onstat -g sql <sid>`
 on the server before guessing at another reply shape: an idle server thread

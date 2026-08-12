@@ -11,6 +11,7 @@ add_library(ifxodbc SHARED
   bind_encode.cpp
   statement.cpp
   stmt_attr.cpp
+  transaction.cpp
 )
 
 target_include_directories(ifxodbc PRIVATE ${CMAKE_SOURCE_DIR})

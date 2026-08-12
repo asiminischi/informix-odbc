@@ -76,7 +76,18 @@ IFXODBC_EXPORT SQLRETURN SQL_API SQLGetInfo(SQLHDBC ConnectionHandle, SQLUSMALLI
         case SQL_CATALOG_NAME_SEPARATOR:
             return writeString(InfoValuePtr, BufferLength, StringLengthPtr, ".");
         case SQL_TXN_CAPABLE:
-            return writeNumeric<SQLUSMALLINT>(InfoValuePtr, StringLengthPtr, SQL_TC_NONE);
+            // SQL_TC_DML, not SQL_TC_ALL/SQL_TC_DDL_COMMIT: SQ_BEGIN/
+            // SQ_CMMTWORK/SQ_RBWORK are confirmed live for DML statements
+            // (see docs/protocol-notes.md's Transactions section), but
+            // whether DDL inside an open transaction behaves the way any
+            // of the SQL_TC_DDL_* values promise hasn't been checked.
+            // Was SQL_TC_NONE before SQLEndTran existed - left at NONE
+            // this long was itself a bug once transactions were wired up:
+            // unixODBC's Driver Manager consults this (together with
+            // SQLGetFunctions) before it will even attempt to call
+            // SQLEndTran, and returns IM001 itself without reaching this
+            // driver's code at all if it's NONE.
+            return writeNumeric<SQLUSMALLINT>(InfoValuePtr, StringLengthPtr, SQL_TC_DML);
         case SQL_GETDATA_EXTENSIONS:
             return writeNumeric<SQLUINTEGER>(InfoValuePtr, StringLengthPtr, 0);
         case SQL_MAX_COLUMN_NAME_LEN:
@@ -114,6 +125,7 @@ IFXODBC_EXPORT SQLRETURN SQL_API SQLGetFunctions(SQLHDBC ConnectionHandle, SQLUS
         SQL_API_SQLBINDCOL,         SQL_API_SQLFETCH,           SQL_API_SQLGETDATA,
         SQL_API_SQLFREESTMT,        SQL_API_SQLROWCOUNT,        SQL_API_SQLSETSTMTATTR,
         SQL_API_SQLGETSTMTATTR,     SQL_API_SQLCANCEL,          SQL_API_SQLBINDPARAMETER,
+        SQL_API_SQLENDTRAN,
     };
     auto isImplemented = [](SQLUSMALLINT id) {
         for (auto f : kImplemented) {

@@ -7,15 +7,16 @@ as part of writing this report; see "How this was verified" below).
 
 This is a working prototype, not a production-grade driver yet. The protocol
 layer and a real ODBC surface both round-trip correctly against a live
-Informix server today, confirmed via `isql` through the actual unixODBC
-Driver Manager, not just unit tests. Transactions and all 8 MVP
+Informix server today, confirmed via `isql`/`tools/odbc_dm_probe` through
+the actual unixODBC Driver Manager, not just unit tests. Transactions
+(including `SQLEndTran`/`SQL_ATTR_AUTOCOMMIT` now actually driving
+begin/commit/rollback, not just the underlying primitives) and all 8 MVP
 bind-parameter types are done and confirmed live, including NULL binds
-(fixed two framing/type bugs this pass - see gap 3 below). But large, expected pieces
-of a production ODBC driver are still missing outright: `SQLEndTran` isn't
-wired to the now-working transaction primitive yet, catalog functions
-(`SQLTables`/`SQLColumns`/...), Unicode, Windows driver registration, LOBs,
-and more. See "Gaps to close before production-grade" below for the concrete
-list.
+(fixed two framing/type bugs this pass - see gap 3 below). But large,
+expected pieces of a production ODBC driver are still missing outright:
+catalog functions (`SQLTables`/`SQLColumns`/...), Unicode, Windows driver
+registration, LOBs, and more. See "Gaps to close before production-grade"
+below for the concrete list.
 
 ## What's done (verified live, not just "compiles")
 
@@ -91,17 +92,40 @@ testing.
 
 Roughly in the order they'd bite a real application:
 
-1. **`SQLEndTran` not wired up yet.** The protocol-layer primitive is done:
-   `SqliConnection::beginTransaction`/`commitTransaction`/`rollbackTransaction`
-   (`SQ_BEGIN`/`SQ_CMMTWORK`/`SQ_RBWORK`) are implemented and confirmed live
-   (see `docs/protocol-notes.md`'s Transactions section) - a row inserted
-   inside a transaction and rolled back is invisible even to the same
-   connection, and a committed row is visible from a separate connection.
-   What's still missing is the ODBC entry point itself: `SQLEndTran` doesn't
-   call any of this yet, and there's no driver-managed transaction boundary
-   (autocommit state, `SQL_ATTR_AUTOCOMMIT`) tying connection lifecycle to
-   these calls. Every statement is still effectively auto-committed by the
-   server's own default behavior until that wiring exists.
+1. **~~`SQLEndTran` not wired up yet~~ - done.** `SQLEndTran(SQL_HANDLE_DBC, ...)`
+   is implemented (`driver/transaction.cpp`), and `SQL_ATTR_AUTOCOMMIT`
+   actually changes behavior instead of just being round-tripped:
+   `driver/statement.cpp`'s `doExecute` lazily opens a transaction
+   (`SQ_BEGIN`) on the first statement after autocommit goes off, turning
+   autocommit back on commits whatever's currently open
+   (`driver/connect.cpp`'s `SQLSetConnectAttr`), and `SQLDisconnect` rolls
+   back an unresolved transaction rather than leaving the server to decide.
+   Confirmed live through the real Driver Manager (`tools/odbc_dm_probe`,
+   run via WSL2/unixODBC - see that tool's `runTransactionTest`), not just
+   the sqli layer: rollback via `SQLEndTran` leaves the row invisible on
+   the same connection, commit makes it visible from a separate connection,
+   and the autocommit OFF -> ON transition commits an in-flight insert.
+   Also checked live what a commit does to an already-open SELECT cursor
+   (this driver never declares cursors `WITH HOLD`, so a server-side close
+   was plausible) - it survives: fetching more rows after
+   `SQLEndTran(SQL_COMMIT)` on a statement with an open cursor keeps
+   working, no explicit cursor-state reset needed in the driver.
+   `SQLEndTran(SQL_HANDLE_ENV, ...)` (commit/rollback every connection
+   under an environment) isn't implemented - this driver has no
+   env-to-connections index to walk - and returns HYC00 rather than
+   silently no-opping.
+
+   Getting this working through unixODBC's Driver Manager surfaced two
+   bugs unrelated to the transaction logic itself, both now fixed:
+   `driver/info.cpp`'s `SQLGetFunctions` never listed `SQL_API_SQLENDTRAN`
+   as implemented, and `SQLGetInfo(SQL_TXN_CAPABLE)` still reported
+   `SQL_TC_NONE` (a leftover from before any transaction support existed) -
+   unixODBC checks both before it will even attempt to call `SQLEndTran`,
+   and returned `IM001` ("driver does not support this function") itself
+   without ever reaching this driver's code. `SQL_TXN_CAPABLE` is now
+   `SQL_TC_DML` (DML confirmed transactional; DDL-inside-a-transaction
+   behavior hasn't been checked, so not claiming `SQL_TC_ALL`/
+   `SQL_TC_DDL_COMMIT` yet).
 2. **No catalog functions.** `SQLTables`, `SQLColumns`, `SQLGetTypeInfo`,
    `SQLPrimaryKeys`, `SQLStatistics`, etc. don't exist. Most real ODBC
    clients (BI tools, admin GUIs, even some ORM schema-introspection code)
@@ -221,22 +245,21 @@ notes:
 
 ## Suggested next steps, in priority order
 
-1. Wire `SQLEndTran` to the now-confirmed `SqliConnection::beginTransaction`/
-   `commitTransaction`/`rollbackTransaction`, plus `SQL_ATTR_AUTOCOMMIT`
-   handling.
-2. Catalog functions: `SQLTables`/`SQLColumns` first (unblocks the most
+1. Catalog functions: `SQLTables`/`SQLColumns` first (unblocks the most
    client tooling), then `SQLGetTypeInfo`/`SQLPrimaryKeys`/`SQLStatistics`.
-3. Windows driver registration (registry helper plus install doc) so the
-   native Windows ODBC DM path is actually usable, not just the DLL.
-4. Remaining scalar types beyond the MVP-8 set (FLOAT/SMALLFLOAT/BOOLEAN/
+2. Windows driver registration (registry helper plus install doc) so the
+   native Windows ODBC DM path is actually usable, not just the DLL - the
+   transaction work this pass had to fall back to WSL2/unixODBC for its
+   real-Driver-Manager verification for the same pre-existing reason.
+3. Remaining scalar types beyond the MVP-8 set (FLOAT/SMALLFLOAT/BOOLEAN/
    INTERVAL, sub-second DATETIME), then LOBs - both bind and fetch sides.
-5. Unicode (`SQLWCHAR`) support.
-7. SSL and PAM auth.
-8. Thread-safety pass plus connection pooling.
-9. Installer packaging for both platforms.
-10. Broaden `SQLGetInfo`/`SQLGetFunctions` and the SQLSTATE table against a
-    real ODBC conformance trace rather than "whatever `isql` happened to
-    need."
+4. Unicode (`SQLWCHAR`) support.
+5. SSL and PAM auth.
+6. Thread-safety pass plus connection pooling.
+7. Installer packaging for both platforms.
+8. Broaden `SQLGetInfo`/`SQLGetFunctions` and the SQLSTATE table against a
+   real ODBC conformance trace rather than "whatever `isql` happened to
+   need."
 
 See [`docs/production-plan.md`](docs/production-plan.md) for a phased plan
 to close these gaps.

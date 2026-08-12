@@ -229,6 +229,19 @@ SQLRETURN doExecute(OdbcStatement* s) {
         postDriverError(s->diag, "HY010", "function sequence error: statement is not prepared");
         return SQL_ERROR;
     }
+    // Lazily opens a transaction on the first statement since the last
+    // commit/rollback/connect, matching ODBC's manual-commit contract: the
+    // application never calls anything to *start* a transaction, only
+    // SQLEndTran to end one - see driver/handles.h's transactionOpen doc
+    // comment for the other three places this state gets resolved.
+    if (s->conn->autoCommit == SQL_AUTOCOMMIT_OFF && !s->conn->transactionOpen) {
+        auto begin = s->conn->sqli->beginTransaction();
+        if (!begin) {
+            postSqliError(s->diag, begin.error());
+            return SQL_ERROR;
+        }
+        s->conn->transactionOpen = true;
+    }
     auto params = buildBindParams(s);
     if (!params) return SQL_ERROR;
     auto result = s->stmt->execute(*params);

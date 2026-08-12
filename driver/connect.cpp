@@ -91,9 +91,30 @@ IFXODBC_EXPORT SQLRETURN SQL_API SQLSetConnectAttr(SQLHDBC ConnectionHandle, SQL
     conn->diag.clear();
 
     switch (Attribute) {
-        case SQL_ATTR_AUTOCOMMIT:
-            conn->autoCommit = static_cast<SQLUINTEGER>(reinterpret_cast<std::intptr_t>(ValuePtr));
+        case SQL_ATTR_AUTOCOMMIT: {
+            auto newValue = static_cast<SQLUINTEGER>(reinterpret_cast<std::intptr_t>(ValuePtr));
+            // Per the ODBC spec: turning autocommit back on commits
+            // whatever transaction is currently open, rather than leaving
+            // it dangling with no way left to end it (SQLEndTran would
+            // still work, but a caller that just asked for autocommit
+            // semantics shouldn't have to know that). No-op if nothing is
+            // open, which covers both "was already autocommit" and "was
+            // manual-commit but hadn't executed a statement yet."
+            if (newValue == SQL_AUTOCOMMIT_ON && conn->transactionOpen) {
+                if (!conn->connected || !conn->sqli) {
+                    postDriverError(conn->diag, "08003", "connection not open");
+                    return SQL_ERROR;
+                }
+                auto r = conn->sqli->commitTransaction();
+                conn->transactionOpen = false;
+                if (!r) {
+                    postSqliError(conn->diag, r.error());
+                    return SQL_ERROR;
+                }
+            }
+            conn->autoCommit = newValue;
             return SQL_SUCCESS;
+        }
         case SQL_ATTR_LOGIN_TIMEOUT:
             conn->loginTimeoutSec = static_cast<SQLUINTEGER>(reinterpret_cast<std::intptr_t>(ValuePtr));
             return SQL_SUCCESS;
@@ -189,6 +210,17 @@ IFXODBC_EXPORT SQLRETURN SQL_API SQLDisconnect(SQLHDBC ConnectionHandle) {
     if (!conn->connected || !conn->sqli) {
         postDriverError(conn->diag, "08003", "connection not open");
         return SQL_ERROR;
+    }
+
+    // An unresolved manual-commit transaction shouldn't be left for the
+    // server to decide about on its own - roll it back explicitly so
+    // disconnecting has the same "nothing half-applied" guarantee
+    // regardless of autocommit mode. Best-effort: a failed rollback here
+    // doesn't block the disconnect itself, since there would be no way to
+    // retry it afterward anyway.
+    if (conn->transactionOpen) {
+        (void)conn->sqli->rollbackTransaction();
+        conn->transactionOpen = false;
     }
 
     auto result = conn->sqli->disconnectOrderly();

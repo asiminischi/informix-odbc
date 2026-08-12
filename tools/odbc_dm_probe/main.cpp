@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -373,7 +374,242 @@ bool runBindParamTest(SQLHDBC dbc) {
     expectEq("fetched value == -7", fetchedInd != SQL_NULL_DATA && fetchedValue == -7);
 
     SQLFreeHandle(SQL_HANDLE_STMT, selStmt);
+
+    // NULL bound ahead of another parameter, through the real ODBC surface
+    // via SQLBindParameter/SQL_NULL_DATA rather than a hand-built
+    // sqli::BindParam - the two driver-layer pieces added alongside the
+    // sqli::writeBindBlock framing fix (buildBindParams' isNull branch,
+    // ifxTypeForParameterType) had no coverage through SQLBindParameter
+    // itself yet; this closes that gap. Also re-proves the framing fix
+    // live at this layer, not just sqli's own integration test.
+    ok &= execDirect(dbc, "drop table if exists null_order_probe");
+    ok &= execDirect(dbc, "create table null_order_probe (col_smallint smallint, col_integer integer)");
+    SQLHSTMT nullOrderStmt = SQL_NULL_HSTMT;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &nullOrderStmt);
+    const char* nullOrderSql = "insert into null_order_probe (col_smallint, col_integer) values (?, ?)";
+    rc = SQLPrepare(nullOrderStmt, reinterpret_cast<SQLCHAR*>(const_cast<char*>(nullOrderSql)), SQL_NTS);
+    expectEq("SQLPrepare(null_order_probe insert) succeeds", rc == SQL_SUCCESS);
+
+    SQLSMALLINT nullParamPlaceholder = 0;
+    SQLLEN nullInd = SQL_NULL_DATA;
+    rc = SQLBindParameter(nullOrderStmt, 1, SQL_PARAM_INPUT, SQL_C_SSHORT, SQL_SMALLINT, 0, 0, &nullParamPlaceholder,
+                           0, &nullInd);
+    expectEq("SQLBindParameter(1, NULL smallint) succeeds", rc == SQL_SUCCESS);
+    SQLINTEGER nullOrderIntVal = 99;
+    SQLLEN nullOrderIntInd = 0;
+    rc = SQLBindParameter(nullOrderStmt, 2, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &nullOrderIntVal, 0,
+                           &nullOrderIntInd);
+    expectEq("SQLBindParameter(2, integer 99) succeeds", rc == SQL_SUCCESS);
+
+    rc = SQLExecute(nullOrderStmt);
+    expectEq("SQLExecute(NULL-then-value insert) succeeds, not a hang", rc == SQL_SUCCESS);
+    if (rc != SQL_SUCCESS) printDiag(SQL_HANDLE_STMT, nullOrderStmt, "nullOrderStmt");
+    SQLFreeHandle(SQL_HANDLE_STMT, nullOrderStmt);
+
+    SQLHSTMT nullOrderSelStmt = SQL_NULL_HSTMT;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &nullOrderSelStmt);
+    const char* nullOrderSelSql = "select col_smallint, col_integer from null_order_probe";
+    rc = SQLExecDirect(nullOrderSelStmt, reinterpret_cast<SQLCHAR*>(const_cast<char*>(nullOrderSelSql)), SQL_NTS);
+    expectEq("select-back after NULL-then-value insert succeeds", rc == SQL_SUCCESS);
+    SQLSMALLINT roSmallint = 0;
+    SQLLEN roSmallintInd = 0;
+    SQLINTEGER roInteger = 0;
+    SQLLEN roIntegerInd = 0;
+    SQLBindCol(nullOrderSelStmt, 1, SQL_C_SSHORT, &roSmallint, 0, &roSmallintInd);
+    SQLBindCol(nullOrderSelStmt, 2, SQL_C_SLONG, &roInteger, 0, &roIntegerInd);
+    rc = SQLFetch(nullOrderSelStmt);
+    expectEq("row found after NULL-then-value insert", rc == SQL_SUCCESS);
+    expectEq("col_smallint round-tripped as NULL", roSmallintInd == SQL_NULL_DATA);
+    expectEq("col_integer round-tripped as 99", roIntegerInd != SQL_NULL_DATA && roInteger == 99);
+    SQLFreeHandle(SQL_HANDLE_STMT, nullOrderSelStmt);
+
+    execDirect(dbc, "drop table if exists null_order_probe");
     execDirect(dbc, "drop table if exists bind_probe");
+    return ok;
+}
+
+// Verifies the driver-layer transaction wiring added on top of the
+// already-confirmed-live SqliConnection::begin/commit/rollbackTransaction
+// primitives: SQL_ATTR_AUTOCOMMIT actually changing behavior (not just
+// round-tripping, which is all it did before), the lazy SQ_BEGIN
+// driver/statement.cpp's doExecute now issues before the first statement
+// of a manual-commit transaction, and SQLEndTran itself. Also specifically
+// checks what a commit does to an already-open SELECT cursor - Informix
+// SQLI cursors can be closed server-side by a COMMIT unless declared WITH
+// HOLD, which this driver never does, so a stale client-side cursorOpen_
+// flag after a commit would desync the next fetch/close exactly the way
+// this project's other framing bugs have (see docs/protocol-notes.md's
+// Transactions section) - worth knowing rather than assuming either way.
+bool runTransactionTest(SQLHENV env, SQLHDBC dbc, const std::string& connStr) {
+    bool ok = true;
+    auto expectEq = [&ok](const char* label, bool cond) {
+        std::printf("  [%s] %s\n", cond ? "ok" : "FAIL", label);
+        if (!cond) ok = false;
+    };
+
+    ok &= execDirect(dbc, "drop table if exists txn_probe");
+    ok &= execDirect(dbc, "create table txn_probe (id serial not null, tag varchar(32))");
+    if (!ok) {
+        std::printf("[txn] fixture setup failed, aborting transaction test\n");
+        return false;
+    }
+
+    auto countTag = [&](SQLHDBC handle, const char* tag) -> long long {
+        SQLHSTMT stmt = SQL_NULL_HSTMT;
+        SQLAllocHandle(SQL_HANDLE_STMT, handle, &stmt);
+        std::string sql = std::string("select count(*) from txn_probe where tag = '") + tag + "'";
+        SQLRETURN rc = SQLExecDirect(stmt, reinterpret_cast<SQLCHAR*>(const_cast<char*>(sql.c_str())), SQL_NTS);
+        if (rc != SQL_SUCCESS && rc != SQL_SUCCESS_WITH_INFO) {
+            printDiag(SQL_HANDLE_STMT, stmt, "count");
+            SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+            return -1;
+        }
+        // SQL_C_CHAR, not SQL_C_SBIGINT: count(*) comes back as DECIMAL on
+        // this server (same finding as tests/integration/test_transactions.cpp's
+        // countRows), and DECIMAL -> SQL_C_SBIGINT isn't a conversion this
+        // driver implements (only DECIMAL -> SQL_C_DOUBLE/SQL_C_CHAR are -
+        // see driver/convert_native.cpp's isIntegerFamily gate). SQL_C_CHAR
+        // is the one target type every column type supports.
+        char countBuf[32] = {};
+        SQLLEN ind = 0;
+        SQLBindCol(stmt, 1, SQL_C_CHAR, countBuf, sizeof(countBuf), &ind);
+        SQLRETURN fetchRc = SQLFetch(stmt);
+        if (fetchRc != SQL_SUCCESS && fetchRc != SQL_SUCCESS_WITH_INFO) {
+            printDiag(SQL_HANDLE_STMT, stmt, "count-fetch");
+            SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+            return -1;
+        }
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+        return ind == SQL_NULL_DATA ? -1 : std::strtoll(countBuf, nullptr, 10);
+    };
+
+    SQLRETURN rc = SQLSetConnectAttr(dbc, SQL_ATTR_AUTOCOMMIT, reinterpret_cast<SQLPOINTER>(SQL_AUTOCOMMIT_OFF), 0);
+    expectEq("SQLSetConnectAttr(AUTOCOMMIT_OFF) succeeds", rc == SQL_SUCCESS);
+
+    // Rollback: insert, roll back, confirm absent on this same connection.
+    ok &= execDirect(dbc, "insert into txn_probe (tag) values ('rollback-me')");
+    rc = SQLEndTran(SQL_HANDLE_DBC, dbc, SQL_ROLLBACK);
+    expectEq("SQLEndTran(ROLLBACK) succeeds", rc == SQL_SUCCESS);
+    expectEq("rolled-back row is absent on the same connection", countTag(dbc, "rollback-me") == 0);
+
+    // Commit: insert two statements in the same transaction, commit,
+    // confirm visible from a *separate* connection (proves it actually
+    // reached the server, not just this connection's own read-your-writes).
+    ok &= execDirect(dbc, "insert into txn_probe (tag) values ('commit-me')");
+    ok &= execDirect(dbc, "insert into txn_probe (tag) values ('commit-me')");
+    rc = SQLEndTran(SQL_HANDLE_DBC, dbc, SQL_COMMIT);
+    expectEq("SQLEndTran(COMMIT) succeeds", rc == SQL_SUCCESS);
+
+    SQLHDBC dbc2 = SQL_NULL_HDBC;
+    SQLAllocHandle(SQL_HANDLE_DBC, env, &dbc2);
+    SQLCHAR outConnStr[1024];
+    SQLSMALLINT outConnStrLen = 0;
+    rc = SQLDriverConnect(dbc2, nullptr, reinterpret_cast<SQLCHAR*>(const_cast<char*>(connStr.c_str())),
+                           static_cast<SQLSMALLINT>(connStr.size()), outConnStr, sizeof(outConnStr), &outConnStrLen,
+                           SQL_DRIVER_NOPROMPT);
+    if (rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) {
+        expectEq("committed rows are visible from a separate connection", countTag(dbc2, "commit-me") == 2);
+        SQLDisconnect(dbc2);
+    } else {
+        printDiag(SQL_HANDLE_DBC, dbc2, "dbc2");
+        expectEq("second connection for commit-visibility check succeeded", false);
+    }
+    SQLFreeHandle(SQL_HANDLE_DBC, dbc2);
+
+    // A commit's effect on an already-open SELECT cursor: prepare+execute
+    // a query that opens a server-side cursor, fetch one row, commit, then
+    // try to fetch again. Whatever happens here (clean SQL_NO_DATA, a
+    // clean error, or a hang under this process's own timeout wrapper)
+    // is worth knowing rather than assumed - this driver never declares
+    // cursors WITH HOLD, so a commit closing them server-side is plausible.
+    {
+        SQLHSTMT stmt = SQL_NULL_HSTMT;
+        SQLAllocHandle(SQL_HANDLE_STMT, dbc, &stmt);
+        const char* sql = "select tag from txn_probe where tag = 'commit-me'";
+        rc = SQLExecDirect(stmt, reinterpret_cast<SQLCHAR*>(const_cast<char*>(sql)), SQL_NTS);
+        expectEq("cursor-probe SQLExecDirect succeeds", rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+        rc = SQLFetch(stmt);
+        expectEq("cursor-probe first SQLFetch succeeds", rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
+
+        rc = SQLEndTran(SQL_HANDLE_DBC, dbc, SQL_COMMIT);
+        std::printf("  [info] SQLEndTran(COMMIT) with an open cursor: rc=%d\n", static_cast<int>(rc));
+        printDiag(SQL_HANDLE_DBC, dbc, "dbc (post-commit-with-open-cursor)");
+
+        rc = SQLFetch(stmt);
+        std::printf("  [info] SQLFetch after commit-with-open-cursor: rc=%d\n", static_cast<int>(rc));
+        printDiag(SQL_HANDLE_STMT, stmt, "stmt (post-commit-with-open-cursor fetch)");
+
+        SQLFreeHandle(SQL_HANDLE_STMT, stmt);
+    }
+
+    // Autocommit OFF -> ON transition: commits whatever's currently open.
+    ok &= execDirect(dbc, "insert into txn_probe (tag) values ('autocommit-flip')");
+    rc = SQLSetConnectAttr(dbc, SQL_ATTR_AUTOCOMMIT, reinterpret_cast<SQLPOINTER>(SQL_AUTOCOMMIT_ON), 0);
+    expectEq("SQLSetConnectAttr(AUTOCOMMIT_ON) with an open transaction succeeds", rc == SQL_SUCCESS);
+
+    SQLHDBC dbc3 = SQL_NULL_HDBC;
+    SQLAllocHandle(SQL_HANDLE_DBC, env, &dbc3);
+    rc = SQLDriverConnect(dbc3, nullptr, reinterpret_cast<SQLCHAR*>(const_cast<char*>(connStr.c_str())),
+                           static_cast<SQLSMALLINT>(connStr.size()), outConnStr, sizeof(outConnStr), &outConnStrLen,
+                           SQL_DRIVER_NOPROMPT);
+    if (rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) {
+        expectEq("autocommit ON->OFF->ON flip's row is visible from a separate connection",
+                  countTag(dbc3, "autocommit-flip") == 1);
+        SQLDisconnect(dbc3);
+    } else {
+        expectEq("third connection for autocommit-flip check succeeded", false);
+    }
+    SQLFreeHandle(SQL_HANDLE_DBC, dbc3);
+
+    // Back under autocommit ON: statements need no SQLEndTran at all.
+    ok &= execDirect(dbc, "insert into txn_probe (tag) values ('plain-autocommit')");
+    expectEq("plain autocommit insert is visible on the same connection with no SQLEndTran",
+              countTag(dbc, "plain-autocommit") == 1);
+
+    // SQLDisconnect with an unresolved transaction: on a *dedicated*
+    // connection (dbc's own eventual SQLDisconnect in main() always runs
+    // under autocommit ON by this point, so it would never exercise this
+    // branch) - autocommit off, insert, disconnect with no SQLEndTran at
+    // all, then check from a fresh connection that the row never
+    // committed. This is the one driver/connect.cpp SQLDisconnect branch
+    // added alongside SQLEndTran that nothing above exercises, and it's
+    // exactly the guarantee a BOP restore that dies mid-transaction and
+    // disconnects would depend on: better an aborted restore leaves
+    // nothing applied than half of it silently committed.
+    {
+        SQLHDBC dbc4 = SQL_NULL_HDBC;
+        SQLAllocHandle(SQL_HANDLE_DBC, env, &dbc4);
+        rc = SQLDriverConnect(dbc4, nullptr, reinterpret_cast<SQLCHAR*>(const_cast<char*>(connStr.c_str())),
+                               static_cast<SQLSMALLINT>(connStr.size()), outConnStr, sizeof(outConnStr),
+                               &outConnStrLen, SQL_DRIVER_NOPROMPT);
+        if (rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) {
+            rc = SQLSetConnectAttr(dbc4, SQL_ATTR_AUTOCOMMIT, reinterpret_cast<SQLPOINTER>(SQL_AUTOCOMMIT_OFF), 0);
+            expectEq("dbc4 SQLSetConnectAttr(AUTOCOMMIT_OFF) succeeds", rc == SQL_SUCCESS);
+            ok &= execDirect(dbc4, "insert into txn_probe (tag) values ('disconnect-me')");
+            rc = SQLDisconnect(dbc4);
+            expectEq("SQLDisconnect with an open, unresolved transaction succeeds", rc == SQL_SUCCESS);
+        } else {
+            printDiag(SQL_HANDLE_DBC, dbc4, "dbc4");
+            expectEq("fourth connection for disconnect-rollback check succeeded", false);
+        }
+        SQLFreeHandle(SQL_HANDLE_DBC, dbc4);
+
+        SQLHDBC dbc5 = SQL_NULL_HDBC;
+        SQLAllocHandle(SQL_HANDLE_DBC, env, &dbc5);
+        rc = SQLDriverConnect(dbc5, nullptr, reinterpret_cast<SQLCHAR*>(const_cast<char*>(connStr.c_str())),
+                               static_cast<SQLSMALLINT>(connStr.size()), outConnStr, sizeof(outConnStr),
+                               &outConnStrLen, SQL_DRIVER_NOPROMPT);
+        if (rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO) {
+            expectEq("row from a transaction never SQLEndTran'd before SQLDisconnect was rolled back",
+                      countTag(dbc5, "disconnect-me") == 0);
+            SQLDisconnect(dbc5);
+        } else {
+            expectEq("fifth connection for disconnect-rollback check succeeded", false);
+        }
+        SQLFreeHandle(SQL_HANDLE_DBC, dbc5);
+    }
+
+    execDirect(dbc, "drop table if exists txn_probe");
     return ok;
 }
 
@@ -491,6 +727,10 @@ int main(int argc, char** argv) {
     bool bindOk = runBindParamTest(dbc);
     std::printf("bind-parameter test: %s\n", bindOk ? "PASS" : "FAIL");
 
+    std::printf("--- SQLEndTran + SQL_ATTR_AUTOCOMMIT ---\n");
+    bool txnOk = runTransactionTest(env, dbc, connStr);
+    std::printf("transaction test: %s\n", txnOk ? "PASS" : "FAIL");
+
     rc = SQLDisconnect(dbc);
     std::printf("SQLDisconnect rc=%d\n", static_cast<int>(rc));
     printDiag(SQL_HANDLE_DBC, dbc, "dbc");
@@ -499,5 +739,5 @@ int main(int argc, char** argv) {
     SQLFreeHandle(SQL_HANDLE_ENV, env);
     std::printf("done.\n");
     bool disconnectOk = (rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
-    return (disconnectOk && nativeOk && diagOk && bindOk) ? 0 : 1;
+    return (disconnectOk && nativeOk && diagOk && bindOk && txnOk) ? 0 : 1;
 }
