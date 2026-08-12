@@ -24,20 +24,26 @@ development.
 
 ## Known quirks
 
-- This image's entrypoint ends in an interactive shell that the server process
-  depends on staying attached to stdin: without a TTY, the shell hits EOF and
-  exits a few seconds after the server reports on-line, taking the container
-  down with it (`Shutdown Signal Received 15` in `docker logs`). The
-  `tty: true`/`stdin_open: true` lines in `docker-compose.yml` are required,
-  not optional, for `docker compose up -d` to stay running.
+- `onstat` (and the rest of `$INFORMIXDIR/bin`) is only on `PATH` inside a
+  login shell for the `informix` user, not a bare `docker exec`. There's no
+  `/etc/profile.d/*.sh` that sets it - it comes from the user's own login
+  profile. The healthcheck accounts for this by running `bash -lc "onstat -"`
+  rather than a bare `onstat -`; do the same for any manual `docker exec`.
 - The image reinitializes its data directory (`INFORMIX_CLEAN=ALWAYS`) on
-  every fresh boot of the entrypoint, even when `/opt/ibm/data` is a
-  persistent named volume with prior data in it - only `sysmaster`/
-  `sysutils`/`sysuser`/`sysadmin` survive. Any database created for testing
-  (e.g. `ifxodbc_test`) does not persist across a container recreate/restart
-  and needs to be recreated each time:
-  `echo "create database ifxodbc_test with log;" | dbaccess - -` (run inside
-  the container, after sourcing `/etc/profile.d/informix.sh`).
-- The default healthcheck command needs the Informix environment sourced
-  first (`onstat` isn't on the bare `docker exec` `PATH`) - already fixed in
-  `docker-compose.yml`'s `CMD-SHELL` form.
+  at least some fresh boots of the entrypoint, even when `/opt/ibm/data` is a
+  persistent named volume with prior data in it - observed once this session
+  where only `sysmaster`/`sysutils`/`sysuser`/`sysadmin` survived a restart.
+  Not confirmed to happen on every restart. If a database created for
+  testing (e.g. `ifxodbc_test`) is missing after bringing the container back
+  up, recreate it:
+  `docker exec ifxodbc_dev bash -lc 'echo "create database ifxodbc_test with log;" | dbaccess - -'`
+- A container was observed dying ~90-100s after reporting on-line, with
+  `Shutdown Signal Received 15` in `docker logs` and no corresponding
+  external `docker stop`/`kill` from this project's own tooling - root cause
+  not identified. `tty: true`/`stdin_open: true` are present in
+  `docker-compose.yml` (this image's entrypoint does end in an interactive
+  shell in some code paths, which needs one to avoid exiting on stdin EOF),
+  but a container with both already set still died with this signature once,
+  so they are not confirmed sufficient on their own. If the container dies
+  shortly after coming online, check `docker logs` for this signature and
+  retry `docker compose up -d`.

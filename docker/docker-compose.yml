@@ -13,7 +13,7 @@ services:
     volumes:
       - informix_data:/opt/ibm/data
     healthcheck:
-      test: ["CMD-SHELL", "source /etc/profile.d/informix.sh && onstat -"]
+      test: ["CMD", "bash", "-lc", "onstat -"]
       interval: 10s
       timeout: 5s
       retries: 30
