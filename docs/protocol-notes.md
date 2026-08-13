@@ -913,6 +913,148 @@ reproducing the exact captured bytes above, and exercised live end-to-end via
 `tools/ifx_probe` against the full `type_probe` table (including the
 all-NULL row).
 
+## Simple large objects (BYTE/TEXT) - fetch, confirmed live
+
+Informix has two entirely separate LOB mechanisms: *simple* large objects
+(BYTE=`ifxtype::kByte`(11)/TEXT=`ifxtype::kText`(12), the older mechanism,
+this section) and *smart* large objects (BLOB/CLOB, stored in an sbspace -
+see the next section for what's confirmed about those so far, which is much
+less). They share nothing at the wire level.
+
+**The TUPLE row does not carry a simple LOB's bytes inline.** DESCRIBE
+reports `encodedLength=56` for both BYTE and TEXT (confirmed live), and
+that's exactly what's in the row: a fixed 56-byte, mostly-opaque
+*descriptor*, not the value. Confirmed live via a raw-bytes capture
+(temporary debug instrumentation, not part of the repo) against a real
+`TEXT` column holding `"hello-clob\n"` (11 bytes): the row's per-column slice
+is 56 bytes regardless of the value's actual length, matching a decompiled
+JDBC reference (`IfxBlob.java`, which allocates a same-sized 56-byte
+`blobDesc` buffer). Field layout within the 56 bytes, per the decompiled
+source and now independently confirmed live for three of the four fields:
+
+- offset 8 (4 bytes, big-endian) = `tb_start` - confirmed live as `1` for
+  an 11-byte value (1-based start of the value's byte range).
+- offset 12 (4 bytes) = `tb_end` - confirmed live as `11` for the same value
+  (1-based inclusive end - `tb_end - tb_start + 1` gives the byte count).
+- offset 16 (4 bytes) = `tb_size` - confirmed live as `11`, the value's
+  total byte length directly.
+- offset 38-39 (2 bytes) = `tb_flags`. **NULL is confirmed live to be
+  exactly `tb_flags == 1`** (bytes `00 01`) **with every other byte in the
+  56-byte descriptor zero** - captured from a real NULL `TEXT` column,
+  distinguishable from a real value's `tb_flags` (confirmed live as `0x0208`
+  for an inserted-but-not-yet-fetched value - some other bit pattern, not
+  exactly `1`). The rest of `tb_flags`'s bits, and the descriptor's other
+  opaque bytes (0-7, 20-37, 40-55), are never interpreted by this driver -
+  only echoed back verbatim to the server (see below), matching how the
+  decompiled JDBC reference treats them too.
+
+**Fetching the actual content is a second, standalone round trip** -
+`SqliConnection::fetchSimpleLob(descriptor)` (`sqli/connection.cpp`), called
+after a row carrying a simple-LOB column has already been fetched and
+decoded. The real precondition is "no response is currently mid-stream on
+this connection" (request/response can't interleave), not "never inside a
+fetch loop" per se - `SqliStatement::fetchRow`'s underlying batch read
+already drains its whole response to `SQ_EOT` before returning any row, so
+calling this once `fetchRow` has returned (even once per row, as
+`tools/ifx_probe` does below) is safe; confirmed live this way. **Not**
+confirmed live: a result set large enough to span multiple server-side
+fetch batches, where the main cursor's own protocol state might not be as
+cleanly idle between rows. It sends `SQ_FETCHBLOB`(38) + the 56-byte
+descriptor **echoed back verbatim, unmodified** + `SQ_EOT`, then reads the
+generic tagged-record response loop
+(same shape `executeCommand`'s reply loop uses) accumulating every
+`SQ_BLOB`(39) chunk's payload (`u16` length + that many bytes, padded to
+even length like every other variable-length field in this protocol) until
+`SQ_EOT`. Opcodes 38/39/40 (`kFetchBlob`/`kBlob`/`kFerr`,
+`sqli/protocol.h`) are reverse-engineered from the decompiled reference's
+`sendFetchBlob`/`receiveText`/`receiveBlob` (`IfxSqli.java`) - `kFerr`(40)
+is only relevant to the bind direction (an abort sentinel if the source
+stream fails mid-upload, not yet implemented - see below).
+
+**Confirmed live, first attempt, no hang**: fetched `"hello-clob\n"` back
+correctly from a `TEXT` column via `tools/ifx_probe` (which now calls
+`fetchSimpleLob` for `kByte`/`kText` columns after checking the NULL
+sentinel), correctly reported `NULL` for a NULL `TEXT` row, correctly
+fetched the same 11 bytes as raw hex from the equivalent `BYTE` column, and
+- to exercise chunking, since the decompiled reference shows the server can
+split a large value across multiple `SQ_BLOB` messages - fetched a 200,000
+byte `BYTE` value and confirmed it came back byte-for-byte identical to the
+source file (`cmp`, exact match). `splitRow` (`sqli/statement.cpp`) treats
+`kByte`/`kText` as fixed-width at `col.encodedLength` for the purposes of
+locating the descriptor within a row - the same shape `kChar` already uses,
+just interpreted completely differently downstream.
+
+**Not yet done**: the ODBC `SQLGetData`/`SQLBindCol` surface for these
+types (deferred - this section only covers the sqli layer, matching this
+project's usual sqli-first/ODBC-surface-later sequencing, e.g. INTERVAL's
+own history), and the bind/write direction (`SQ_BIND` for a simple-LOB "?"
+parameter is a plain scalar slot carrying the same 56-byte descriptor shape
+as a placeholder, immediately followed by an out-of-band `SQ_BLOB`(39)
+chunk stream capped at 1024 bytes/chunk and terminated by a zero-length
+chunk - reverse-engineered from the decompiled reference's `sendBind`/
+`sendStreamBlob`, not yet independently confirmed live).
+
+Test fixture note: seeding real BYTE/TEXT row data for live testing turned
+out to need `dbaccess`'s `LOAD FROM 'file' INSERT INTO table(col)` command,
+not a plain `INSERT ... VALUES ('literal')` - Informix's interactive SQL
+parser rejects a literal string for a BYTE/TEXT column outright (`-617 A
+blob data type must be supplied within this context`), confirmed live; a
+literal insert is only ever accepted via a host-language bind parameter
+(exactly the SQ_BIND flow above), never as SQL text. This is why there's no
+automated `ctest` integration test for simple-LOB fetch yet - fixture setup
+currently depends on `dbaccess`/Docker, not just this driver's own code;
+once bind is implemented, a self-contained integration test (seed via this
+driver's own bind, verify via `fetchSimpleLob`) becomes possible without an
+external dependency.
+
+## Smart large objects (BLOB/CLOB) - descriptor shape only, NOT yet fetched
+
+Much less confirmed than simple LOBs above - this is what's known so far,
+not a working fetch path.
+
+DESCRIBE reports smart LOB columns as `ifxType=41` - the same wire type
+code `ifxtype::kBoolean` already uses for its own extended-type framing.
+Confirmed live: a `BLOB` column reports `extendedId=10 owner="informix"
+name="blob"`, a `CLOB` column reports `extendedId=11 owner="informix"
+name="clob"`, both `encodedLength=72`. Fetching one today misdispatches
+into the existing BOOLEAN decoder (both share ifxType 41) and fails cleanly
+with "BOOLEAN: unexpected payload length" - wrong, but not a hang.
+
+The TUPLE row's per-column shape for these, confirmed live via a raw-bytes
+capture of a 2-row `(BLOB, CLOB)` insert: `nullFlag`(1 byte) + `length`(4
+bytes, big-endian - confirmed live as `72`) + `length` bytes of opaque
+payload = 77 bytes total when non-null (the same self-describing
+null-flag-byte convention `kBoolean` uses, just with a 4-byte length field
+where BOOLEAN has none). The 72-byte payload is an `IfxLocator` per the
+decompiled reference (`IfxLocator.java`: `IFX_LOCATOR_SIZE = 72` - an exact,
+non-inferred match to the live `encodedLength`) - a token the JDBC driver
+itself never decodes internally, only round-trips to the server. Diffing
+two real locators (one `BLOB`, one `CLOB`, inserted in the same statement)
+byte-for-byte found only 2 differing bytes out of 72 (a small ordinal-like
+field and part of what's presumably a per-LO unique id) - consistent with
+"mostly-opaque identifier," but the exact field layout inside those 72
+bytes is not determinable from the decompiled JDBC source (it never
+decodes the locator either) and is NOT yet independently reverse-engineered
+by this driver.
+
+Getting the actual content is a fundamentally different, larger mechanism
+than simple LOBs': per the decompiled reference, `IfxLoOpen`/`IfxLoClose`/
+`IfxLoSeek`/`IfxLoStat`/etc. are not dedicated opcodes at all - they're
+calls to built-in Informix SPL functions (`informix.ifx_lo_open`,
+`informix.ifx_lo_close`, ...) via a generic "fastpath" RPC subsystem
+(`SQ_GETROUTINE`(101) resolves a function signature to a handle,
+`SQ_EXFPROUTINE`(102) invokes it with bound parameters using the same
+`sendBind` machinery ordinary prepared statements use, `SQ_FPROUTINE`(103)
+carries the result). Once a smart LOB is open (yielding an integer file
+descriptor), bulk read/write goes through a dedicated `SQ_LODATA`(97)
+message (subcodes: `LO_READ`=0, `LO_READWITHSEEK`=1, `LO_WRITE`=2) whose
+response can itself carry multiple internally length-prefixed chunks in one
+message. None of this - fastpath RPC or `SQ_LODATA` - is implemented or
+confirmed live yet; it's a materially larger dependency (a whole RPC
+subsystem as a prerequisite) than simple LOBs' two-opcode fetch, which is
+exactly why smart LOBs are scoped as separate follow-on work rather than
+"one more scalar case."
+
 ## Transactions
 
 **Status: verified** - `SqliConnection::beginTransaction`/`commitTransaction`/

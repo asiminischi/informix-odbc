@@ -322,6 +322,50 @@ std::expected<void, Error> SqliConnection::executeCommand(const std::string& sql
     return {};
 }
 
+std::expected<std::vector<std::byte>, Error> SqliConnection::fetchSimpleLob(std::span<const std::byte> descriptor) {
+    ByteWriter w;
+    w.u16(opcode::kFetchBlob);
+    w.bytes(descriptor);
+    w.u16(opcode::kEot);
+    if (auto r = sock_.writeAll(w.view()); !r) return std::unexpected(r.error());
+
+    std::vector<std::byte> result;
+    std::optional<Error> pendingError;
+    for (;;) {
+        auto tag = readU16(sock_);
+        if (!tag) return std::unexpected(tag.error());
+        if (*tag == opcode::kEot) break;
+
+        switch (*tag) {
+            case opcode::kBlob: {
+                auto len = readU16(sock_);
+                if (!len) return std::unexpected(len.error());
+                if (*len > 0) {
+                    auto chunk = sock_.readExactN(*len);
+                    if (!chunk) return std::unexpected(chunk.error());
+                    result.insert(result.end(), chunk->begin(), chunk->end());
+                    if (*len & 1) {
+                        auto pad = sock_.readExactN(1);
+                        if (!pad) return std::unexpected(pad.error());
+                    }
+                }
+                break;
+            }
+            case opcode::kError: {
+                auto err = readErrorRecord(sock_);
+                if (!err) return std::unexpected(err.error());
+                pendingError = *err;
+                break;
+            }
+            default:
+                return std::unexpected(Error{ErrorKind::Protocol, "unrecognized tag in fetchSimpleLob response"});
+        }
+    }
+
+    if (pendingError) return std::unexpected(*pendingError);
+    return result;
+}
+
 namespace {
 
 // Sends an opcode (with an optional trailing u16 field some opcodes require

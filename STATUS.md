@@ -389,15 +389,29 @@ Roughly in the order they'd bite a real application:
    Linux/WSL2 + unixODBC + `isql`.
 6. **No Unicode.** ANSI (`SQL_C_CHAR`) only; no `SQLWCHAR`/`W`-suffixed
    functions.
-7. **Missing scalar types**: LOBs (BLOB/CLOB/BYTE/TEXT, both bind and
-   fetch sides) - the only scalar type family left with no support at
-   all. INTERVAL is now fully done for both classes: fetch, sqli-layer
-   bind, ODBC `SQLBindParameter` wiring, and `SQLColumns` (see item 3
-   above) - only `SQLGetTypeInfo` remains a deliberately deferred gap for
-   INTERVAL specifically (its `kTypeMap` design doesn't fit INTERVAL's 13
-   qualifier shapes, and nothing in this project's verification bar
-   exercises it). BOOLEAN, FLOAT/SMALLFLOAT, and DATETIME (including
-   sub-second FRACTION) are fully done too, including catalog rows.
+7. **Missing scalar types**: LOBs (BLOB/CLOB/BYTE/TEXT). INTERVAL is now
+   fully done for both classes: fetch, sqli-layer bind, ODBC
+   `SQLBindParameter` wiring, and `SQLColumns` (see item 3 above) - only
+   `SQLGetTypeInfo` remains a deliberately deferred gap for INTERVAL
+   specifically (its `kTypeMap` design doesn't fit INTERVAL's 13 qualifier
+   shapes, and nothing in this project's verification bar exercises it).
+   BOOLEAN, FLOAT/SMALLFLOAT, and DATETIME (including sub-second FRACTION)
+   are fully done too, including catalog rows. **LOBs turned out to be two
+   unrelated mechanisms, not one type family**: simple large objects
+   (BYTE/TEXT) and smart large objects (BLOB/CLOB, sbspace-backed), which
+   share nothing at the wire level (see `docs/protocol-notes.md`'s two
+   separate sections). Simple-LOB **fetch is now done and confirmed live**:
+   `SqliConnection::fetchSimpleLob` sends `SQ_FETCHBLOB`(38) with the
+   column's 56-byte in-row descriptor (the TUPLE row never carries the
+   value inline - just this fixed-size mostly-opaque descriptor, confirmed
+   live down to which exact byte signals NULL) and accumulates `SQ_BLOB`(39)
+   response chunks; confirmed live via `tools/ifx_probe` for both BYTE and
+   TEXT, including NULL and a 200KB value spanning multiple chunks
+   (byte-for-byte exact). Still missing: simple-LOB *bind*, and all of
+   smart LOBs (BLOB/CLOB share ifxType 41 with BOOLEAN and currently
+   misdecode; getting their content needs a whole fastpath-RPC subsystem
+   this driver doesn't have yet, reverse-engineered but not implemented -
+   see `docs/protocol-notes.md`).
 8. **No real generated-key retrieval.** The `SQ_INSERTDONE` wire field is
    decoded, but the driver never sends the extra "SGK" request the server
    needs to actually populate it, so every INSERT currently reports a
@@ -451,11 +465,10 @@ write every column type a real database has, and has to actually be
 callable from BOP's own code; catalog-completeness and driver-manager
 polish don't block that.
 
-1. **Remaining scalar types beyond the MVP-8 set - LOBs (BLOB/CLOB/BYTE/
-   TEXT, both bind and fetch sides) are the only scalar family left
-   unstarted. INTERVAL is now fully done for both classes end to end,
-   including the ODBC `SQLBindParameter` surface (`ColumnSize`/
-   `DecimalDigits` now plumbed through - see item 7) - only
+1. **Remaining scalar types beyond the MVP-8 set - LOBs are the only
+   scalar family left with real gaps. INTERVAL is now fully done for both
+   classes end to end, including the ODBC `SQLBindParameter` surface
+   (`ColumnSize`/`DecimalDigits` now plumbed through - see item 7) - only
    `SQLGetTypeInfo` remains a deliberately deferred INTERVAL gap.
    BOOLEAN, FLOAT/SMALLFLOAT, and DATETIME (including sub-second FRACTION)
    are fully done end to end too (bind, fetch, and catalog rows,
@@ -468,11 +481,19 @@ polish don't block that.
    points called directly (bypassing the Driver Manager) - none of this
    yet through a *real* Driver Manager, which currently needs the
    Linux/WSL2 path (see item 5's Windows DM gap) not set up in this
-   environment.**
+   environment. LOBs split into two unrelated mechanisms once
+   investigated (simple BYTE/TEXT vs. smart BLOB/CLOB, sharing nothing at
+   the wire level - see `docs/protocol-notes.md`); simple-LOB **fetch is
+   now done and confirmed live at the sqli layer** (`SqliConnection::
+   fetchSimpleLob`, confirmed via `tools/ifx_probe` including a 200KB
+   multi-chunk value) - simple-LOB bind, the ODBC `SQLGetData` surface for
+   either type, and all of smart LOBs (needs a fastpath-RPC subsystem,
+   reverse-engineered but not implemented) remain.**
    Blocking: a real Informix database backup/restore tool can't skip
-   columns of a type it doesn't support. LOBs in particular are likely to
-   need their own multi-message wire handling, not just another entry in
-   the existing scalar bind/fetch tables.
+   columns of a type it doesn't support. Smart LOBs in particular need
+   their own multi-message wire handling (confirmed, not just suspected,
+   now that the fastpath/SQ_LODATA mechanism has been reverse-engineered),
+   not just another entry in the existing scalar bind/fetch tables.
 2. **Decide and prototype the BOP integration mechanism** (CGO, subprocess
    + a small IPC protocol, or something else) - deliberately left
    undecided when this project started. Nothing else here matters to BOP

@@ -11,12 +11,44 @@
 
 namespace {
 
+// Simple LOB (BYTE/TEXT) NULL check: confirmed live that a NULL column's
+// 56-byte descriptor is all-zero except a big-endian u16 value of exactly
+// 1 at offset 38 (tb_flags) - a real (non-NULL) value's tb_flags carries
+// other bits set too (e.g. 0x0208, confirmed live for a freshly-loaded,
+// not-yet-fetched TEXT value), so this checks the exact NULL sentinel
+// rather than a single bit.
+bool isSimpleLobNull(std::span<const std::byte> descriptor) {
+    return std::to_integer<unsigned>(descriptor[38]) == 0 && std::to_integer<unsigned>(descriptor[39]) == 1;
+}
+
 // Decodes and prints one column's value using the sqli/types.h codecs,
 // exercising them against whatever the live server actually sends (rather
-// than just the frozen bytes the unit tests use).
-void printColumnValue(const ifxsqli::ColumnDesc& col, std::span<const std::byte> bytes) {
+// than just the frozen bytes the unit tests use). `conn` is needed for
+// simple-LOB columns, which require a second round trip
+// (SqliConnection::fetchSimpleLob) to get the actual content - every other
+// type decodes purely from `bytes`.
+void printColumnValue(ifxsqli::SqliConnection& conn, const ifxsqli::ColumnDesc& col, std::span<const std::byte> bytes) {
     using namespace ifxsqli;
     switch (col.ifxType) {
+        case ifxtype::kByte:
+        case ifxtype::kText: {
+            if (bytes.size() != kSimpleLobDescriptorSize) {
+                std::printf("<error: simple LOB descriptor wrong size (%zu, expected %zu)>", bytes.size(),
+                            kSimpleLobDescriptorSize);
+                return;
+            }
+            if (isSimpleLobNull(bytes)) { std::printf("NULL"); return; }
+            auto content = conn.fetchSimpleLob(bytes);
+            if (!content) { std::printf("<error fetching simple LOB: %s>", content.error().message.c_str()); return; }
+            if (col.ifxType == ifxtype::kText) {
+                std::printf("\"%.*s\"", static_cast<int>(content->size()),
+                            reinterpret_cast<const char*>(content->data()));
+            } else {
+                std::printf("0x");
+                for (auto b : *content) std::printf("%02x", std::to_integer<unsigned char>(b));
+            }
+            return;
+        }
         case ifxtype::kSmallInt: {
             auto v = decodeSmallInt(bytes);
             if (!v) { std::printf("<error: %s>", v.error().message.c_str()); return; }
@@ -242,7 +274,7 @@ int main(int argc, char** argv) {
             const auto& cols = stmt->columns();
             for (std::size_t i = 0; i < (*row)->size(); ++i) {
                 if (i > 0) std::printf(", ");
-                printColumnValue(cols[i], (**row)[i]);
+                printColumnValue(*conn, cols[i], (**row)[i]);
             }
             std::printf("\n");
         }

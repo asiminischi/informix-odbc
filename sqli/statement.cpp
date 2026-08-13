@@ -60,6 +60,18 @@ std::expected<std::vector<std::vector<std::byte>>, Error> splitRow(std::span<con
             case ifxtype::kChar:               // CHAR(n): fixed width
                 width = col.encodedLength;
                 break;
+            // Simple LOB (BYTE/TEXT): the TUPLE row carries a fixed-size
+            // opaque descriptor here, not the value itself - same
+            // fixed-width shape as kChar for splitRow's purposes (DESCRIBE
+            // reports encodedLength=56, confirmed live, including for a
+            // NULL row - the descriptor doesn't shrink), just interpreted
+            // completely differently downstream (see
+            // SqliConnection::fetchSimpleLob, sqli/types.h's
+            // kSimpleLobDescriptorSize doc comment).
+            case ifxtype::kByte:
+            case ifxtype::kText:
+                width = col.encodedLength;
+                break;
             case ifxtype::kBoolean: {
                 // Self-describing, not fixed-width despite encodedLength=1 -
                 // see decodeBoolean's doc comment for the confirmed shape.

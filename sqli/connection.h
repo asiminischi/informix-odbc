@@ -4,10 +4,13 @@
 #include "sqli/handshake.h"
 #include "sqli/transport.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <optional>
+#include <span>
 #include <string>
+#include <vector>
 
 namespace ifxsqli {
 
@@ -66,6 +69,30 @@ public:
     // correctly rather than desyncing the stream.
     [[nodiscard]] std::optional<std::int64_t> lastSerialInserted() const { return lastSerialInserted_; }
     [[nodiscard]] std::optional<std::int64_t> lastBigSerialInserted() const { return lastBigSerialInserted_; }
+
+    // Fetches a simple large object's (BYTE/TEXT, ifxtype::kByte/kText)
+    // actual content, given the opaque 56-byte descriptor a TUPLE row
+    // carries for that column instead of the value itself (see
+    // sqli/types.h's kSimpleLobDescriptorSize doc comment). `descriptor`
+    // must be exactly that 56-byte slice, echoed back verbatim - this
+    // driver never interprets it, only round-trips it, matching the
+    // decompiled JDBC reference. Sends SQ_FETCHBLOB(38) + the descriptor,
+    // then concatenates every SQ_BLOB(39) response chunk until SQ_EOT.
+    // Confirmed live (tools/ifx_probe, both BYTE and TEXT, NULL, and a
+    // 200KB multi-chunk value) - see docs/protocol-notes.md's Simple LOB
+    // section.
+    //
+    // The real precondition is "no response currently mid-stream on this
+    // connection" (SQ_FETCHBLOB is a standalone request/response exchange
+    // that can't interleave with another in-flight one), not "not inside a
+    // fetch loop" per se - SqliStatement::fetchRow's underlying batch read
+    // already drains its whole response to SQ_EOT before returning any
+    // row, so calling this once fetchRow has returned (even repeatedly,
+    // once per row, as tools/ifx_probe does) is safe. NOT yet confirmed
+    // live: a result set large enough to span multiple server-side fetch
+    // batches, where the main cursor's own fetch protocol might not be
+    // fully idle the way a small, single-batch result set's is.
+    [[nodiscard]] std::expected<std::vector<std::byte>, Error> fetchSimpleLob(std::span<const std::byte> descriptor);
 
     // Exposed for SqliStatement (sqli/statement.h), which sits on top of the
     // same connection and needs to send/receive statement-protocol messages

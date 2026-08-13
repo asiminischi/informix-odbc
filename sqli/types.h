@@ -35,6 +35,12 @@ inline constexpr int kVarchar = 13;
 inline constexpr int kNVarchar = 16;
 inline constexpr int kBigInt = 52;
 inline constexpr int kBigSerial = 53;
+// Simple large objects (the older LO mechanism, distinct from smart
+// BLOB/CLOB below) - confirmed live via DESCRIBE against real BYTE/TEXT
+// columns. Both report extendedId=0 (plain scalars, not the extended-type
+// framing BOOLEAN/BLOB/CLOB use).
+inline constexpr int kByte = 11;
+inline constexpr int kText = 12;
 // Confirmed live via DESCRIBE against an INTERVAL YEAR TO MONTH column -
 // matches the decompiled JDBC driver's IfxIntervalYM/IfxIntervalDF exactly
 // (both interval classes share this one wire type code; which class a
@@ -460,5 +466,31 @@ struct DecimalBindEncoding {
 // `value.fraction` and `encodedLength`'s own end code matter.
 [[nodiscard]] std::expected<std::vector<std::byte>, Error> encodeIntervalDayFraction(
     const IntervalDayFractionValue& value, std::uint32_t encodedLength);
+
+// Simple large objects (BYTE=kByte, TEXT=kText): confirmed live that the
+// TUPLE row does NOT carry the value's bytes inline - it carries this
+// fixed-size, mostly-opaque 56-byte descriptor instead (DESCRIBE's
+// encodedLength is 56 for both types, confirmed live; matches this
+// project's decompiled JDBC reference's IfxBlob.java, which allocates the
+// same 56-byte blobDesc buffer). Field layout within the 56 bytes, per the
+// decompiled reference: offset 8 (4 bytes) = tb_start, offset 12 (4
+// bytes) = tb_end, offset 16 (4 bytes) = tb_size (the value's total byte
+// length), offset 38-39 (2 bytes) = tb_flags. tb_start/tb_end/tb_size are
+// confirmed live for exactly one sample (an 11-byte value: tb_start=1,
+// tb_end=11, tb_size=11) - plausible but not stress-tested across more
+// values/qualifiers. tb_flags's NULL sentinel IS independently confirmed
+// live and precise: a NULL value's tb_flags is exactly 1 (bytes 00 01)
+// with every other byte in the 56-byte descriptor zero, distinct from a
+// real value's tb_flags (confirmed live as 0x0208 for one inserted value -
+// some other bit pattern, not exactly 1); the rest of tb_flags's bits
+// aren't decoded. The remaining bytes (0-7, 20-37, 40-55) are opaque
+// server-side bookkeeping this driver never needs to interpret - only
+// echo verbatim back to the server (see SqliConnection::fetchSimpleLob),
+// the same way the JDBC reference treats them. Getting the actual value
+// requires a second round trip using this descriptor as an opaque token
+// (SqliConnection::fetchSimpleLob, sqli/connection.h) - there is no
+// decoder function here the way every other scalar type has, since the
+// descriptor alone doesn't carry the value.
+inline constexpr std::size_t kSimpleLobDescriptorSize = 56;
 
 } // namespace ifxsqli
