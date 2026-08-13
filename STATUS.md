@@ -336,22 +336,32 @@ Roughly in the order they'd bite a real application:
    this project's verification bar currently needs. See
    `docs/protocol-notes.md`'s "INTERVAL in SQLColumns" section for detail.
 
-   **A pre-existing bug was found (not fixed) while deriving the
-   `COLUMN_SIZE` formula**: `driver/convert.cpp`'s `formatIntervalDayFraction`
-   (the `SQL_C_CHAR` text surface, shipped in the DAY-FRACTION decode
-   commit) only receives `hasDayField`, not the qualifier's actual
-   start/end reach - its `!hasDayField` branch always prints `iv.hour` as
-   the first field regardless of which field is actually the qualifier's
-   leader, so a MINUTE-anchored or SECOND-anchored qualifier (`MINUTE TO
-   SECOND`, `SECOND TO SECOND`) prints the true leading value stranded in
-   the wrong slot, and it always prints the full `HH:MM:SS` shape even
-   when the qualifier doesn't reach that far (e.g. `HOUR TO MINUTE` shows
-   a spurious `:00` seconds field). This is exactly the
-   "MINUTE/SECOND-anchored leading fields... untested" gap already flagged
-   below, now diagnosed with a concrete cause and fix (pass the qualifier
-   into the formatter, not just `hasDayField`) - `sqli::
-   decodeIntervalDayFraction` itself is unaffected, this is purely a
-   `driver/convert.cpp` rendering gap. Next slice, not this one.
+   **A bug found while deriving the `COLUMN_SIZE` formula is now fixed**:
+   `driver/convert.cpp`'s `formatIntervalDayFraction` (the `SQL_C_CHAR`
+   text surface, shipped in the DAY-FRACTION decode commit) originally
+   only received `hasDayField`, not the qualifier's actual start/end
+   reach - its `!hasDayField` branch always printed `iv.hour` as the first
+   field regardless of which field is actually the qualifier's leader, so
+   a MINUTE-anchored or SECOND-anchored qualifier (`MINUTE TO SECOND`,
+   `SECOND TO SECOND`) printed the true leading value stranded in the
+   wrong slot, and it always printed the full `HH:MM:SS` shape even when
+   the qualifier didn't reach that far (e.g. `HOUR TO MINUTE` showed a
+   spurious `:00` seconds field). Fixed by passing the qualifier's
+   start/effective-end into the formatter, which now walks the same
+   field-by-field sequence `sqli::decodeIntervalDayFraction` itself uses
+   (`tools/ifx_probe`'s own separate, more-broken copy of the same logic -
+   it unconditionally used `iv.day`, always 0 - got the identical fix).
+   Confirmed live via six new wire captures covering every previously-
+   untested leading-field/qualifier-reach combination (`HOUR TO HOUR`,
+   `HOUR TO MINUTE`, `MINUTE TO MINUTE`, `MINUTE TO SECOND`, `SECOND TO
+   SECOND`, `SECOND TO FRACTION(3)`) plus a negative case, which also
+   became new `sqli::decodeIntervalDayFraction` unit tests, closing the
+   "MINUTE/SECOND-anchored leading fields... untested" decode-side gap
+   this class had carried since the original commit (only `HOUR TO
+   SECOND` was previously confirmed, and it happens to reach all the way
+   to SECOND, so the formatter bug didn't manifest for that specific
+   shape). See `docs/protocol-notes.md`'s INTERVAL DAY-FRACTION class
+   section for the full writeup.
 4. **No DSN-based connect (`SQLConnect`).** Only `SQLDriverConnect` with an
    explicit keyword string works today. Fine for `isql -k`, but many
    GUI/ODBC-Admin tools default to the DSN path.
@@ -426,12 +436,12 @@ write every column type a real database has, and has to actually be
 callable from BOP's own code; catalog-completeness and driver-manager
 polish don't block that.
 
-1. **Remaining scalar types beyond the MVP-8 set - fix
-   `formatIntervalDayFraction`'s MINUTE/SECOND-anchored rendering bug (see
-   item 3 - found this session, small and self-contained), then INTERVAL's
-   ODBC `SQLBindParameter` wiring (needs `ColumnSize`/`DecimalDigits`
-   plumbed through - see item 7; `SQLColumns` and sqli-layer bind are
-   already done for both classes), then LOBs (both bind and fetch sides).
+1. **Remaining scalar types beyond the MVP-8 set - INTERVAL's ODBC
+   `SQLBindParameter` wiring (needs `ColumnSize`/`DecimalDigits` plumbed
+   through - see item 7; `SQLColumns`, sqli-layer bind, and the
+   DAY-FRACTION text-rendering bug found and fixed this session are all
+   done for both classes - see item 3), then LOBs (both bind and fetch
+   sides).
    BOOLEAN, FLOAT/SMALLFLOAT, and DATETIME (including sub-second FRACTION)
    are fully done end to end (bind, fetch, and catalog rows, sqli-layer
    plus ODBC-layer). All of this confirmed live - DATETIME/FRACTION and

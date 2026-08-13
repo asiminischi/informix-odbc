@@ -1081,26 +1081,54 @@ path for `SQLGetTypeInfo`, and the real Driver Manager isn't reachable in
 this environment) currently exercises it, so it's an open, documented gap
 rather than an oversight.
 
-**A pre-existing bug found while deriving `COLUMN_SIZE`'s formula, not
-fixed here**: `driver/convert.cpp`'s `formatIntervalDayFraction` (the
-`SQL_C_CHAR` text surface, shipped in the DAY-FRACTION decode commit) only
-receives `hasDayField`, not the qualifier's actual start/end reach. Its
-`!hasDayField` branch always feeds `iv.hour` as the first printed field
+**A bug found while deriving `COLUMN_SIZE`'s formula, now fixed**:
+`driver/convert.cpp`'s `formatIntervalDayFraction` (the `SQL_C_CHAR` text
+surface, shipped in the DAY-FRACTION decode commit) originally only
+received `hasDayField`, not the qualifier's actual start/end reach. Its
+`!hasDayField` branch always fed `iv.hour` as the first printed field
 regardless of which field is actually the qualifier's leader - a
 MINUTE-anchored or SECOND-anchored qualifier (`MINUTE TO SECOND`,
-`SECOND TO SECOND`) would print the true leading value stranded in the
-wrong slot (e.g. `0:04:05` instead of a correct minute-leading rendering)
-rather than in the first slot - and it always prints the full `HH:MM:SS`
-shape regardless of whether the qualifier actually reaches that far (e.g.
-`HOUR TO MINUTE` would show a spurious `:00` seconds field). Both stem
-from the same root cause: the formatter needs the qualifier's start *and*
-end passed in, not just `hasDayField`. `sqli::decodeIntervalDayFraction`
-itself is unaffected (its own field-by-field decode already handles
-MINUTE/SECOND-anchored qualifiers correctly, per its own doc comment); this
-is purely a `driver/convert.cpp` text-rendering gap. Confirmed reachable
-(the sqli-layer decode guard accepts `start` in `{DAY, HOUR, MINUTE,
-SECOND}`), not yet independently live-captured for the specific
-MINUTE/SECOND-anchored cases - see `STATUS.md`'s open items.
+`SECOND TO SECOND`) printed the true leading value stranded in the wrong
+slot (e.g. `0:04:05` instead of a correct minute-leading rendering) rather
+than in the first slot - and it always printed the full `HH:MM:SS` shape
+regardless of whether the qualifier actually reached that far (e.g.
+`HOUR TO MINUTE` showed a spurious `:00` seconds field). Both stemmed from
+the same root cause: the formatter needed the qualifier's start *and* end,
+not just `hasDayField`. `sqli::decodeIntervalDayFraction` itself was
+unaffected (its own field-by-field decode already handles
+MINUTE/SECOND-anchored qualifiers correctly, per its own doc comment) -
+this was purely a `driver/convert.cpp` text-rendering gap.
+
+Fixed by passing `start`/`wholeEnd` (the same effective-end-with-FRACTION-
+collapsed-to-SECOND convention `driver/catalog.cpp`'s INTERVAL dispatch
+also uses) into the formatter, which now walks the same start..wholeEnd
+field sequence `decodeIntervalDayFraction` itself does: the leading field
+(whichever of day/hour/minute/second `start` names) prints unpadded with
+the sign, each subsequent field in `{HOUR, MINUTE, SECOND}` up to
+`wholeEnd` prints as a zero-padded `:NN` suffix (space instead of colon
+for the separator immediately after a DAY leading field, matching
+Informix's own `D HH:MM:SS` display), and nothing prints past `wholeEnd`.
+`tools/ifx_probe`'s own separate (and more broken - it unconditionally
+used `iv.day`, always 0, regardless of qualifier) inline copy of this
+logic got the identical fix.
+
+Confirmed live via a probe table (`fmt_probe`) covering the four
+previously-unconfirmed leading-field/qualifier-reach combinations plus a
+FRACTION and a negative case: `HOUR(3) TO HOUR` -> `123`; `HOUR(3) TO
+MINUTE` -> `123:45`; `MINUTE(3) TO MINUTE` -> `123` (previously would have
+used `iv.hour`, always 0, as the leader); `MINUTE(3) TO SECOND` ->
+`123:45`; `SECOND(3) TO SECOND` -> `123`; `SECOND(2) TO FRACTION(3)` ->
+`45.678`; negative `MINUTE(3) TO SECOND` (`-05:09`) -> `-5:09`. The same
+six wire captures also became new `sqli::decodeIntervalDayFraction` unit
+tests (`tests/sqli/test_types.cpp`'s `INTERVAL DAY TO FRACTION` test),
+closing the "HOUR/MINUTE/SECOND-anchored leading fields... aren't
+independently live-tested" gap this class's decode side had carried since
+the original DAY-FRACTION commit - only `HOUR TO SECOND` (which happens to
+reach all the way to SECOND, so the old formatter bug didn't manifest for
+that specific shape) was previously confirmed. `driver/convert.cpp`'s own
+fixed output was checked directly against these same captured bytes
+without a live connection (see this document's Windows ODBC DM note for
+why), not yet independently confirmed through the real Driver Manager.
 
 ## Open questions / risks
 

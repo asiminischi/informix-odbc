@@ -3,6 +3,7 @@
 #include "sqli/types.h"
 #include "sqli/version.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <span>
@@ -119,9 +120,37 @@ void printColumnValue(const ifxsqli::ColumnDesc& col, std::span<const std::byte>
             if (!v) { std::printf("<error: %s>", v.error().message.c_str()); return; }
             if (!*v) { std::printf("NULL"); return; }
             const auto& iv = **v;
-            std::printf("%s%lld %02lld:%02lld:%02lld", iv.negative ? "-" : "", static_cast<long long>(iv.day),
-                        static_cast<long long>(iv.hour), static_cast<long long>(iv.minute),
-                        static_cast<long long>(iv.second));
+            // Prints only the fields the qualifier actually covers, with
+            // whichever of day/hour/minute/second is the leading field
+            // (per `startCode`) printed unpadded and first - a previous
+            // version unconditionally printed "day HH:MM:SS", which used
+            // iv.day (always 0 for non-DAY-anchored qualifiers) as the
+            // leading value and printed spurious trailing fields for any
+            // qualifier narrower than *_TO_SECOND (see
+            // driver/convert.cpp's formatIntervalDayFraction, which has
+            // the same fix and a fuller writeup of the bug).
+            unsigned endCode = col.encodedLength & 0xF;
+            unsigned wholeEnd = std::min(endCode, 10u);
+            long long leadingValue = 0;
+            switch (startCode) {
+                case 4: leadingValue = iv.day; break;
+                case 6: leadingValue = iv.hour; break;
+                case 8: leadingValue = iv.minute; break;
+                case 10: leadingValue = iv.second; break;
+            }
+            std::printf("%s%lld", iv.negative ? "-" : "", leadingValue);
+            const char* sepAfterLeading = (startCode == 4) ? " " : ":";
+            bool firstAfterLeading = true;
+            for (unsigned tu = startCode + 2; tu <= wholeEnd; tu += 2) {
+                long long value = 0;
+                switch (tu) {
+                    case 6: value = iv.hour; break;
+                    case 8: value = iv.minute; break;
+                    case 10: value = iv.second; break;
+                }
+                std::printf("%s%02lld", firstAfterLeading ? sepAfterLeading : ":", value);
+                firstAfterLeading = false;
+            }
             if (iv.fractionDigits > 0) {
                 std::printf(".%0*d", iv.fractionDigits, iv.fraction);
             }

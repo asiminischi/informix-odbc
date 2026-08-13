@@ -558,6 +558,72 @@ TEST_CASE("INTERVAL DAY TO FRACTION") {
         CHECK((*v)->fractionDigits == 0);
     }
 
+    // HOUR/MINUTE/SECOND-anchored leading fields, none of which the
+    // captures above independently exercise (only HOUR TO SECOND, which
+    // happens to reach all the way to SECOND) - six live captures
+    // (IFX_SQLI_TRACE via ifx_probe against fmt_probe) covering every
+    // remaining qualifier shape in this class: HOUR TO HOUR, HOUR TO
+    // MINUTE, MINUTE TO MINUTE, MINUTE TO SECOND, SECOND TO SECOND, and
+    // SECOND TO FRACTION(3). These also independently confirm
+    // decodeIntervalDayFraction's start-code dispatch places the leading
+    // value into `minute`/`second` (not `hour`, which
+    // driver/convert.cpp's formatIntervalDayFraction incorrectly assumed
+    // for these same shapes until this session - see STATUS.md).
+    {
+        constexpr std::uint32_t kEncLen = (3u << 8) | 0x66; // totalDigits=3, HOUR(6) to HOUR(6)
+        auto v = decodeIntervalDayFraction(fromHex("c4 01 17"), kEncLen);
+        REQUIRE(v.has_value());
+        REQUIRE(v->has_value());
+        CHECK((*v)->hour == 123);
+        CHECK((*v)->minute == 0);
+        CHECK((*v)->second == 0);
+    }
+    {
+        constexpr std::uint32_t kEncLen = (5u << 8) | 0x68; // totalDigits=5, HOUR(6) to MINUTE(8)
+        auto v = decodeIntervalDayFraction(fromHex("c4 01 17 2d"), kEncLen);
+        REQUIRE(v.has_value());
+        REQUIRE(v->has_value());
+        CHECK((*v)->hour == 123);
+        CHECK((*v)->minute == 45);
+        CHECK((*v)->second == 0);
+    }
+    {
+        constexpr std::uint32_t kEncLen = (3u << 8) | 0x88; // totalDigits=3, MINUTE(8) to MINUTE(8)
+        auto v = decodeIntervalDayFraction(fromHex("c3 01 17"), kEncLen);
+        REQUIRE(v.has_value());
+        REQUIRE(v->has_value());
+        CHECK((*v)->hour == 0);
+        CHECK((*v)->minute == 123);
+        CHECK((*v)->second == 0);
+    }
+    {
+        constexpr std::uint32_t kEncLen = (5u << 8) | 0x8A; // totalDigits=5, MINUTE(8) to SECOND(10)
+        auto v = decodeIntervalDayFraction(fromHex("c3 01 17 2d"), kEncLen);
+        REQUIRE(v.has_value());
+        REQUIRE(v->has_value());
+        CHECK((*v)->hour == 0);
+        CHECK((*v)->minute == 123);
+        CHECK((*v)->second == 45);
+    }
+    {
+        constexpr std::uint32_t kEncLen = (3u << 8) | 0xAA; // totalDigits=3, SECOND(10) to SECOND(10)
+        auto v = decodeIntervalDayFraction(fromHex("c2 01 17"), kEncLen);
+        REQUIRE(v.has_value());
+        REQUIRE(v->has_value());
+        CHECK((*v)->minute == 0);
+        CHECK((*v)->second == 123);
+    }
+    {
+        constexpr std::uint32_t kEncLen = (5u << 8) | 0xAD; // totalDigits=5, SECOND(10) to FRACTION(3)=13
+        auto v = decodeIntervalDayFraction(fromHex("c1 2d 43 50"), kEncLen);
+        REQUIRE(v.has_value());
+        REQUIRE(v->has_value());
+        CHECK((*v)->minute == 0);
+        CHECK((*v)->second == 45);
+        CHECK((*v)->fraction == 678);
+        CHECK((*v)->fractionDigits == 3);
+    }
+
     auto null = decodeIntervalDayFraction(fromHex("00 00 00 00 00 00 00 00"), (13u << 8) | 0x4F);
     REQUIRE(null.has_value());
     CHECK(!null->has_value());
