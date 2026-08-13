@@ -493,4 +493,16 @@ struct DecimalBindEncoding {
 // descriptor alone doesn't carry the value.
 inline constexpr std::size_t kSimpleLobDescriptorSize = 56;
 
+// Builds a SQ_BIND placeholder descriptor for a non-NULL simple LOB
+// parameter - the decompiled reference (IfxBlob.toIfx()) describes this as
+// "the same 56-byte descriptor shape, with tb_size patched in": all-zero
+// except tb_size (offset 16, 4 bytes big-endian) set to `contentLength`.
+// Deliberately does NOT set tb_start/tb_end (unlike a real fetched
+// descriptor, which has them) - the decompiled source only mentions
+// tb_size being patched, and this is genuinely a placeholder the server is
+// expected to replace, not a real descriptor being round-tripped, so
+// there's no live-fetched reference value to match beyond what's actually
+// claimed. NOT yet confirmed live.
+[[nodiscard]] std::vector<std::byte> encodeSimpleLobPlaceholder(std::uint32_t contentLength);
+
 } // namespace ifxsqli

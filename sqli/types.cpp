@@ -827,4 +827,11 @@ std::expected<std::vector<std::byte>, Error> encodeIntervalDayFraction(const Int
     return packIntervalMantissa(std::move(mantissa), value.negative ? -1 : 1, unnormalizedExp);
 }
 
+std::vector<std::byte> encodeSimpleLobPlaceholder(std::uint32_t contentLength) {
+    std::vector<std::byte> out(kSimpleLobDescriptorSize, std::byte{0});
+    auto sizeBytes = writeBigEndian<std::int32_t>(static_cast<std::int32_t>(contentLength));
+    std::copy(sizeBytes.begin(), sizeBytes.end(), out.begin() + 16);
+    return out;
+}
+
 } // namespace ifxsqli

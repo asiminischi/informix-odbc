@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <span>
 
 namespace ifxsqli {
 
@@ -190,6 +191,49 @@ void writeBindBlock(ByteWriter& w, const std::vector<BindParam>& params) {
         w.u16(p.precisionField);
         w.bytes(p.data);
         if (p.data.size() & 1) w.u8(0);
+    }
+
+    // Simple LOB (BYTE/TEXT) params carry only a placeholder descriptor in
+    // `data` above - the real content streams out-of-band here, gated by a
+    // dedicated SQ_BBIND(41) header (opcode::kBBind's doc comment) sent
+    // only when at least one non-NULL simple-LOB param is present
+    // (`blobCount`), found by reading the decompiled reference's
+    // sendBlob() directly (IfxSqli.java:3328) - the earlier research
+    // summary this driver's design was based on omitted this header
+    // entirely, which caused a live tag-56 (SQ_EXIT) rejection on the
+    // first attempt with any real content, since sendBind's SQ_BIND
+    // records + a bare, unwrapped SQ_BLOB stream isn't a request shape
+    // the server recognizes. A NULL simple-LOB param is skipped
+    // completely here - no chunk stream, not even an empty
+    // terminator-only one - matching sendBlob's own `!ival.isNull()`
+    // guard exactly (confirmed by reading the decompiled loop, not by
+    // guessing): only `blobCount` counts, and only non-NULL params ever
+    // get iterated inside sendBlob's own per-param loop.
+    std::size_t blobCount = 0;
+    for (const auto& p : params) {
+        if (!p.isNull && (p.ifxType == ifxtype::kByte || p.ifxType == ifxtype::kText)) ++blobCount;
+    }
+    if (blobCount > 0) {
+        w.u16(opcode::kBBind);
+        w.u16(static_cast<std::uint16_t>(blobCount));
+        constexpr std::size_t kMaxChunkSize = 1024;
+        for (const auto& p : params) {
+            if (p.isNull || (p.ifxType != ifxtype::kByte && p.ifxType != ifxtype::kText)) continue;
+            if (p.simpleLobContent) {
+                const auto& content = *p.simpleLobContent;
+                std::size_t offset = 0;
+                while (offset < content.size()) {
+                    std::size_t chunkLen = std::min(kMaxChunkSize, content.size() - offset);
+                    w.u16(opcode::kBlob);
+                    w.u16(static_cast<std::uint16_t>(chunkLen));
+                    w.bytes(std::span<const std::byte>(content).subspan(offset, chunkLen));
+                    if (chunkLen & 1) w.u8(0);
+                    offset += chunkLen;
+                }
+            }
+            w.u16(opcode::kBlob);
+            w.u16(0);
+        }
     }
 }
 

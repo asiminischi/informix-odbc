@@ -10,6 +10,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -398,6 +400,161 @@ void check(const char* label, bool condition) {
     return true;
 }
 
+// A simple LOB (BYTE/TEXT) descriptor's NULL sentinel, mirrored from
+// tools/ifx_probe/main.cpp's isSimpleLobNull - see sqli/types.h's
+// kSimpleLobDescriptorSize doc comment for how this was confirmed live.
+bool isSimpleLobNull(std::span<const std::byte> descriptor) {
+    return std::to_integer<unsigned>(descriptor[38]) == 0 && std::to_integer<unsigned>(descriptor[39]) == 1;
+}
+
+// Live round trip for simple LOB (BYTE/TEXT) SQ_BIND - see
+// sqli::encodeSimpleLobPlaceholder's doc comment and
+// SqliConnection::fetchSimpleLob for what's being exercised. Three inserts,
+// each independently significant during development: a small (<1024 byte,
+// single-chunk, odd-length) TEXT value; a NULL TEXT value bound ahead of
+// another parameter (the same desync-prone ordering checkNullBind already
+// exercises for other types - a NULL simple-LOB param needs no content
+// stream at all, per the decompiled reference's sendBlob(), unlike every
+// other NULL-able type here which still writes a 0 precisionField); and a
+// 5000-byte BYTE value forcing the client-side chunking loop
+// (writeBindBlock) to emit more than one SQ_BLOB chunk. All three, plus
+// the missing SQ_BBIND(41) header this driver's first attempt omitted
+// entirely (causing a live tag-56/SQ_EXIT connection drop), are documented
+// in docs/protocol-notes.md's Simple LOB section.
+[[nodiscard]] bool checkSimpleLobBind(const std::string& host, int port, const ConnectParams& params) {
+    auto conn = SqliConnection::connect(host, port, params);
+    if (!conn) {
+        std::fprintf(stderr, "connect failed: %s\n", conn.error().message.c_str());
+        return false;
+    }
+
+    std::string smallText = "hello simple lob bind";
+    std::vector<std::byte> smallTextBytes(smallText.size());
+    std::memcpy(smallTextBytes.data(), smallText.data(), smallText.size());
+    {
+        auto insertStmt = SqliStatement::prepare(*conn, "insert into bind_probe (col_text) values (?)");
+        if (!insertStmt) {
+            std::fprintf(stderr, "prepare insert(text) failed: %s\n", insertStmt.error().message.c_str());
+            return false;
+        }
+        BindParam textParam;
+        textParam.ifxType = ifxtype::kText;
+        textParam.data = encodeSimpleLobPlaceholder(static_cast<std::uint32_t>(smallTextBytes.size()));
+        textParam.simpleLobContent = smallTextBytes;
+        std::vector<BindParam> params2{textParam};
+        if (auto r = insertStmt->execute(params2); !r) {
+            std::fprintf(stderr, "execute insert(text) failed: %s\n", r.error().message.c_str());
+            return false;
+        }
+        if (auto r = insertStmt->close(); !r) return false;
+        if (auto r = insertStmt->release(); !r) return false;
+    }
+    {
+        auto insertStmt =
+            SqliStatement::prepare(*conn, "insert into bind_probe (col_text, col_integer) values (?, ?)");
+        if (!insertStmt) {
+            std::fprintf(stderr, "prepare insert(null text) failed: %s\n", insertStmt.error().message.c_str());
+            return false;
+        }
+        BindParam nullTextParam;
+        nullTextParam.ifxType = ifxtype::kText;
+        nullTextParam.isNull = true;
+        std::vector<BindParam> params2{nullTextParam,
+                                        BindParam{ifxtype::kInteger, false, encodeInteger(424242), kIntegerBindPrecision}};
+        if (auto r = insertStmt->execute(params2); !r) {
+            std::fprintf(stderr, "execute insert(null text) failed: %s\n", r.error().message.c_str());
+            return false;
+        }
+        if (auto r = insertStmt->close(); !r) return false;
+        if (auto r = insertStmt->release(); !r) return false;
+    }
+    std::vector<std::byte> bigBytes(5000);
+    for (std::size_t i = 0; i < bigBytes.size(); ++i) bigBytes[i] = static_cast<std::byte>((i * 37 + 11) & 0xFF);
+    {
+        auto insertStmt = SqliStatement::prepare(*conn, "insert into bind_probe (col_byte) values (?)");
+        if (!insertStmt) {
+            std::fprintf(stderr, "prepare insert(byte) failed: %s\n", insertStmt.error().message.c_str());
+            return false;
+        }
+        BindParam byteParam;
+        byteParam.ifxType = ifxtype::kByte;
+        byteParam.data = encodeSimpleLobPlaceholder(static_cast<std::uint32_t>(bigBytes.size()));
+        byteParam.simpleLobContent = bigBytes;
+        std::vector<BindParam> params2{byteParam};
+        if (auto r = insertStmt->execute(params2); !r) {
+            std::fprintf(stderr, "execute insert(byte) failed: %s\n", r.error().message.c_str());
+            return false;
+        }
+        if (auto r = insertStmt->close(); !r) return false;
+        if (auto r = insertStmt->release(); !r) return false;
+    }
+
+    auto selectStmt = SqliStatement::prepare(
+        *conn, "select col_text, col_integer, col_byte from bind_probe"
+               " where col_text is not null or col_integer = 424242 or col_byte is not null");
+    if (!selectStmt) {
+        std::fprintf(stderr, "prepare select failed: %s\n", selectStmt.error().message.c_str());
+        return false;
+    }
+    if (auto r = selectStmt->execute(); !r) {
+        std::fprintf(stderr, "execute select failed: %s\n", r.error().message.c_str());
+        return false;
+    }
+    bool sawSmallText = false, sawNullTextRow = false, sawBigByte = false;
+    int rowCount = 0;
+    for (;;) {
+        auto row = selectStmt->fetchRow();
+        if (!row) {
+            std::fprintf(stderr, "fetchRow failed: %s\n", row.error().message.c_str());
+            return false;
+        }
+        if (!*row) break;
+        ++rowCount;
+        const auto& r = **row;
+        bool textNull = isSimpleLobNull(r[0]);
+        auto integerVal = decodeInteger(r[1]);
+        bool byteNull = isSimpleLobNull(r[2]);
+
+        if (!textNull) {
+            auto content = conn->fetchSimpleLob(r[0]);
+            if (!content) {
+                std::fprintf(stderr, "fetchSimpleLob(text) failed: %s\n", content.error().message.c_str());
+                return false;
+            }
+            std::string s(reinterpret_cast<const char*>(content->data()), content->size());
+            check("small TEXT bind round-trips", s == smallText);
+            sawSmallText = true;
+        } else if (integerVal && integerVal->has_value() && **integerVal == 424242) {
+            check("NULL TEXT bound ahead of another param leaves that param intact", true);
+            sawNullTextRow = true;
+        } else if (!byteNull) {
+            auto content = conn->fetchSimpleLob(r[2]);
+            if (!content) {
+                std::fprintf(stderr, "fetchSimpleLob(byte) failed: %s\n", content.error().message.c_str());
+                return false;
+            }
+            bool match = content->size() == bigBytes.size();
+            if (match) {
+                for (std::size_t i = 0; i < content->size(); ++i) {
+                    if ((*content)[i] != bigBytes[i]) { match = false; break; }
+                }
+            }
+            check("5000-byte BYTE bind (multi-chunk write) round-trips exactly", match);
+            sawBigByte = true;
+        }
+    }
+    if (auto r = selectStmt->close(); !r) return false;
+    if (auto r = selectStmt->release(); !r) return false;
+    if (auto r = conn->executeCommand(
+            "delete from bind_probe where col_text is not null or col_integer = 424242 or col_byte is not null");
+        !r)
+        return false;
+    if (auto r = conn->disconnectOrderly(); !r) return false;
+
+    check("all three simple LOB bind rows found", rowCount == 3 && sawSmallText && sawNullTextRow && sawBigByte);
+    return true;
+}
+
 [[nodiscard]] bool run(const std::string& host, int port, const ConnectParams& params) {
     auto setup = SqliConnection::connect(host, port, params);
     if (!setup) {
@@ -413,7 +570,8 @@ void check(const char* label, bool condition) {
             " col_char char(20), col_varchar varchar(32), col_date date, col_decimal decimal(10,2),"
             " col_datetime datetime year to second, col_float float, col_smallfloat smallfloat,"
             " col_boolean boolean, col_datetime_frac datetime year to fraction(5),"
-            " col_interval_ym interval year(4) to month, col_interval_df interval day(4) to fraction(3))");
+            " col_interval_ym interval year(4) to month, col_interval_df interval day(4) to fraction(3),"
+            " col_text text, col_byte byte)");
         !r) {
         std::fprintf(stderr, "create table failed: %s\n", r.error().message.c_str());
         return false;
@@ -609,6 +767,10 @@ int main() {
         return 1;
     }
     if (!checkIntervalDayFractionRoundTrip(host, port, params, IntervalDayFractionValue{true, 5, 3, 4, 5, 678, 3})) {
+        std::printf("\nbind integration test FAILED to complete (see error above)\n");
+        return 1;
+    }
+    if (!checkSimpleLobBind(host, port, params)) {
         std::printf("\nbind integration test FAILED to complete (see error above)\n");
         return 1;
     }

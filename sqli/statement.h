@@ -51,6 +51,18 @@ struct BindParam {
     std::uint16_t precisionField = 0;
     std::optional<std::string> extendedOwnerName;
     std::optional<std::string> extendedTypeName;
+
+    // Simple LOB (BYTE/TEXT) binds only: the parameter's real content,
+    // streamed out-of-band under a dedicated SQ_BBIND(41) header
+    // immediately after the whole bind block (writeBindBlock,
+    // sqli/statement.cpp) - `data` for such a param instead carries the
+    // 56-byte SQ_BIND placeholder descriptor (see
+    // sqli::encodeSimpleLobPlaceholder), not the value. nullopt for every
+    // other type, and for a NULL simple-LOB value: a NULL simple-LOB
+    // param needs no content stream at all (confirmed against the
+    // decompiled reference's sendBlob(), which skips NULL params
+    // entirely - not even an empty terminator).
+    std::optional<std::vector<std::byte>> simpleLobContent;
 };
 
 // One prepared statement's cursor lifecycle: prepare -> execute (opens a

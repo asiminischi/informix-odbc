@@ -40,6 +40,14 @@ inline constexpr std::uint16_t kInsertDone = 94;
 inline constexpr std::uint16_t kFetchBlob = 38;
 inline constexpr std::uint16_t kBlob = 39;
 inline constexpr std::uint16_t kFerr = 40;
+// Precedes the bind-direction chunk streams: u16(count of non-NULL
+// simple-LOB params in this bind), sent once per SQ_BIND that has any -
+// found by reading the decompiled reference's sendBlob() directly
+// (IfxSqli.java:3328), not mentioned in this driver's own earlier
+// research summary of sendBind's blob-chunk tail. Omitting this header
+// causes the server to reject the whole bind with a lone tag-56
+// (SQ_EXIT) response and drop the connection - confirmed live.
+inline constexpr std::uint16_t kBBind = 41;
 inline constexpr std::uint16_t kNonCursorDescribe = 22;
 inline constexpr std::uint16_t kReturnType = 100;
 inline constexpr std::uint16_t kWantDone = 49;

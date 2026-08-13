@@ -984,15 +984,63 @@ source file (`cmp`, exact match). `splitRow` (`sqli/statement.cpp`) treats
 locating the descriptor within a row - the same shape `kChar` already uses,
 just interpreted completely differently downstream.
 
-**Not yet done**: the ODBC `SQLGetData`/`SQLBindCol` surface for these
-types (deferred - this section only covers the sqli layer, matching this
-project's usual sqli-first/ODBC-surface-later sequencing, e.g. INTERVAL's
-own history), and the bind/write direction (`SQ_BIND` for a simple-LOB "?"
-parameter is a plain scalar slot carrying the same 56-byte descriptor shape
-as a placeholder, immediately followed by an out-of-band `SQ_BLOB`(39)
-chunk stream capped at 1024 bytes/chunk and terminated by a zero-length
-chunk - reverse-engineered from the decompiled reference's `sendBind`/
-`sendStreamBlob`, not yet independently confirmed live).
+**Bind (write direction) - now done and confirmed live.** A simple-LOB "?"
+parameter's `SQ_BIND` record is an ordinary scalar slot (type/indicator/
+precision/data, no extended owner/name - types 11/12 are below the `type >
+18` threshold that gates extended-type framing) whose `data` carries a
+56-byte *placeholder* descriptor, not the value: all-zero except `tb_size`
+(offset 16, 4 bytes big-endian) set to the content's byte length
+(`sqli::encodeSimpleLobPlaceholder`, mirroring the decompiled reference's
+`IfxBlob.toIfx()`, which patches only that one field into an
+otherwise-untouched `blobDesc`). `precisionField` is left at `0` -
+`IfxBlob` never overrides `IfxObject.getEncodedLength()`'s zero default,
+unlike DECIMAL/CHAR/VARCHAR's own precisionField conventions.
+
+**The real content streams out-of-band, but critically under a header this
+project's own prior research summary of the decompiled source had missed
+entirely**: immediately after the whole `SQ_BIND` block (every param's
+type/indicator/precision/data, in order), IF at least one bound param is a
+non-NULL simple LOB, the client sends `SQ_BBIND`(41) + `u16` count of such
+params, THEN, for each non-NULL simple-LOB param in order, its content as
+`SQ_BLOB`(39) chunks (`u16` length + that many bytes, padded to even
+length, capped at 1024 bytes/chunk) terminated by a zero-length `SQ_BLOB`
+chunk. A NULL simple-LOB param is skipped entirely in this phase - no
+chunk stream, not even an empty terminator - confirmed by reading the
+decompiled reference's `sendBlob()` (`IfxSqli.java:3328`) directly rather
+than trusting the earlier paraphrase: its per-param loop is explicitly
+gated on `!ival.isNull()`, and `blobCount` (the count field) is
+incremented under the identical condition inside `sendBind` itself.
+
+**How the missing header was found**: the first live attempt (bind record
++ a bare `SQ_BLOB` chunk stream, no `SQ_BBIND` wrapper - matching this
+project's own earlier research summary, which had paraphrased `sendBlob`'s
+existence but dropped its own opening `SQ_BBIND`(41)+count header) got a
+lone tag-56 (`SQ_EXIT`) response and the connection dropped - the same
+generic "malformed request" failure signature already documented for
+BOOLEAN's missing owner/name. Isolating which part of the request
+triggered it (a terminator-only stream with zero real chunks succeeded; a
+single real data chunk, any size, failed identically) pointed at the chunk
+stream itself rather than the base bind record, which is what prompted
+re-reading `IfxSqli.java` directly instead of the earlier summary -
+`sendBlob()`'s own first three lines (`writeSmallInt(41)`,
+`writeSmallInt(count)`, `flush()`) were the missing piece.
+
+Confirmed live via `tests/integration/test_bind.cpp`'s `checkSimpleLobBind`
+(part of the default `bind_integration` test, not a one-off probe): a
+small (21-byte, odd-length, single-chunk) `TEXT` value round-trips
+correctly; a `NULL` `TEXT` value bound ahead of another parameter in the
+same statement doesn't desync the following parameter (the same
+desync-prone ordering already exercised for other types via
+`checkNullBind`); and a 5000-byte `BYTE` value (five chunks: four 1024-byte
+chunks plus a 904-byte remainder) round-trips byte-for-byte exact,
+confirming the client-side chunking loop (`writeBindBlock`,
+`sqli/statement.cpp`) is correct for a multi-chunk upload, not just a
+single-chunk one.
+
+**Not yet done**: the ODBC `SQLGetData`/`SQLBindCol`/`SQLBindParameter`
+surface for either type (deferred - this section only covers the sqli
+layer, matching this project's usual sqli-first/ODBC-surface-later
+sequencing, e.g. INTERVAL's own history).
 
 Test fixture note: seeding real BYTE/TEXT row data for live testing turned
 out to need `dbaccess`'s `LOAD FROM 'file' INSERT INTO table(col)` command,

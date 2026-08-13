@@ -407,11 +407,24 @@ Roughly in the order they'd bite a real application:
    live down to which exact byte signals NULL) and accumulates `SQ_BLOB`(39)
    response chunks; confirmed live via `tools/ifx_probe` for both BYTE and
    TEXT, including NULL and a 200KB value spanning multiple chunks
-   (byte-for-byte exact). Still missing: simple-LOB *bind*, and all of
-   smart LOBs (BLOB/CLOB share ifxType 41 with BOOLEAN and currently
-   misdecode; getting their content needs a whole fastpath-RPC subsystem
-   this driver doesn't have yet, reverse-engineered but not implemented -
-   see `docs/protocol-notes.md`).
+   (byte-for-byte exact). Simple-LOB **bind is now done too**:
+   `SQ_BIND` carries a 56-byte placeholder descriptor
+   (`sqli::encodeSimpleLobPlaceholder`, only `tb_size` patched in), and the
+   real content streams separately under a dedicated `SQ_BBIND`(41)+count
+   header followed by `SQ_BLOB`(39) chunks - a header this project's own
+   first research pass on the decompiled source missed entirely, causing a
+   live tag-56/`SQ_EXIT` connection drop on the first attempt; found by
+   re-reading `IfxSqli.java`'s `sendBlob()` directly after bisecting which
+   part of the request triggered the failure. Confirmed live and now a
+   permanent `ctest` (`tests/integration/test_bind.cpp`'s
+   `checkSimpleLobBind`, part of `bind_integration`): a small odd-length
+   value, a NULL value bound ahead of another parameter (no desync), and a
+   5000-byte multi-chunk upload all round-trip correctly. Still missing:
+   the ODBC `SQLGetData`/`SQLBindParameter` surface for either simple-LOB
+   type, and all of smart LOBs (BLOB/CLOB share ifxType 41 with BOOLEAN
+   and currently misdecode; getting their content needs a whole
+   fastpath-RPC subsystem this driver doesn't have yet, reverse-engineered
+   but not implemented - see `docs/protocol-notes.md`).
 8. **No real generated-key retrieval.** The `SQ_INSERTDONE` wire field is
    decoded, but the driver never sends the extra "SGK" request the server
    needs to actually populate it, so every INSERT currently reports a
@@ -483,12 +496,14 @@ polish don't block that.
    Linux/WSL2 path (see item 5's Windows DM gap) not set up in this
    environment. LOBs split into two unrelated mechanisms once
    investigated (simple BYTE/TEXT vs. smart BLOB/CLOB, sharing nothing at
-   the wire level - see `docs/protocol-notes.md`); simple-LOB **fetch is
-   now done and confirmed live at the sqli layer** (`SqliConnection::
-   fetchSimpleLob`, confirmed via `tools/ifx_probe` including a 200KB
-   multi-chunk value) - simple-LOB bind, the ODBC `SQLGetData` surface for
-   either type, and all of smart LOBs (needs a fastpath-RPC subsystem,
-   reverse-engineered but not implemented) remain.**
+   the wire level - see `docs/protocol-notes.md`); simple-LOB **fetch and
+   bind are now both done and confirmed live at the sqli layer**
+   (`SqliConnection::fetchSimpleLob`/`writeBindBlock`'s `SQ_BBIND`(41)
+   chunk-stream tail, the latter now a permanent `ctest` via
+   `tests/integration/test_bind.cpp`'s `checkSimpleLobBind`) - the ODBC
+   `SQLGetData`/`SQLBindParameter` surface for either type, and all of
+   smart LOBs (needs a fastpath-RPC subsystem, reverse-engineered but not
+   implemented) remain.**
    Blocking: a real Informix database backup/restore tool can't skip
    columns of a type it doesn't support. Smart LOBs in particular need
    their own multi-message wire handling (confirmed, not just suspected,
