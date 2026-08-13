@@ -65,6 +65,8 @@ SQLSMALLINT sqlTypeFor(int ifxType) {
         case kBoolean: return SQL_BIT;
         case kFloat: return SQL_DOUBLE;
         case kSmallFloat: return SQL_REAL;
+        case kByte: return SQL_LONGVARBINARY;
+        case kText: return SQL_LONGVARCHAR;
         default: return SQL_VARCHAR; // unknown types still round-trip as text (driver/convert.h's default case)
     }
 }
@@ -86,6 +88,13 @@ SQLULEN columnSizeFor(const ifxsqli::ColumnDesc& col) {
         case kBoolean: return 1;
         case kFloat: return 15;      // SQL_DOUBLE's standard COLUMN_SIZE (ODBC spec)
         case kSmallFloat: return 7;  // SQL_REAL's standard COLUMN_SIZE (ODBC spec)
+        // Simple LOBs have no declared width (unlike CHAR/VARCHAR's
+        // collength) - INT32_MAX is an unconfirmed first hypothesis
+        // (matching a common ODBC driver convention for "unbounded" long
+        // types), not traced against a live SQLColumns/SQLDescribeCol
+        // capture the way DATE's precisionField=4 eventually was.
+        case kByte:
+        case kText: return 2147483647;
         default: return 0;
     }
 }
@@ -94,14 +103,104 @@ SQLSMALLINT decimalDigitsFor(const ifxsqli::ColumnDesc& col) {
     return (col.ifxType == ifxsqli::ifxtype::kDecimal) ? static_cast<SQLSMALLINT>(col.encodedLength & 0xFF) : 0;
 }
 
+// Simple LOB (BYTE/TEXT) column fetch: genuinely can't live in
+// formatCellAsText/writeNativeCell's pure (raw bytes in, value out)
+// signatures the way every other type does, since `raw` here is only the
+// 56-byte in-row descriptor (sqli/types.h's kSimpleLobDescriptorSize doc
+// comment) - the actual content needs a second network round trip
+// (SqliConnection::fetchSimpleLob) via the statement's connection.
+//
+// `state` is nullptr for a SQLBindCol-driven fetch (SQLFetch's
+// bound-column loop): every other bound column type is single-shot
+// (truncate-if-too-small, no resumability across calls), and this matches
+// that by using a throwaway local LobFetchState that's discarded after
+// one call, so a bound LOB column behaves the same way. Non-null for the
+// SQLGetData path, where the caller (SQLGetData) looks up/creates a
+// per-column entry in OdbcStatement::lobFetchState so repeated calls
+// resume from where the last one left off, per the ODBC-standard
+// "SQLGetData in a loop with a small buffer" idiom LOBs specifically
+// exist for - confirmed live via a direct-export harness driving exactly
+// that loop with a deliberately small buffer against a multi-chunk value
+// (see docs/protocol-notes.md's Simple LOB section).
+SQLRETURN writeSimpleLobColumnValue(OdbcStatement* s, const ifxsqli::ColumnDesc& col, std::span<const std::byte> raw,
+                                     SQLSMALLINT targetType, SQLPOINTER targetValuePtr, SQLLEN bufferLength,
+                                     SQLLEN* strLenOrIndPtr, LobFetchState* state) {
+    if (raw.size() != ifxsqli::kSimpleLobDescriptorSize) {
+        postDriverError(s->diag, "HY000", "malformed simple LOB descriptor");
+        return SQL_ERROR;
+    }
+    // NULL sentinel: tb_flags (offset 38-39) exactly 1 - see
+    // sqli/types.h's kSimpleLobDescriptorSize doc comment. Checked before
+    // ever touching `state`/the network, same as every other type's NULL
+    // short-circuit.
+    if (std::to_integer<unsigned>(raw[38]) == 0 && std::to_integer<unsigned>(raw[39]) == 1) {
+        if (strLenOrIndPtr) *strLenOrIndPtr = SQL_NULL_DATA;
+        return SQL_SUCCESS;
+    }
+
+    SQLSMALLINT effectiveType = targetType;
+    if (effectiveType == SQL_C_DEFAULT) {
+        effectiveType = (col.ifxType == ifxsqli::ifxtype::kText) ? SQL_C_CHAR : SQL_C_BINARY;
+    }
+    if (effectiveType != SQL_C_CHAR && effectiveType != SQL_C_BINARY) {
+        postDriverError(s->diag, "07006", "restricted data type attribute violation");
+        return SQL_ERROR;
+    }
+
+    LobFetchState localState;
+    LobFetchState& st = state ? *state : localState;
+    if (st.exhausted) return SQL_NO_DATA;
+    if (!st.loaded) {
+        auto content = s->conn->sqli->fetchSimpleLob(raw);
+        if (!content) {
+            postSqliError(s->diag, content.error());
+            return SQL_ERROR;
+        }
+        st.content = std::move(*content);
+        st.loaded = true;
+    }
+
+    std::size_t available = st.content.size() - st.offset;
+    std::size_t capacity = 0;
+    if (bufferLength > 0) {
+        capacity = effectiveType == SQL_C_CHAR ? static_cast<std::size_t>(bufferLength) - 1
+                                                : static_cast<std::size_t>(bufferLength);
+    }
+    // Written as a ternary, not std::min, to avoid colliding with
+    // windows.h's own min macro in this translation unit (same avoidance
+    // driver/bind_encode.cpp uses).
+    std::size_t toCopy = capacity < available ? capacity : available;
+    if (targetValuePtr && toCopy > 0) {
+        std::memcpy(targetValuePtr, st.content.data() + st.offset, toCopy);
+    }
+    if (effectiveType == SQL_C_CHAR && targetValuePtr && bufferLength > 0) {
+        static_cast<char*>(targetValuePtr)[toCopy] = '\0';
+    }
+    if (strLenOrIndPtr) *strLenOrIndPtr = static_cast<SQLLEN>(available);
+    st.offset += toCopy;
+    bool truncated = toCopy < available;
+    if (!truncated) st.exhausted = true;
+    if (truncated) {
+        postDriverError(s->diag, "01004", "string data, right-truncated");
+        return SQL_SUCCESS_WITH_INFO;
+    }
+    return SQL_SUCCESS;
+}
+
 // Shared by SQLFetch's bound-column loop and SQLGetData: writes one cell to
 // an application buffer per the requested C type, posting whichever
 // diagnostic fits the outcome. SQL_C_CHAR/SQL_C_DEFAULT stays on the
 // existing text path (driver/convert.h); every other supported C type
-// (slice 3) goes through driver/convert_native.h.
+// (slice 3) goes through driver/convert_native.h. `lobState` is only
+// consulted for BYTE/TEXT columns - see writeSimpleLobColumnValue's doc
+// comment.
 SQLRETURN writeColumnValue(OdbcStatement* s, const ifxsqli::ColumnDesc& col, std::span<const std::byte> raw,
                            SQLSMALLINT targetType, SQLPOINTER targetValuePtr, SQLLEN bufferLength,
-                           SQLLEN* strLenOrIndPtr) {
+                           SQLLEN* strLenOrIndPtr, LobFetchState* lobState = nullptr) {
+    if (col.ifxType == ifxsqli::ifxtype::kByte || col.ifxType == ifxsqli::ifxtype::kText) {
+        return writeSimpleLobColumnValue(s, col, raw, targetType, targetValuePtr, bufferLength, strLenOrIndPtr,
+                                          lobState);
+    }
     if (targetType == SQL_C_CHAR || targetType == SQL_C_DEFAULT) {
         auto cell = formatCellAsText(col, raw);
         if (!cell) {
@@ -488,7 +587,14 @@ IFXODBC_EXPORT SQLRETURN SQL_API SQLBindCol(SQLHSTMT StatementHandle, SQLUSMALLI
         s->boundColumns.erase(ColumnNumber);
         return SQL_SUCCESS;
     }
-    if (TargetType != SQL_C_CHAR && TargetType != SQL_C_DEFAULT && !isNativeTargetType(TargetType)) {
+    // SQL_C_BINARY is allowed here alongside SQL_C_CHAR/SQL_C_DEFAULT (not
+    // folded into isNativeTargetType, which is specifically
+    // driver/convert_native.cpp's own native numeric/date dispatch) - only
+    // meaningful for a simple LOB (BYTE) column; requesting it against any
+    // other column type is rejected later, in writeColumnValue, the same
+    // way every other type-mismatched C target type already is.
+    if (TargetType != SQL_C_CHAR && TargetType != SQL_C_DEFAULT && TargetType != SQL_C_BINARY &&
+        !isNativeTargetType(TargetType)) {
         postDriverError(s->diag, "HYC00", "SQLBindCol: unsupported C target type");
         return SQL_ERROR;
     }
@@ -512,9 +618,13 @@ IFXODBC_EXPORT SQLRETURN SQL_API SQLFetch(SQLHSTMT StatementHandle) {
     }
     if (!*row) {
         s->currentRow.reset();
+        s->lobFetchState.clear();
         return SQL_NO_DATA;
     }
     s->currentRow = std::move(*row);
+    // A new row means any simple-LOB SQLGetData resumable state from the
+    // previous row is stale - see LobFetchState's doc comment.
+    s->lobFetchState.clear();
 
     bool anyInfo = false;
     const auto& cols = s->stmt->columns();
@@ -537,7 +647,8 @@ IFXODBC_EXPORT SQLRETURN SQL_API SQLGetData(SQLHSTMT StatementHandle, SQLUSMALLI
         postDriverError(s->diag, "HY010", "function sequence error: no current row (call SQLFetch first)");
         return SQL_ERROR;
     }
-    if (TargetType != SQL_C_CHAR && TargetType != SQL_C_DEFAULT && !isNativeTargetType(TargetType)) {
+    if (TargetType != SQL_C_CHAR && TargetType != SQL_C_DEFAULT && TargetType != SQL_C_BINARY &&
+        !isNativeTargetType(TargetType)) {
         postDriverError(s->diag, "HYC00", "SQLGetData: unsupported C target type");
         return SQL_ERROR;
     }
@@ -547,8 +658,20 @@ IFXODBC_EXPORT SQLRETURN SQL_API SQLGetData(SQLHSTMT StatementHandle, SQLUSMALLI
         return SQL_ERROR;
     }
 
-    return writeColumnValue(s, cols[ColumnNumber - 1], (*s->currentRow)[ColumnNumber - 1], TargetType, TargetValuePtr,
-                             BufferLength, StrLen_or_IndPtr);
+    // Simple LOB (BYTE/TEXT) columns get a persistent, per-column resumable
+    // fetch state so repeated SQLGetData calls on the same column (the
+    // standard ODBC idiom for pulling a large value through a small
+    // buffer) continue from where the previous call left off, rather than
+    // re-fetching/re-copying from the start - see LobFetchState's doc
+    // comment. Every other column type ignores this (writeColumnValue only
+    // consults it for kByte/kText).
+    const auto& col = cols[ColumnNumber - 1];
+    LobFetchState* lobState = nullptr;
+    if (col.ifxType == ifxsqli::ifxtype::kByte || col.ifxType == ifxsqli::ifxtype::kText) {
+        lobState = &s->lobFetchState[ColumnNumber];
+    }
+    return writeColumnValue(s, col, (*s->currentRow)[ColumnNumber - 1], TargetType, TargetValuePtr, BufferLength,
+                             StrLen_or_IndPtr, lobState);
 }
 
 IFXODBC_EXPORT SQLRETURN SQL_API SQLFreeStmt(SQLHSTMT StatementHandle, SQLUSMALLINT Option) {

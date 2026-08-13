@@ -419,11 +419,30 @@ Roughly in the order they'd bite a real application:
    permanent `ctest` (`tests/integration/test_bind.cpp`'s
    `checkSimpleLobBind`, part of `bind_integration`): a small odd-length
    value, a NULL value bound ahead of another parameter (no desync), and a
-   5000-byte multi-chunk upload all round-trip correctly. Still missing:
-   the ODBC `SQLGetData`/`SQLBindParameter` surface for either simple-LOB
-   type, and all of smart LOBs (BLOB/CLOB share ifxType 41 with BOOLEAN
-   and currently misdecode; getting their content needs a whole
-   fastpath-RPC subsystem this driver doesn't have yet, reverse-engineered
+   5000-byte multi-chunk upload all round-trip correctly. **The ODBC
+   surface (`SQLBindParameter`/`SQLGetData`/`SQLBindCol`) is now done
+   too** - the one real architectural addition, not just another type
+   case: `SQLGetData` was single-shot for every type before this (one call
+   copies or truncates the whole value, no way to resume), the wrong
+   contract for the standard ODBC "loop `SQLGetData` with a small buffer"
+   LOB idiom. Scoped to a new `LobFetchState` (`driver/handles.h`,
+   `OdbcStatement::lobFetchState`) used only for BYTE/TEXT `SQLGetData`
+   calls, cleared each `SQLFetch` - every other type's existing single-shot
+   behavior is untouched. `SQLBindCol` intentionally stays single-shot for
+   LOB columns too (matches every other bound column type). Confirmed
+   live, first attempt, no hang, through this driver's own exported ODBC
+   entry points (same technique as INTERVAL's `SQLBindParameter` check):
+   `SQLBindParameter` insert of both types (including a 5000-byte BYTE
+   forcing the multi-chunk bind path from the ODBC surface), a NULL bind
+   ahead of another parameter, chunked `SQLGetData` reassembly of both a
+   TEXT value (4-byte buffer, `SQL_C_CHAR`) and the 5000-byte BYTE value
+   (7-byte buffer, `SQL_C_BINARY`) - both byte-exact - and `SQLBindCol`
+   single-shot fetch (both a large-enough buffer and a truncating small
+   one). `SQLGetTypeInfo`/`SQLColumns` report both types now too
+   (`SQL_LONGVARBINARY`(-4)/`SQL_LONGVARCHAR`(-1)). Still missing: all of
+   smart LOBs (BLOB/CLOB share ifxType 41 with BOOLEAN and currently
+   misdecode; getting their content needs a whole fastpath-RPC subsystem
+   this driver doesn't have yet, reverse-engineered
    but not implemented - see `docs/protocol-notes.md`).
 8. **No real generated-key retrieval.** The `SQ_INSERTDONE` wire field is
    decoded, but the driver never sends the extra "SGK" request the server
@@ -496,14 +515,12 @@ polish don't block that.
    Linux/WSL2 path (see item 5's Windows DM gap) not set up in this
    environment. LOBs split into two unrelated mechanisms once
    investigated (simple BYTE/TEXT vs. smart BLOB/CLOB, sharing nothing at
-   the wire level - see `docs/protocol-notes.md`); simple-LOB **fetch and
-   bind are now both done and confirmed live at the sqli layer**
-   (`SqliConnection::fetchSimpleLob`/`writeBindBlock`'s `SQ_BBIND`(41)
-   chunk-stream tail, the latter now a permanent `ctest` via
-   `tests/integration/test_bind.cpp`'s `checkSimpleLobBind`) - the ODBC
-   `SQLGetData`/`SQLBindParameter` surface for either type, and all of
-   smart LOBs (needs a fastpath-RPC subsystem, reverse-engineered but not
-   implemented) remain.**
+   the wire level - see `docs/protocol-notes.md`); simple-LOB **fetch,
+   bind, and now the full ODBC surface (`SQLBindParameter`/`SQLGetData`/
+   `SQLBindCol`, including a new resumable-chunk `SQLGetData` mechanism -
+   see item 7) are all done and confirmed live** - only smart LOBs (needs
+   a fastpath-RPC subsystem, reverse-engineered but not implemented)
+   remain.**
    Blocking: a real Informix database backup/restore tool can't skip
    columns of a type it doesn't support. Smart LOBs in particular need
    their own multi-message wire handling (confirmed, not just suspected,

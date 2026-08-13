@@ -255,6 +255,14 @@ constexpr TypeMapEntry kTypeMap[] = {
     {ifxsqli::ifxtype::kBoolean, SQL_BIT, SQL_BIT, 0, "boolean", 0},
     {ifxsqli::ifxtype::kFloat, SQL_DOUBLE, SQL_DOUBLE, 0, "float", 2},
     {ifxsqli::ifxtype::kSmallFloat, SQL_REAL, SQL_REAL, 0, "smallfloat", 2},
+    // Simple LOBs (BYTE/TEXT): unlike every type above, these are plain
+    // scalars at the catalog layer too (confirmed live via DESCRIBE - see
+    // sqli/types.h's kByte/kText doc comment), so this single-row-per-type
+    // kTypeMap entry is enough, the same as BOOLEAN/FLOAT/SMALLFLOAT -
+    // unlike INTERVAL, no per-qualifier special-casing is needed. No
+    // radix (matches CHAR/VARCHAR/BOOLEAN's own radix=0).
+    {ifxsqli::ifxtype::kByte, SQL_LONGVARBINARY, SQL_LONGVARBINARY, 0, "byte", 0},
+    {ifxsqli::ifxtype::kText, SQL_LONGVARCHAR, SQL_LONGVARCHAR, 0, "text", 0},
 };
 
 // `NULL` is not a valid substitute for 0 in the two fields (radix,
@@ -545,6 +553,15 @@ std::string caseColumnSize() {
            " when " +
            std::to_string(ifxsqli::ifxtype::kSmallFloat) +
            " then 7"
+           " when " +
+           std::to_string(ifxsqli::ifxtype::kByte) +
+           // Simple LOBs have no declared width (unlike CHAR/VARCHAR's
+           // collength) - matches driver/statement.cpp's columnSizeFor:
+           // an unconfirmed first-hypothesis sentinel, not traced live.
+           " then 2147483647"
+           " when " +
+           std::to_string(ifxsqli::ifxtype::kText) +
+           " then 2147483647"
            // INTERVAL's COLUMN_SIZE is a character display-size bound, the
            // same convention as DATE/DATETIME above (not the leading
            // field's own declared digit width alone, which ODBC gives its

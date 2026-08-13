@@ -39,6 +39,7 @@
 #define IFXODBC_EXPORT __attribute__((visibility("default")))
 #endif
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -151,6 +152,31 @@ struct ParamBinding {
     SQLSMALLINT decimalDigits = 0;
 };
 
+// SQLGetData's resumable-fetch state for one simple LOB (BYTE/TEXT)
+// column in the current row - genuinely needed only here: every other
+// type's SQLGetData call is single-shot (decode raw bytes -> write once),
+// but a LOB's actual content needs its own network round trip
+// (SqliConnection::fetchSimpleLob) and can be arbitrarily large, so the
+// ODBC-standard "call SQLGetData repeatedly with a small buffer" idiom
+// needs somewhere to remember how much has already been handed back.
+// Keyed per column in OdbcStatement::lobFetchState, cleared on every
+// SQLFetch (a fresh row means a fresh LOB, not a continuation of the
+// previous row's). NOT used for a SQLBindCol-driven fetch (SQLFetch's
+// bound-column loop) - that path stays single-shot-per-row, matching
+// every other bound column type's existing truncate-if-too-small
+// contract, by simply never persisting a LobFetchState across calls.
+struct LobFetchState {
+    std::vector<std::byte> content;
+    std::size_t offset = 0;
+    bool loaded = false;
+    // True once every byte has been handed to the caller via a
+    // non-truncated SQLGetData call - the actual "no more data" signal
+    // (SQL_NO_DATA), distinct from `offset == content.size()` alone,
+    // which a genuinely empty (0-byte, non-NULL) LOB value would satisfy
+    // on its very first call too.
+    bool exhausted = false;
+};
+
 struct OdbcStatement {
     explicit OdbcStatement(OdbcConnection* c) : conn(c) {}
 
@@ -179,6 +205,11 @@ struct OdbcStatement {
     // returned by SqliStatement::fetchRow), consulted by SQLGetData for
     // columns that weren't bound via SQLBindCol.
     std::optional<std::vector<std::vector<std::byte>>> currentRow;
+
+    // Simple LOB (BYTE/TEXT) SQLGetData resumable-fetch state, keyed by
+    // column number - see LobFetchState's doc comment. Cleared on every
+    // SQLFetch.
+    std::map<SQLUSMALLINT, LobFetchState> lobFetchState;
 };
 
 } // namespace ifxodbc

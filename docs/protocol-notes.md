@@ -1037,10 +1037,69 @@ confirming the client-side chunking loop (`writeBindBlock`,
 `sqli/statement.cpp`) is correct for a multi-chunk upload, not just a
 single-chunk one.
 
-**Not yet done**: the ODBC `SQLGetData`/`SQLBindCol`/`SQLBindParameter`
-surface for either type (deferred - this section only covers the sqli
-layer, matching this project's usual sqli-first/ODBC-surface-later
-sequencing, e.g. INTERVAL's own history).
+**ODBC surface - now done and confirmed live too.** Simple LOBs needed a
+real architectural addition here, not just another type case: before this
+work, `SQLGetData` (`driver/statement.cpp`) was single-shot for every
+type - one call copies the whole value (or truncates it) and there was no
+way to resume a partial read. That's the wrong contract for a LOB: the
+standard ODBC idiom for pulling a large value through a small fixed buffer
+is `while (SQLGetData(...) == SQL_SUCCESS_WITH_INFO) append(buf)`, which
+needs each call to continue from where the last one left off. Building
+that generically for every type would have been overkill (nothing else
+needs it, and retrofitting it onto CHAR/VARCHAR's already-correct
+single-shot behavior risked regressing something working); scoped instead
+to a `LobFetchState` (`driver/handles.h`) - content, offset, and an
+`exhausted` flag - keyed per column in a new `OdbcStatement::
+lobFetchState` map, cleared on every `SQLFetch` (a new row's LOB isn't a
+continuation of the previous row's). `exhausted` is tracked separately
+from `offset == content.size()` because a genuinely empty (0-byte,
+non-NULL) value would satisfy that condition on its very first call too -
+the real "no more data" signal is "every byte has already been handed to
+a non-truncated call," which only `SQL_NO_DATA`(100) should follow.
+
+A `SQLBindCol`-driven fetch (`SQLFetch`'s bound-column loop) deliberately
+does **not** get this resumable state - it uses a throwaway local
+`LobFetchState` per call, matching every other bound column type's
+existing single-shot-with-truncation contract (`writeCharResult`'s
+truncate-and-report-full-length shape, reused directly). Only the
+standalone `SQLGetData` entry point (explicitly called after `SQLFetch`,
+not via the bound-column loop) gets a persistent, per-column entry in
+`OdbcStatement::lobFetchState`.
+
+BYTE's default C type is `SQL_C_BINARY` (raw bytes via the indicator, no
+NUL terminator), distinct from TEXT's `SQL_C_CHAR` (NUL-terminated,
+reserves one buffer byte for the NUL) - both were previously entirely
+unhandled (`SQL_C_BINARY` wasn't accepted by `SQLBindCol`/`SQLGetData`'s
+gate checks at all). `SQLBindParameter`'s mirror: `SQL_LONGVARBINARY`
+(BYTE) and `SQL_LONGVARCHAR` (TEXT) are new `encodeBindParam` branches
+(`driver/bind_encode.cpp`) that build a `BindParam` with the 56-byte
+placeholder descriptor in `data` and the real bytes in
+`simpleLobContent`, the same shape the sqli-layer bind work above already
+established - `driver/bind_encode.cpp` didn't need any new machinery here,
+just two more branches routing into what already existed.
+`SQLGetTypeInfo`/`SQLColumns` also now report these two types correctly
+(`driver/catalog.cpp`'s `kTypeMap` gained `SQL_LONGVARBINARY`/-4/`"byte"`
+and `SQL_LONGVARCHAR`/-1/`"text"` rows - no INTERVAL-style per-qualifier
+special-casing needed, since unlike INTERVAL these are plain scalars at
+the catalog layer too); `COLUMN_SIZE` for both is `2147483647`, an
+unconfirmed first-hypothesis sentinel for "no declared maximum" (matching
+a common ODBC driver convention), not traced against a live capture the
+way DATE's `precisionField=4` eventually was.
+
+Confirmed live, first attempt, no hang, through this driver's own
+exported ODBC entry points called directly (bypassing the Driver Manager,
+same technique as INTERVAL's `SQLBindParameter` verification): a
+`SQLBindParameter` TEXT insert and a `SQLBindParameter` BYTE insert (5000
+bytes, forcing the sqli-layer's multi-chunk bind path from the ODBC
+surface, not just directly against `SqliStatement`), a NULL TEXT bind
+ahead of another parameter, chunked `SQLGetData` reassembly of both the
+TEXT value (`SQL_C_CHAR`, 4-byte buffer, 31 calls) and the 5000-byte BYTE
+value (`SQL_C_BINARY`, 7-byte buffer - deliberately not a divisor of 5000,
+716 calls) - both byte-for-byte exact against the bound values -
+`SQLBindCol` single-shot fetch with both a large-enough buffer (full
+value) and a small one (correct truncation, full length still reported
+via the indicator), and a NULL value correctly reported via `SQLGetData`'s
+indicator (`SQL_NULL_DATA`).
 
 Test fixture note: seeding real BYTE/TEXT row data for live testing turned
 out to need `dbaccess`'s `LOAD FROM 'file' INSERT INTO table(col)` command,

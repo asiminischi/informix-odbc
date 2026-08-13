@@ -187,6 +187,40 @@ BindEncodeResult encodeBindParam(SQLSMALLINT valueType, SQLSMALLINT parameterTyp
         p.precisionField = static_cast<std::uint16_t>(s.size());
         return BindEncodeResult{BindEncodeStatus::kOk, std::move(p)};
     }
+    // Simple LOB (BYTE/TEXT): unlike CHAR/VARCHAR above, `data` here is a
+    // 56-byte SQ_BIND placeholder descriptor (sqli::encodeSimpleLobPlaceholder),
+    // not the value - the real content goes in BindParam::simpleLobContent,
+    // streamed out-of-band by sqli::writeBindBlock's SQ_BBIND(41) chunk
+    // stream (see sqli/statement.cpp). precisionField is 0, matching the
+    // sqli-layer finding that IfxBlob never overrides IfxObject's zero
+    // default (see sqli/types.h's encodeSimpleLobPlaceholder doc comment).
+    // BYTE takes SQL_C_BINARY (raw bytes, length from strLenOrInd - never
+    // SQL_NTS, binary data isn't NUL-terminated); TEXT reuses
+    // charBindValue's SQL_C_CHAR handling, same as CHAR/VARCHAR above.
+    if (parameterType == SQL_LONGVARBINARY && (valueType == SQL_C_BINARY || valueType == SQL_C_DEFAULT)) {
+        if (strLenOrInd < 0) return BindEncodeResult{BindEncodeStatus::kUnsupported, {}};
+        const auto* bytes = static_cast<const std::byte*>(parameterValuePtr);
+        std::vector<std::byte> content(bytes, bytes + strLenOrInd);
+        ifxsqli::BindParam p;
+        p.ifxType = ifxsqli::ifxtype::kByte;
+        p.isNull = false;
+        p.data = ifxsqli::encodeSimpleLobPlaceholder(static_cast<std::uint32_t>(content.size()));
+        p.precisionField = 0;
+        p.simpleLobContent = std::move(content);
+        return BindEncodeResult{BindEncodeStatus::kOk, std::move(p)};
+    }
+    if (parameterType == SQL_LONGVARCHAR && (valueType == SQL_C_CHAR || valueType == SQL_C_DEFAULT)) {
+        std::string_view s = charBindValue(parameterValuePtr, strLenOrInd);
+        std::vector<std::byte> content(s.size());
+        std::memcpy(content.data(), s.data(), s.size());
+        ifxsqli::BindParam p;
+        p.ifxType = ifxsqli::ifxtype::kText;
+        p.isNull = false;
+        p.data = ifxsqli::encodeSimpleLobPlaceholder(static_cast<std::uint32_t>(content.size()));
+        p.precisionField = 0;
+        p.simpleLobContent = std::move(content);
+        return BindEncodeResult{BindEncodeStatus::kOk, std::move(p)};
+    }
     if (parameterType == SQL_TYPE_DATE && (valueType == SQL_C_TYPE_DATE || valueType == SQL_C_DATE)) {
         auto unixDays = unixDaysFromDateStruct(*static_cast<SQL_DATE_STRUCT*>(parameterValuePtr));
         ifxsqli::BindParam p;
@@ -357,6 +391,10 @@ std::optional<int> ifxTypeForParameterType(SQLSMALLINT parameterType) {
             return ifxsqli::ifxtype::kDecimal;
         case SQL_TYPE_TIMESTAMP:
             return ifxsqli::ifxtype::kDatetime;
+        case SQL_LONGVARBINARY:
+            return ifxsqli::ifxtype::kByte;
+        case SQL_LONGVARCHAR:
+            return ifxsqli::ifxtype::kText;
         default:
             // INTERVAL isn't a single case label (13 distinct
             // SQL_INTERVAL_* constants, unlike every type above) - reuses
