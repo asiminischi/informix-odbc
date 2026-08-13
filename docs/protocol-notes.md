@@ -1114,53 +1114,167 @@ once bind is implemented, a self-contained integration test (seed via this
 driver's own bind, verify via `fetchSimpleLob`) becomes possible without an
 external dependency.
 
-## Smart large objects (BLOB/CLOB) - descriptor shape only, NOT yet fetched
-
-Much less confirmed than simple LOBs above - this is what's known so far,
-not a working fetch path.
+## Smart large objects (BLOB/CLOB) - fetch confirmed live
 
 DESCRIBE reports smart LOB columns as `ifxType=41` - the same wire type
 code `ifxtype::kBoolean` already uses for its own extended-type framing.
 Confirmed live: a `BLOB` column reports `extendedId=10 owner="informix"
 name="blob"`, a `CLOB` column reports `extendedId=11 owner="informix"
-name="clob"`, both `encodedLength=72`. Fetching one today misdispatches
-into the existing BOOLEAN decoder (both share ifxType 41) and fails cleanly
-with "BOOLEAN: unexpected payload length" - wrong, but not a hang.
+name="clob"`, both `encodedLength=72`. `SqliStatement`'s row splitter
+(`splitRow` in `sqli/statement.cpp`) distinguishes the two ifxType-41 cases
+by `ColumnDesc::extendedTypeName` ("blob"/"clob" vs "boolean").
 
-The TUPLE row's per-column shape for these, confirmed live via a raw-bytes
-capture of a 2-row `(BLOB, CLOB)` insert: `nullFlag`(1 byte) + `length`(4
-bytes, big-endian - confirmed live as `72`) + `length` bytes of opaque
-payload = 77 bytes total when non-null (the same self-describing
+The TUPLE row's per-column shape, confirmed live: `nullFlag`(1 byte) +
+`length`(4 bytes, big-endian - confirmed live as `72`) + `length` bytes of
+opaque payload = 77 bytes total when non-null (the same self-describing
 null-flag-byte convention `kBoolean` uses, just with a 4-byte length field
-where BOOLEAN has none). The 72-byte payload is an `IfxLocator` per the
-decompiled reference (`IfxLocator.java`: `IFX_LOCATOR_SIZE = 72` - an exact,
-non-inferred match to the live `encodedLength`) - a token the JDBC driver
-itself never decodes internally, only round-trips to the server. Diffing
-two real locators (one `BLOB`, one `CLOB`, inserted in the same statement)
-byte-for-byte found only 2 differing bytes out of 72 (a small ordinal-like
-field and part of what's presumably a per-LO unique id) - consistent with
-"mostly-opaque identifier," but the exact field layout inside those 72
-bytes is not determinable from the decompiled JDBC source (it never
-decodes the locator either) and is NOT yet independently reverse-engineered
-by this driver.
+where BOOLEAN has none). When null: `nullFlag`(1)=1 + `length`(4)=0, no
+payload - 5 bytes total, confirmed live (not just 1 byte the way a naive
+reading of "null means nothing follows" would suggest - `IfxBaseType`'s
+`toIfxTuple()` always writes the length field, even for a null value whose
+internal buffer was never populated). The 72-byte payload is an
+`IfxLocator` per the decompiled reference (`IfxLocator.java`:
+`IFX_LOCATOR_SIZE = 72`) - a token this driver never decodes, only
+round-trips to the server (needed verbatim, byte-for-byte, by
+`SqliConnection::fetchSmartLob` below).
 
-Getting the actual content is a fundamentally different, larger mechanism
-than simple LOBs': per the decompiled reference, `IfxLoOpen`/`IfxLoClose`/
-`IfxLoSeek`/`IfxLoStat`/etc. are not dedicated opcodes at all - they're
-calls to built-in Informix SPL functions (`informix.ifx_lo_open`,
-`informix.ifx_lo_close`, ...) via a generic "fastpath" RPC subsystem
-(`SQ_GETROUTINE`(101) resolves a function signature to a handle,
-`SQ_EXFPROUTINE`(102) invokes it with bound parameters using the same
-`sendBind` machinery ordinary prepared statements use, `SQ_FPROUTINE`(103)
-carries the result). Once a smart LOB is open (yielding an integer file
-descriptor), bulk read/write goes through a dedicated `SQ_LODATA`(97)
-message (subcodes: `LO_READ`=0, `LO_READWITHSEEK`=1, `LO_WRITE`=2) whose
-response can itself carry multiple internally length-prefixed chunks in one
-message. None of this - fastpath RPC or `SQ_LODATA` - is implemented or
-confirmed live yet; it's a materially larger dependency (a whole RPC
-subsystem as a prerequisite) than simple LOBs' two-opcode fetch, which is
-exactly why smart LOBs are scoped as separate follow-on work rather than
-"one more scalar case."
+**Getting the actual content needs a fastpath RPC subsystem** - a
+materially larger mechanism than simple LOBs' two-opcode fetch, and the
+reason smart LOBs were scoped as separate follow-on work. Per the
+decompiled reference, `IfxLoOpen`/`IfxLoClose`/etc. aren't dedicated
+opcodes at all - they're calls to built-in Informix SPL functions
+(`informix.ifx_lo_open`, `informix.ifx_lo_close`, ...) resolved and
+invoked generically:
+
+- `SQ_GETROUTINE`(101): resolves a function signature string
+  (e.g. `"function informix.ifx_lo_open(blob ,integer)"`, matched
+  character-for-character against Informix's own function catalog) to a
+  numeric routine handle. Confirmed live: the signature field uses a
+  **4-byte** length prefix (`ByteWriter::ifxChar4`), not the 2-byte
+  `ifxChar2` this driver uses almost everywhere else - a first attempt
+  using `ifxChar2` hung the connection identically regardless of a
+  trailing `SQ_EOT` being present or not, traced to
+  `IfxDataOutputStream.getJavaToIfxCharBytes()` switching to a 4-byte
+  length (`JavaToIfx4BytesChar`) whenever `isRemove64KLimitSupported()`
+  (SQ_PROTOCOLS capability bit 62, byte[7] `& 0x02`) is true - true on
+  every server tested so far, but **not yet plumbed into this driver as
+  its own tracked capability flag** the way `has4ByteOffsets()`/bit 50 is;
+  this is unconditional today (see `getRoutineHandle`'s doc comment in
+  `sqli/connection.cpp`). The reply, in contrast, echoes the database name
+  back via the plain 2-byte `ifxChar2` - a genuine, confirmed-live
+  asymmetry between the two directions, not a mistake. Both the request
+  and the reply are terminated by an explicit `SQ_EOT`, despite neither
+  showing one in `IfxSqli.java`'s own `getHandle()`/`dispatchMsg()`
+  source - the same "trust a live capture over an incomplete `send*`
+  method" situation `SQ_PROTOCOLS` above already has.
+- `SQ_EXFPROUTINE`(102): invokes a resolved handle with bound parameters,
+  using the *exact same* `sendBind`-shaped `SQ_BIND`(5) sub-block ordinary
+  prepared statements use (this driver's existing `writeBindBlock`
+  encoding is reused as-is for parameter bodies) - confirmed live this is
+  one combined write with a single trailing `SQ_EOT`, not two separate
+  EOT-terminated writes (one after the EXFPROUTINE header, another after
+  the bind block). Two parameter shapes this driver's fastpath calls need,
+  both confirmed live against a real JDBC golden-capture trace (see
+  below):
+  - A plain `INTEGER` parameter (`ifxtype::kInteger`, no extended
+    owner/name - below `sendBind`'s `type > 18` threshold): indicator
+    `0`, **precision field `2560`** - confirmed live, and deliberately
+    *not* this driver's own established plain-INTEGER `SQ_BIND` precision
+    (`4`, used for ordinary column binds via `driver/bind_encode.cpp`) -
+    a genuine asymmetry between fastpath and ordinary bind parameters,
+    copied from the trace rather than assumed to match.
+  - A UDT-wrapped locator parameter (`ifxtype::kUdt` = 44): extended
+    owner is the **empty string**, not `"informix"` - confirmed live,
+    unlike BOOLEAN's bind (which does use `"informix"`; see
+    `ifxtype::kUdt`'s doc comment in `sqli/types.h`). Extended type name
+    is `"blob"` (matching `informix.ifx_lo_open`'s own signature
+    literally, regardless of whether the real column is BLOB or CLOB).
+    The data payload is exactly the TUPLE row's own `[4-byte length][72
+    locator bytes]` slice (leading null-flag byte stripped) - which is
+    also, conveniently, exactly `IfxBaseType.toIfx()`'s own non-null
+    bind-parameter encoding, confirmed live via the trace showing
+    "Data (76 bytes)" (4 + 72) for this parameter - so no re-encoding is
+    needed on the way in.
+- `SQ_FPROUTINE`(103): the invocation's reply tag, carrying the return
+  value(s) - confirmed live, `SQ_EOT`-terminated. `informix.ifx_lo_open`
+  returns one plain `INTEGER` (the file descriptor); `informix.ifx_lo_close`
+  also returns one (a status code this driver discards). Confirmed live:
+  an `INTEGER` return's precision field is *also* `2560`, matching the
+  equally-nonstandard bind-direction value, not the `4` an ordinary
+  INTEGER column fetch would imply.
+- `SQ_LODATA`(97): bulk read/write against an already-open smart LOB file
+  descriptor. `LO_READ`(subcommand `0`) request: `u16(97)` + `u16(0)` +
+  **`u16(fd)`** (a smallint on the wire, confirmed live, despite `fd`
+  arriving from `SQ_FPROUTINE` as a full 4-byte int) + `u32(requested
+  byte count)` + `u16(32000)` (a fixed `R_W_BUFSIZE` the golden trace
+  showed unconditionally) + `SQ_EOT`. The requested byte count is just an
+  upper bound, not a guess that has to be right: the reply's own
+  `fileSize` field (a `u32` immediately after a `u16` optype) is
+  authoritative, confirmed live - requesting a value comfortably larger
+  than any real smart LOB (this driver uses `0x7FFFFFFF`) is safe. The
+  chunk stream that follows is simple length-prefixed records (`u16`
+  length + that many bytes, padded to even) read back-to-back until the
+  reply's own `fileSize` total has been consumed - **no zero-length
+  terminator chunk** the way simple LOBs' `SQ_BLOB` stream has one
+  (confirmed live and matches the decompiled reference's
+  `receiveLODATA`, which tracks a remaining-byte counter rather than
+  watching for a sentinel); a trailing `SQ_EOT` follows the last chunk.
+  `LO_WRITE`(subcommand `2`) isn't implemented yet (bind/write is
+  deliberately out of scope for this first slice - see below); its reply
+  shape (confirmed live via the JDBC trace, for when write support is
+  added) is simpler: `u16` optype `2` + `u32` bytes-written, no chunk
+  stream at all.
+
+**Implementation**: `SqliConnection::fetchSmartLob` (`sqli/connection.cpp`)
+does all three round trips (open, `LO_READ`, close) and returns the
+assembled content. Confirmed live against this project's IDS 14.10 dev
+container: a small single-chunk value, a 75000-byte value spanning
+multiple `SQ_LODATA` chunks (byte-for-byte exact, both via a direct
+`SqliStatement`/`fetchSmartLob` harness and through `tools/ifx_probe`),
+and a NULL value (correctly detected via the TUPLE row's null-flag byte,
+never reaching `fetchSmartLob` at all). `tools/ifx_probe`'s
+`printColumnValue` dispatches to it for any ifxType-41 column whose
+`extendedTypeName` is `"blob"`/`"clob"`.
+
+**How this was found**: reverse-engineering the fastpath framing from the
+decompiled source alone hit a real dead end - a first attempt at
+`SQ_GETROUTINE` (2-byte signature length, no capability-gating
+considered) hung regardless of a trailing `SQ_EOT`, and a follow-up
+`SQ_EXFPROUTINE` attempt (correct per a literal reading of `sendBind`,
+using this driver's existing plain-INTEGER precision of `4`) also hung -
+`onstat -g sql` showed the server's session idle with no lock wait,
+which turned out to be *uninformative* for fastpath calls (that column
+only reflects SQL-statement lock waits, not a thread blocked in a raw
+socket read, and fastpath isn't a SQL statement). Rather than keep
+guessing field-by-field, the real IBM JDBC driver
+(`jdbc-4.50.10.jar`) was run directly against the same dev container with
+its own protocol tracing enabled (`TRACEFILE`/`TRACE=3` connection
+properties, plus raising `java.util.logging`'s logger level - the
+`TraceFlag` handler alone isn't enough, the `Logger` itself defaults to a
+level that filters out `FINE`/`FINER` before the handler ever sees them)
+doing a real `PreparedStatement.setBytes()` insert into a BLOB/CLOB
+column followed by a `ResultSet.getBytes()`/`getString()` read-back. That
+one capture (~17,000 log records) resolved every remaining framing
+question in one pass - the 4-byte signature length, the no-owner UDT
+param, the `2560` precision magic number, the exact `SQ_LODATA` chunk
+loop - none of which would have been found reliably by further guess-and-
+probe alone. Recorded here as a reusable technique: when a live attempt
+hangs inexplicably and the decompiled source is ambiguous or apparently
+contradicted by observed behavior (as it was for both the missing
+`SQ_EOT`s and the `getJavaToIfxCharBytes` capability-gating), get a real
+protocol trace from the vendor's own driver rather than continuing to
+iterate on guessed field shapes.
+
+**Not yet implemented**: bind/write (`informix.ifx_lo_create`, `SQ_LODATA`
+`LO_WRITE`) and the ODBC driver-layer surface (`SQLGetData`/
+`SQLBindParameter` for BLOB/CLOB) - deliberately scoped as follow-on work,
+matching this project's established fetch-first sequencing (simple LOBs,
+INTERVAL, DATETIME FRACTION all landed fetch-then-bind-then-ODBC-surface
+in that order). The `informix.ifx_lo_create` fastpath call was captured in
+the same golden trace (return value type `40`, not `44` - a genuinely
+different wire type code for the *created* locator than the `44` used to
+*bind* one in, not yet reverse-engineered) if a future session picks this
+up.
 
 ## Transactions
 

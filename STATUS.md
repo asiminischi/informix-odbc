@@ -439,11 +439,26 @@ Roughly in the order they'd bite a real application:
    (7-byte buffer, `SQL_C_BINARY`) - both byte-exact - and `SQLBindCol`
    single-shot fetch (both a large-enough buffer and a truncating small
    one). `SQLGetTypeInfo`/`SQLColumns` report both types now too
-   (`SQL_LONGVARBINARY`(-4)/`SQL_LONGVARCHAR`(-1)). Still missing: all of
-   smart LOBs (BLOB/CLOB share ifxType 41 with BOOLEAN and currently
-   misdecode; getting their content needs a whole fastpath-RPC subsystem
-   this driver doesn't have yet, reverse-engineered
-   but not implemented - see `docs/protocol-notes.md`).
+   (`SQL_LONGVARBINARY`(-4)/`SQL_LONGVARCHAR`(-1)). **Smart LOB (BLOB/CLOB)
+   fetch is now done too, at the sqli layer** - `SqliConnection::fetchSmartLob`
+   implements the fastpath RPC subsystem (`SQ_GETROUTINE`/`SQ_EXFPROUTINE`/
+   `SQ_FPROUTINE`) plus `SQ_LODATA`, confirmed live: a small value, a
+   75000-byte value spanning multiple `SQ_LODATA` chunks (byte-exact), and
+   NULL, all via both a direct harness and `tools/ifx_probe`. Found by
+   getting a real JDBC driver protocol trace against the same dev
+   container after two plausible-looking framings both hung live - see
+   `docs/protocol-notes.md`'s Smart large objects section for the full
+   writeup, including two confirmed asymmetries from this driver's other
+   conventions (fastpath INTEGER parameters/returns use precision 2560,
+   not the 4 ordinary INTEGER binds use; the locator UDT parameter's
+   extended owner is empty, not "informix" like BOOLEAN's bind) and a new
+   `SQ_PROTOCOLS` capability bit this driver now tracks
+   (`SqliConnection::namedParametersSupported()`, needed for
+   `SQ_GETROUTINE`'s request framing). Still missing: smart LOB bind/write
+   (`informix.ifx_lo_create`, `SQ_LODATA LO_WRITE`) and the ODBC
+   driver-layer surface (`SQLGetData`/`SQLBindParameter`) - deliberately
+   scoped as follow-on work, matching every other type's established
+   fetch-then-bind-then-ODBC-surface sequencing.
 8. **No real generated-key retrieval.** The `SQ_INSERTDONE` wire field is
    decoded, but the driver never sends the extra "SGK" request the server
    needs to actually populate it, so every INSERT currently reports a
@@ -516,16 +531,18 @@ polish don't block that.
    environment. LOBs split into two unrelated mechanisms once
    investigated (simple BYTE/TEXT vs. smart BLOB/CLOB, sharing nothing at
    the wire level - see `docs/protocol-notes.md`); simple-LOB **fetch,
-   bind, and now the full ODBC surface (`SQLBindParameter`/`SQLGetData`/
+   bind, and the full ODBC surface (`SQLBindParameter`/`SQLGetData`/
    `SQLBindCol`, including a new resumable-chunk `SQLGetData` mechanism -
-   see item 7) are all done and confirmed live** - only smart LOBs (needs
-   a fastpath-RPC subsystem, reverse-engineered but not implemented)
-   remain.**
+   see item 7) are all done and confirmed live**. Smart LOB **fetch is now
+   done too** at the sqli layer (`SqliConnection::fetchSmartLob` - the
+   fastpath RPC subsystem plus `SQ_LODATA`, confirmed live including a
+   multi-chunk value and NULL - see `docs/protocol-notes.md`), found only
+   after getting a real JDBC driver protocol trace against the same dev
+   container (two plausible-looking framings guessed from the decompiled
+   source alone both hung live first). Still remaining: smart LOB
+   bind/write and its own ODBC driver-layer surface.**
    Blocking: a real Informix database backup/restore tool can't skip
-   columns of a type it doesn't support. Smart LOBs in particular need
-   their own multi-message wire handling (confirmed, not just suspected,
-   now that the fastpath/SQ_LODATA mechanism has been reverse-engineered),
-   not just another entry in the existing scalar bind/fetch tables.
+   columns of a type it doesn't support.
 2. **Decide and prototype the BOP integration mechanism** (CGO, subprocess
    + a small IPC protocol, or something else) - deliberately left
    undecided when this project started. Nothing else here matters to BOP

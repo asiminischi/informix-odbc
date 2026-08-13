@@ -118,6 +118,24 @@ void printColumnValue(ifxsqli::SqliConnection& conn, const ifxsqli::ColumnDesc& 
             return;
         }
         case ifxtype::kBoolean: {
+            if (col.extendedTypeName == "blob" || col.extendedTypeName == "clob") {
+                if (bytes.empty()) { std::printf("<error: empty smart LOB column>"); return; }
+                bool isNull = bytes[0] == std::byte{1};
+                if (isNull) { std::printf("NULL"); return; }
+                auto content = conn.fetchSmartLob(bytes.subspan(1));
+                if (!content) {
+                    std::printf("<error fetching smart LOB: %s>", content.error().message.c_str());
+                    return;
+                }
+                if (col.extendedTypeName == "clob") {
+                    std::printf("\"%.*s\"", static_cast<int>(content->size()),
+                                reinterpret_cast<const char*>(content->data()));
+                } else {
+                    std::printf("0x");
+                    for (auto b : *content) std::printf("%02x", std::to_integer<unsigned char>(b));
+                }
+                return;
+            }
             auto v = decodeBoolean(bytes);
             if (!v) { std::printf("<error: %s>", v.error().message.c_str()); return; }
             if (!*v) { std::printf("NULL"); return; }

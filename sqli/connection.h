@@ -39,6 +39,13 @@ public:
     // several independent flags - see docs/protocol-notes.md.
     [[nodiscard]] bool has4ByteOffsets() const { return has4ByteOffsets_; }
 
+    // Whether SQ_GETROUTINE's named-parameters wire framing applies (see
+    // sqli/connection.cpp's ProtocolCapabilities doc comment) - consulted by
+    // the fastpath RPC subsystem (sqli/fastpath.cpp) that smart LOBs (BLOB/
+    // CLOB) need. Confirmed live: set on this project's IDS 14.10 dev
+    // container.
+    [[nodiscard]] bool namedParametersSupported() const { return namedParametersSupported_; }
+
     // Sends a simple, resultless SQL command (e.g. "set isolation to ...")
     // and waits for it to complete. Distinct from SqliStatement because the
     // wire shape is different: prepare+execute+release happen as one batch
@@ -94,18 +101,47 @@ public:
     // fully idle the way a small, single-batch result set's is.
     [[nodiscard]] std::expected<std::vector<std::byte>, Error> fetchSimpleLob(std::span<const std::byte> descriptor);
 
+    // Fetches a smart large object's (BLOB/CLOB, ifxtype::kBoolean's shared
+    // wire type 41 - distinguished from BOOLEAN by ColumnDesc::extendedTypeName
+    // being "blob"/"clob") actual content, given the 72-byte IfxLocator
+    // payload a TUPLE row carries for that column. `locatorPayload` must be
+    // exactly [4-byte big-endian length=72][72-byte locator bytes] - a
+    // smart-LOB TUPLE column's own raw slice with just the leading 1-byte
+    // null-flag stripped off (see docs/protocol-notes.md's Smart large
+    // objects section for the full row shape) - which is also, conveniently,
+    // exactly IfxBaseType.toIfx()'s own non-null bind-parameter encoding, so
+    // it round-trips into SQ_BIND with no re-encoding.
+    //
+    // Unlike simple LOBs (a dedicated two-opcode fetch), smart LOBs need a
+    // whole fastpath RPC subsystem: resolves and calls
+    // informix.ifx_lo_open(blob, integer) to get a file descriptor, reads
+    // the entire value via SQ_LODATA, then calls
+    // informix.ifx_lo_close(integer) - three separate round trips.
+    // Confirmed live against this project's IDS 14.10 dev container, cross-
+    // checked against a real JDBC driver (jdbc-4.50.10.jar) protocol trace
+    // (SQLIDEBUG-equivalent TRACEFILE/TRACE connection properties) doing the
+    // same open/read/close sequence - see docs/protocol-notes.md for the
+    // full byte-level writeup, including two confirmed asymmetries from
+    // this driver's other bind conventions: fastpath INTEGER parameters and
+    // return values use precision field 2560 (not the 4 ordinary INTEGER
+    // binds use elsewhere), and the locator UDT parameter's extended owner
+    // is the empty string (not "informix", unlike BOOLEAN's bind).
+    [[nodiscard]] std::expected<std::vector<std::byte>, Error> fetchSmartLob(std::span<const std::byte> locatorPayload);
+
     // Exposed for SqliStatement (sqli/statement.h), which sits on top of the
     // same connection and needs to send/receive statement-protocol messages
     // over it directly.
     [[nodiscard]] TcpSocket& transport() { return sock_; }
 
 private:
-    SqliConnection(TcpSocket sock, ConnectResult info, bool has4ByteOffsets)
-        : sock_(std::move(sock)), info_(std::move(info)), has4ByteOffsets_(has4ByteOffsets) {}
+    SqliConnection(TcpSocket sock, ConnectResult info, bool has4ByteOffsets, bool namedParametersSupported)
+        : sock_(std::move(sock)), info_(std::move(info)), has4ByteOffsets_(has4ByteOffsets),
+          namedParametersSupported_(namedParametersSupported) {}
 
     TcpSocket sock_;
     ConnectResult info_;
     bool has4ByteOffsets_ = false;
+    bool namedParametersSupported_ = false;
     std::optional<std::int64_t> lastSerialInserted_;
     std::optional<std::int64_t> lastBigSerialInserted_;
 };

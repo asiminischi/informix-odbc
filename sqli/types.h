@@ -62,6 +62,15 @@ inline constexpr int kBoolean = 41;
 // from kBoolean (41), the plain DESCRIBE/TUPLE base type code. Use this,
 // not kBoolean, when building a BindParam for a BOOLEAN "?" parameter.
 inline constexpr int kBooleanBindType = 45;
+// The generic opaque-UDT wire type code (matches the decompiled JDBC
+// driver's IfxUDT, which every fastpath RPC parameter/return value not
+// covered by a plain scalar type - e.g. the 72-byte smart-LOB locator
+// bind_encode.cpp's SqliConnection::fetchSmartLob passes to
+// informix.ifx_lo_open - travels as, confirmed live via a JDBC golden-
+// capture trace). Not used for ordinary SQ_BIND/SQ_RETURN_TYPE (BOOLEAN
+// uses its own kBooleanBindType instead), only the fastpath subsystem's
+// own SQ_BIND sub-block.
+inline constexpr int kUdt = 44;
 } // namespace ifxtype
 
 // A decoded calendar DATETIME value. Any contiguous qualifier span within

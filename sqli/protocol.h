@@ -55,6 +55,25 @@ inline constexpr std::uint16_t kCost = 55;
 inline constexpr std::uint16_t kExit = 56;
 inline constexpr std::uint16_t kProtocols = 126;
 
+// Fastpath RPC subsystem (smart LOBs - BLOB/CLOB - need to call built-in
+// Informix SPL functions like informix.ifx_lo_open by name; see
+// SqliConnection::fetchSmartLob). Confirmed live against this project's IDS
+// 14.10 dev container, cross-checked against a real JDBC driver protocol
+// trace - see docs/protocol-notes.md's Smart large objects section.
+// kGetRoutine: resolves a function signature string to a numeric handle
+// (request and reply both explicitly SQ_EOT-terminated, despite neither
+// showing one in the decompiled reference's own send/receive methods - the
+// same "trust the live capture" situation SQ_PROTOCOLS above already has).
+// kExfpRoutine: invokes a resolved handle with bound parameters (its own
+// header plus an embedded SQ_BIND sub-block, one combined write, one
+// trailing EOT). kFpRoutine: the invocation's reply tag, carrying the
+// function's return value(s). kLoData: bulk read/write against an already-
+// open smart LOB file descriptor (obtained from an ifx_lo_open call).
+inline constexpr std::uint16_t kGetRoutine = 101;
+inline constexpr std::uint16_t kExfpRoutine = 102;
+inline constexpr std::uint16_t kFpRoutine = 103;
+inline constexpr std::uint16_t kLoData = 97;
+
 // Transaction opcodes. Confirmed live via
 // tests/integration/test_transactions.cpp - see docs/protocol-notes.md's
 // Transactions section.

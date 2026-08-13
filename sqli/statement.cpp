@@ -74,6 +74,29 @@ std::expected<std::vector<std::vector<std::byte>>, Error> splitRow(std::span<con
                 width = col.encodedLength;
                 break;
             case ifxtype::kBoolean: {
+                // Smart large objects (BLOB/CLOB) share this wire type code
+                // with BOOLEAN but have a completely different, larger
+                // self-describing shape: nullFlag(1 byte) + length(4 bytes,
+                // big-endian) + length bytes of opaque IfxLocator payload
+                // (72 bytes, confirmed live) when non-null; nullFlag(1) +
+                // length(4)=0 with no payload when null (IfxBaseType's
+                // toIfxTuple() always writes the length field, even for a
+                // null value whose internal buffer was never populated) -
+                // see SqliConnection::fetchSmartLob's doc comment and
+                // docs/protocol-notes.md's Smart large objects section.
+                // Distinguished from a real BOOLEAN column by
+                // extendedTypeName, since both share ifxType 41.
+                if (col.extendedTypeName == "blob" || col.extendedTypeName == "clob") {
+                    if (offset + 5 > row.size()) {
+                        return std::unexpected(
+                            Error{ErrorKind::Protocol, "row truncated reading smart LOB null flag/length"});
+                    }
+                    bool isNull = row[offset] == std::byte{1};
+                    ByteReader lenReader(std::span<const std::byte>(row).subspan(offset + 1, 4));
+                    std::uint32_t length = lenReader.u32();
+                    width = isNull ? 5 : 5 + static_cast<std::size_t>(length);
+                    break;
+                }
                 // Self-describing, not fixed-width despite encodedLength=1 -
                 // see decodeBoolean's doc comment for the confirmed shape.
                 if (offset >= row.size()) {
