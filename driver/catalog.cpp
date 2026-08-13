@@ -295,6 +295,171 @@ std::string caseRadix() {
     return sql;
 }
 
+// INTERVAL's per-column DATA_TYPE/TYPE_NAME/SQL_DATETIME_SUB/COLUMN_SIZE/
+// DECIMAL_DIGITS can't ride kTypeMap's basetype-keyed dispatch the way
+// every other type does: DESCRIBE/syscolumns.coltype report the *same*
+// base type code (14, ifxtype::kInterval) for every INTERVAL column
+// regardless of its qualifier, but ODBC expects a distinct DATA_TYPE per
+// qualifier *shape* (SQL_INTERVAL_YEAR vs SQL_INTERVAL_DAY_TO_SECOND, etc,
+// 13 shapes across both interval classes - see sqli/types.h's
+// decodeIntervalYearMonth/decodeIntervalDayFraction for the qualifier
+// encoding this decodes). `start`/`end` here are the effective start/end
+// codes with any FRACTION(n) end code collapsed to plain SECOND (10) -
+// ODBC has no INTERVAL data type distinguishing "TO SECOND" from
+// "TO FRACTION(n)"; the fractional-seconds precision goes in
+// DECIMAL_DIGITS instead (see intervalCaseDecimalDigits below), matching
+// how ODBC's own native interval C types already carry it.
+//
+// DATA_TYPE values are the *positive* SQL_INTERVAL_* constants
+// (101-113, `100 + SQL_CODE_*`), not the negative ODBC 2.x-era values also
+// named SQL_INTERVAL_* in sqlext.h - confirmed by actually compiling a
+// probe against this project's toolchain rather than assuming from
+// memory: sqlext.h's `#if (ODBCVER >= 0x0300)` guard selects the positive
+// branch by default on this SDK (ODBCVER defaults to 0x0380; nothing in
+// this project overrides it), so that's the value a caller actually
+// receives.
+struct IntervalShapeEntry {
+    unsigned start;
+    unsigned end; // effective end - FRACTION(n) collapsed to 10 (SECOND)
+    SQLSMALLINT dataType;
+    SQLSMALLINT sqlDatetimeSub;
+    const char* typeName;
+    bool hasSecondsField; // whether DECIMAL_DIGITS (fractional-seconds precision) applies
+    // COLUMN_SIZE's constant part (see intervalCaseColumnSize): the maximum
+    // character count NOT contributed by the leading field's own declared
+    // width or FRACTION's own digit count, both added separately since
+    // they vary per column, not per shape. `SQL_DESC_DATETIME_INTERVAL_
+    // PRECISION` (a distinct descriptor field, 26, confirmed via sqlext.h)
+    // is where leading precision actually belongs in the ODBC model -
+    // COLUMN_SIZE here is a character display-size bound instead, matching
+    // this file's existing DATE(10)/DATETIME(19) convention rather than
+    // leading precision alone (which would under-report and truncate a
+    // SQL_C_CHAR fetch of this driver's own formatIntervalYearMonth/
+    // DayFraction text - not independently confirmed against a real ODBC
+    // client, same hedge as DATETIME's own approximate 19).
+    int displayWidthBase;
+};
+
+constexpr IntervalShapeEntry kIntervalShapes[] = {
+    // YEAR-MONTH class: sign + leading digits + "-MM" (formatIntervalYearMonth
+    // always renders the years-months form, confirmed live/see
+    // driver/convert.cpp) = leadingWidth + 1(sign) + 1(dash) + 2(month) = +4.
+    {0, 0, SQL_INTERVAL_YEAR, SQL_CODE_YEAR, "interval year", false, 4},
+    {0, 2, SQL_INTERVAL_YEAR_TO_MONTH, SQL_CODE_YEAR_TO_MONTH, "interval year to month", false, 4},
+    {2, 2, SQL_INTERVAL_MONTH, SQL_CODE_MONTH, "interval month", false, 4},
+    // DAY-anchored: sign + leading digits + " HH:MM:SS" = leadingWidth +
+    // 1(sign) + 1(space) + 2 + 1(colon) + 2 + 1(colon) + 2 = +10.
+    {4, 4, SQL_INTERVAL_DAY, SQL_CODE_DAY, "interval day", false, 10},
+    {4, 6, SQL_INTERVAL_DAY_TO_HOUR, SQL_CODE_DAY_TO_HOUR, "interval day to hour", false, 10},
+    {4, 8, SQL_INTERVAL_DAY_TO_MINUTE, SQL_CODE_DAY_TO_MINUTE, "interval day to minute", false, 10},
+    {4, 10, SQL_INTERVAL_DAY_TO_SECOND, SQL_CODE_DAY_TO_SECOND, "interval day to second", true, 10},
+    // HOUR/MINUTE/SECOND-anchored: sign + leading digits + ":MM:SS" =
+    // leadingWidth + 1(sign) + 1(colon) + 2 + 1(colon) + 2 = +7.
+    {6, 6, SQL_INTERVAL_HOUR, SQL_CODE_HOUR, "interval hour", false, 7},
+    {6, 8, SQL_INTERVAL_HOUR_TO_MINUTE, SQL_CODE_HOUR_TO_MINUTE, "interval hour to minute", false, 7},
+    {6, 10, SQL_INTERVAL_HOUR_TO_SECOND, SQL_CODE_HOUR_TO_SECOND, "interval hour to second", true, 7},
+    {8, 8, SQL_INTERVAL_MINUTE, SQL_CODE_MINUTE, "interval minute", false, 7},
+    {8, 10, SQL_INTERVAL_MINUTE_TO_SECOND, SQL_CODE_MINUTE_TO_SECOND, "interval minute to second", true, 7},
+    {10, 10, SQL_INTERVAL_SECOND, SQL_CODE_SECOND, "interval second", true, 7},
+};
+
+// Raw SQL expressions decoding an INTERVAL column's packed qualifier
+// (`collength` = (totalDigits << 8) | qualifierByte, confirmed live - see
+// docs/protocol-notes.md's Catalog functions section, and the same packing
+// sqli/types.h's decodeIntervalYearMonth documents at the wire level).
+// Each takes the exact SQL text of the collength column to read (e.g.
+// "c.collength" inside buildColumnsSql's inner derived table) rather than
+// a shared alias, since a single SELECT list can't reference a sibling
+// item in the same list (the same restriction basetype/nullable_flag
+// already work around there). Used only to build that inner table's own
+// interval_start/interval_end/interval_leading/interval_frac columns -
+// everywhere else in this file references those as plain aliases instead
+// of re-deriving them (decode once, reference many times).
+std::string intervalTotalDigitsExpr(std::string_view collength) {
+    return "trunc(" + std::string(collength) + " / 256)";
+}
+std::string intervalStartExpr(std::string_view collength) {
+    return "trunc(mod(" + std::string(collength) + ", 256) / 16)";
+}
+std::string intervalRawEndExpr(std::string_view collength) {
+    return "mod(mod(" + std::string(collength) + ", 256), 16)";
+}
+// FRACTION(n) end codes (11-15) collapse to 10 (SECOND) - see
+// IntervalShapeEntry's doc comment for why.
+std::string intervalEndExpr(std::string_view collength) {
+    std::string rawEnd = intervalRawEndExpr(collength);
+    return "case when (" + rawEnd + ") > 10 then 10 else (" + rawEnd + ") end";
+}
+// Fractional-seconds digit count: 0 for a plain "TO SECOND" qualifier
+// (matches decodeIntervalDayFraction's own fractionDigits=0 convention for
+// that case), n for "TO FRACTION(n)".
+std::string intervalFracExpr(std::string_view collength) {
+    std::string rawEnd = intervalRawEndExpr(collength);
+    return "case when (" + rawEnd + ") > 10 then (" + rawEnd + ") - 10 else 0 end";
+}
+// Leading field's own declared digit width - decodeIntervalYearMonth/
+// decodeIntervalDayFraction's `leadingWidth`, reconstructed here in SQL
+// rather than shared, since this file has no dependency on sqli/types.cpp's
+// (internal, header-invisible) implementation.
+std::string intervalLeadingExpr(std::string_view collength) {
+    return "(" + intervalTotalDigitsExpr(collength) + ") - ((" + intervalEndExpr(collength) + ") - (" +
+           intervalStartExpr(collength) + ")) - (" + intervalFracExpr(collength) + ")";
+}
+
+// "case interval_start * 16 + interval_end when <key> then <field> ... end"
+// - the same one-CASE-per-output-field shape caseInt uses for kTypeMap,
+// keyed on the decoded (start, end) pair instead of a flat ifxBaseType
+// value. Assumes `interval_start`/`interval_end` are already promoted to
+// their own aliases in the querying SELECT's FROM source (see
+// buildColumnsSql).
+std::string intervalCaseInt(SQLSMALLINT IntervalShapeEntry::*field) {
+    std::string sql = "case interval_start * 16 + interval_end";
+    for (const auto& e : kIntervalShapes) {
+        sql += " when " + std::to_string(e.start * 16 + e.end) + " then " + std::to_string(e.*field);
+    }
+    sql += " else null end";
+    return sql;
+}
+std::string intervalCaseTypeName() {
+    std::string sql = "case interval_start * 16 + interval_end";
+    for (const auto& e : kIntervalShapes) {
+        sql += " when " + std::to_string(e.start * 16 + e.end) + " then '" + e.typeName + "'";
+    }
+    sql += " else 'interval' end";
+    return sql;
+}
+// DECIMAL_DIGITS (fractional-seconds precision): NULL for shapes with no
+// seconds field at all (YEAR, MONTH, DAY_TO_HOUR, etc - ODBC's own
+// convention that this field only applies to types with a seconds
+// component), `interval_frac` for the rest.
+std::string intervalCaseDecimalDigits() {
+    std::string sql = "case interval_start * 16 + interval_end";
+    for (const auto& e : kIntervalShapes) {
+        if (e.hasSecondsField) sql += " when " + std::to_string(e.start * 16 + e.end) + " then interval_frac";
+    }
+    sql += " else null end";
+    return sql;
+}
+// COLUMN_SIZE (character display size, not leading precision - see
+// IntervalShapeEntry::displayWidthBase's doc comment): the shape's fixed
+// punctuation/field-count overhead, plus the leading field's own declared
+// width, plus a "." + digit count for FRACTION if the qualifier has one.
+// A conservative upper bound on this driver's own SQL_C_CHAR text surface
+// (formatIntervalYearMonth/DayFraction) for that column - never smaller
+// than the longest string those functions can actually produce for this
+// shape and leading width, so a caller sizing a buffer from this value
+// won't truncate.
+std::string intervalCaseColumnSize() {
+    std::string sql = "(case interval_start * 16 + interval_end";
+    for (const auto& e : kIntervalShapes) {
+        sql += " when " + std::to_string(e.start * 16 + e.end) + " then " + std::to_string(e.displayWidthBase);
+    }
+    sql += " else 0 end)"
+           " + interval_leading"
+           " + (case when interval_frac > 0 then interval_frac + 1 else 0 end)";
+    return sql;
+}
+
 // Wrapped in trim(): confirmed live (same finding as buildTablesSql's
 // TABLE_TYPE) that Informix infers a CASE-of-string-literals' result type
 // as CHAR sized to the widest branch ('bigserial', 9 characters) and pads
@@ -304,10 +469,14 @@ std::string caseTypeName() {
     for (const auto& e : kTypeMap) {
         sql += " when " + std::to_string(e.ifxBaseType) + " then '" + e.typeName + "'";
     }
+    // INTERVAL (basetype 14) dispatches further on the decoded qualifier
+    // shape rather than a single literal, unlike every other branch here -
+    // see IntervalShapeEntry's doc comment.
+    sql += " when 14 then (" + intervalCaseTypeName() + ")";
     // Matches driver/statement.cpp's sqlTypeFor fallback: an Informix type
-    // this driver doesn't otherwise model (INTERVAL/LOBs/opaque types,
-    // outside the MVP-8-plus-BOOLEAN-plus-FLOAT-family set) still shows up
-    // as a column rather than being silently dropped from the result.
+    // this driver doesn't otherwise model (LOBs/opaque types, outside the
+    // MVP-8-plus-BOOLEAN-plus-FLOAT-plus-INTERVAL set) still shows up as a
+    // column rather than being silently dropped from the result.
     sql += " else 'unknown' end) as type_name";
     return sql;
 }
@@ -323,7 +492,12 @@ std::string caseTypeName() {
 // qualifier this driver's bind/fetch paths support elsewhere - a column
 // with a different qualifier gets an approximate value here rather than
 // decoding collength's packed qualifier bits for a display-width formula,
-// same MVP-scope choice already made for bind/fetch.
+// same MVP-scope choice already made for bind/fetch. INTERVAL follows the
+// same display-width convention, but *does* decode collength's packed
+// qualifier bits (see intervalCaseColumnSize/IntervalShapeEntry) - unlike
+// DATETIME's single supported qualifier, INTERVAL's leading field width is
+// a genuine per-column declared value with no single reasonable constant
+// to approximate it with.
 // Wrapped in cast(... as integer) for the same reason caseInt/caseRadix
 // are: the DECIMAL branch (trunc(collength / 256)) would otherwise type
 // the whole expression as DECIMAL, not INTEGER - see caseInt's comment.
@@ -371,6 +545,14 @@ std::string caseColumnSize() {
            " when " +
            std::to_string(ifxsqli::ifxtype::kSmallFloat) +
            " then 7"
+           // INTERVAL's COLUMN_SIZE is a character display-size bound, the
+           // same convention as DATE/DATETIME above (not the leading
+           // field's own declared digit width alone, which ODBC gives its
+           // own separate descriptor field - see
+           // IntervalShapeEntry::displayWidthBase's doc comment for why).
+           " when 14 then (" +
+           intervalCaseColumnSize() +
+           ")"
            " else null end as integer)";
 }
 
@@ -387,15 +569,29 @@ std::pair<std::string, std::vector<ifxsqli::BindParam>> buildColumnsSql(const st
                                                                          const std::string& columnPattern,
                                                                          bool catalogMatches) {
     std::string columnSize = caseColumnSize();
+    // INTERVAL's DATA_TYPE/SQL_DATETIME_SUB vary per qualifier shape, not
+    // per basetype - passed as caseInt's "elseSql" fallback (basetype 14
+    // isn't in kTypeMap, so it already falls through to elseSql), rather
+    // than modifying caseInt itself. SQL_DATA_TYPE (the verbose type) is
+    // simpler: always SQL_INTERVAL (10) regardless of shape.
+    std::string dataTypeElse =
+        "case when basetype = 14 then (" + intervalCaseInt(&IntervalShapeEntry::dataType) + ") else " +
+        std::to_string(SQL_VARCHAR) + " end";
+    std::string sqlDataTypeElse = "case when basetype = 14 then 10 else " + std::to_string(SQL_VARCHAR) + " end";
+    std::string sqlDatetimeSubElse =
+        "case when basetype = 14 then (" + intervalCaseInt(&IntervalShapeEntry::sqlDatetimeSub) + ") else null end";
     std::string sql =
         "select " + catalogLiteral(database) +
         " as table_cat, table_schem, table_name, column_name, " +
-        caseInt("data_type", &TypeMapEntry::dataType, std::to_string(SQL_VARCHAR)) +
+        caseInt("data_type", &TypeMapEntry::dataType, dataTypeElse) +
         ", " + caseTypeName() + ", (" + columnSize + ") as column_size, (" + columnSize +
         ") as buffer_length,"
         " cast(case when basetype = " +
         std::to_string(ifxsqli::ifxtype::kDecimal) +
-        " then mod(collength, 256) else null end as integer) as decimal_digits,"
+        " then mod(collength, 256)"
+        " when basetype = 14 then (" +
+        intervalCaseDecimalDigits() +
+        ") else null end as integer) as decimal_digits,"
         " " +
         caseRadix() +
         ","
@@ -403,8 +599,8 @@ std::pair<std::string, std::vector<ifxsqli::BindParam>> buildColumnsSql(const st
         " cast(null as varchar(254)) as remarks,"
         " cast(null as varchar(254)) as column_def,"
         " " +
-        caseInt("sql_data_type", &TypeMapEntry::sqlDataType, std::to_string(SQL_VARCHAR)) + ", " +
-        caseInt("sql_datetime_sub", &TypeMapEntry::sqlDatetimeSub, "null") +
+        caseInt("sql_data_type", &TypeMapEntry::sqlDataType, sqlDataTypeElse) + ", " +
+        caseInt("sql_datetime_sub", &TypeMapEntry::sqlDatetimeSub, sqlDatetimeSubElse) +
         ","
         " case when basetype in (" +
         std::to_string(ifxsqli::ifxtype::kChar) + ", " + std::to_string(ifxsqli::ifxtype::kVarchar) + ", " +
@@ -416,7 +612,23 @@ std::pair<std::string, std::vector<ifxsqli::BindParam>> buildColumnsSql(const st
         " select trim(t.owner) as table_schem, t.tabname as table_name, c.colname as column_name,"
         " case when c.coltype >= 256 then c.coltype - 256 else c.coltype end as basetype,"
         " c.collength as collength, c.colno as colno,"
-        " case when c.coltype >= 256 then 0 else 1 end as nullable_flag"
+        " case when c.coltype >= 256 then 0 else 1 end as nullable_flag,"
+        // Decoded once here (see IntervalShapeEntry's doc comment), read as
+        // plain aliases by every INTERVAL-aware CASE above and in
+        // caseTypeName/caseColumnSize - garbage-but-unused for non-INTERVAL
+        // rows, same as basetype/nullable_flag's own derived-table split.
+        " cast(" +
+        intervalStartExpr("c.collength") +
+        " as integer) as interval_start,"
+        " cast(" +
+        intervalEndExpr("c.collength") +
+        " as integer) as interval_end,"
+        " cast(" +
+        intervalLeadingExpr("c.collength") +
+        " as integer) as interval_leading,"
+        " cast(" +
+        intervalFracExpr("c.collength") +
+        " as integer) as interval_frac"
         " from systables t join syscolumns c on t.tabid = c.tabid"
         " where t.tabtype in ('T', 'V')"
         " ) x"
@@ -467,8 +679,14 @@ std::pair<std::string, std::vector<ifxsqli::BindParam>> buildColumnsSql(const st
 // any particular column's declared nullability) and SEARCHABLE is always
 // SQL_SEARCHABLE for every type. DECIMAL's MINIMUM_SCALE/MAXIMUM_SCALE
 // (0/32) approximate Informix's documented max precision rather than being
-// read from the server. INTERVAL_PRECISION is always NULL (no INTERVAL
-// support - out of MVP-8 scope, same gap noted elsewhere in this file).
+// read from the server. INTERVAL_PRECISION is always NULL - INTERVAL has
+// no SQLGetTypeInfo rows at all (deliberately deferred, unlike SQLColumns
+// above): kTypeMap is a flat one-row-per-ifxBaseType table, and INTERVAL's
+// 13 qualifier shapes (see IntervalShapeEntry) don't fit that shape without
+// a larger restructure nothing in this project's verification bar
+// currently needs, since SQLGetTypeInfo has no isql-native invocation path
+// to exercise it and the real Driver Manager isn't reachable in this
+// environment (see STATUS.md's Windows DM / WSL2 gap).
 std::string sqlSmallInt(int v) { return "cast(" + std::to_string(v) + " as smallint)"; }
 std::string sqlNullSmallInt() { return "cast(null as smallint)"; }
 std::string sqlQuotedLiteral(const std::string& s) {

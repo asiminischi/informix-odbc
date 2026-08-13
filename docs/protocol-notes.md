@@ -1012,6 +1012,96 @@ catalogs, `SchemaName="%"` alone to list schemas) and `COLUMN_DEF`
 `driver/catalog.cpp`'s top comment for why these are deliberate,
 documented gaps rather than oversights.
 
+**INTERVAL in `SQLColumns`** (`driver/catalog.cpp`'s `IntervalShapeEntry`/
+`intervalCase*` helpers) needed its own dispatch, structurally different
+from every other type's flat `kTypeMap` lookup: `syscolumns.coltype`
+reports the *same* base type code (14) for every INTERVAL column
+regardless of qualifier, but ODBC expects a distinct `DATA_TYPE` per
+qualifier *shape* (`SQL_INTERVAL_YEAR` vs `SQL_INTERVAL_DAY_TO_SECOND`,
+13 shapes total across both interval classes). `collength` packs the same
+`(totalDigits << 8) | qualifierByte` qualifier `sqli::decodeIntervalYearMonth`/
+`decodeIntervalDayFraction` already decode at the wire level - confirmed
+live via a probe table (`INTERVAL YEAR(4) TO MONTH`/`DAY(4) TO
+FRACTION(3)`/`MONTH(2) TO MONTH` produced `collength` 1538/3405/546,
+matching `(6<<8)|0x02`/`(13<<8)|0x4D`/`(2<<8)|0x22` exactly) - so
+`buildColumnsSql`'s inner derived table decodes `start`/`end`/
+`leadingWidth`/`fractionDigits` from `collength` once (the same per-field
+arithmetic as the sqli-layer decoders, reconstructed in SQL rather than
+shared, since this file has no dependency on `sqli/types.cpp`'s internal
+implementation), and every outer `CASE` (`DATA_TYPE`, `TYPE_NAME`,
+`SQL_DATA_TYPE`, `SQL_DATETIME_SUB`, `COLUMN_SIZE`, `DECIMAL_DIGITS`)
+dispatches on those decoded aliases instead of `basetype` directly.
+FRACTION(n) end codes collapse to plain SECOND for this dispatch - ODBC
+has no INTERVAL data type distinguishing "TO SECOND" from
+"TO FRACTION(n)"; the fractional-seconds precision goes in
+`DECIMAL_DIGITS` instead, matching how ODBC's native interval C types
+already carry it.
+
+`DATA_TYPE` uses the *positive* `SQL_INTERVAL_*` constants (101-113,
+`100 + SQL_CODE_*`), not the negative ODBC-2.x-era values also named
+`SQL_INTERVAL_*` in `sqlext.h` - both exist in the header behind an
+`#if (ODBCVER >= 0x0300)` branch, and rather than trust which one wins
+from memory, a throwaway probe was actually compiled against this
+project's toolchain: `ODBCVER` defaults to `0x0380` on this SDK (nothing
+in this project overrides it), so the positive branch is what a caller
+actually receives.
+
+`COLUMN_SIZE` reports a character *display-size* bound (matching this
+file's existing `DATE`(10)/`DATETIME`(19) convention), not the leading
+field's own declared digit width alone - confirmed via `sqlext.h` that
+leading precision has its own separate ODBC descriptor field
+(`SQL_DESC_DATETIME_INTERVAL_PRECISION`, 26), so reporting it as
+`COLUMN_SIZE` would both be off-model and risk truncating a `SQL_C_CHAR`
+fetch through this driver's own `formatIntervalYearMonth`/
+`formatIntervalDayFraction` text surface. Each qualifier shape's
+`COLUMN_SIZE` is leading-field width plus a shape-specific constant
+(punctuation and fixed-width subfields, e.g. YEAR-MONTH's `+4` for
+sign+dash+2-digit-month) plus a FRACTION suffix if present - all four
+qualifier shapes captured above were confirmed live to produce the
+expected value (8/18/6/12 respectively, the last for a fifth probe column,
+`INTERVAL HOUR(5) TO SECOND`). Like `DATETIME`'s own approximate 19, this
+is a reasoned upper bound (never smaller than what this driver's own text
+formatters can produce for that shape and leading width), not
+independently confirmed against a real ODBC client that actually consumes
+`COLUMN_SIZE`.
+
+Verified by generating the SQL via `buildColumnsSql` and running it
+directly against the live server through `SqliStatement` (same technique
+as this project's no-live-DM-connection verification elsewhere) - not yet
+through the real Driver Manager, which needs the Linux/WSL2 path not set
+up in this environment (see the Windows DM gap noted elsewhere in this
+document). Non-INTERVAL columns were re-checked the same way to confirm no
+regression to the existing `kTypeMap` dispatch.
+
+**Deliberately not extended to `SQLGetTypeInfo`**: that function's
+`kTypeMap`-driven design emits exactly one row per type, and INTERVAL's 13
+qualifier shapes don't fit that shape without a larger restructure -
+nothing in this project's verification bar (no isql-native invocation
+path for `SQLGetTypeInfo`, and the real Driver Manager isn't reachable in
+this environment) currently exercises it, so it's an open, documented gap
+rather than an oversight.
+
+**A pre-existing bug found while deriving `COLUMN_SIZE`'s formula, not
+fixed here**: `driver/convert.cpp`'s `formatIntervalDayFraction` (the
+`SQL_C_CHAR` text surface, shipped in the DAY-FRACTION decode commit) only
+receives `hasDayField`, not the qualifier's actual start/end reach. Its
+`!hasDayField` branch always feeds `iv.hour` as the first printed field
+regardless of which field is actually the qualifier's leader - a
+MINUTE-anchored or SECOND-anchored qualifier (`MINUTE TO SECOND`,
+`SECOND TO SECOND`) would print the true leading value stranded in the
+wrong slot (e.g. `0:04:05` instead of a correct minute-leading rendering)
+rather than in the first slot - and it always prints the full `HH:MM:SS`
+shape regardless of whether the qualifier actually reaches that far (e.g.
+`HOUR TO MINUTE` would show a spurious `:00` seconds field). Both stem
+from the same root cause: the formatter needs the qualifier's start *and*
+end passed in, not just `hasDayField`. `sqli::decodeIntervalDayFraction`
+itself is unaffected (its own field-by-field decode already handles
+MINUTE/SECOND-anchored qualifiers correctly, per its own doc comment); this
+is purely a `driver/convert.cpp` text-rendering gap. Confirmed reachable
+(the sqli-layer decode guard accepts `start` in `{DAY, HOUR, MINUTE,
+SECOND}`), not yet independently live-captured for the specific
+MINUTE/SECOND-anchored cases - see `STATUS.md`'s open items.
+
 ## Open questions / risks
 
 - Whether `has4ByteOffsets()`'s constituent capability bits (see "Narrow vs. wide

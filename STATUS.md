@@ -308,8 +308,50 @@ Roughly in the order they'd bite a real application:
    and discards outright, and that `driver/bind_encode.cpp`'s
    `encodeBindParam` has no parameter to receive at all. See
    `docs/protocol-notes.md`'s INTERVAL SQ_BIND encoding section for detail.
-   Catalog rows (`SQLColumns`/`SQLGetTypeInfo`) remain unimplemented for
-   both classes - see item 7 below.
+
+   `SQLColumns` now reports INTERVAL columns correctly for both classes -
+   `driver/catalog.cpp` decodes each column's qualifier from
+   `syscolumns.collength` (the same packed `(totalDigits << 8) |
+   qualifierByte` shape the wire protocol uses, confirmed live via a probe
+   table) and dispatches `DATA_TYPE`/`TYPE_NAME`/`SQL_DATA_TYPE`/
+   `SQL_DATETIME_SUB`/`COLUMN_SIZE`/`DECIMAL_DIGITS` on the decoded
+   qualifier shape instead of the flat `basetype`-keyed lookup every other
+   type uses (INTERVAL's wire type code is shared by all 13 qualifier
+   shapes across both classes, unlike every other type). `DATA_TYPE` uses
+   `sqlext.h`'s positive `SQL_INTERVAL_*` values (101-113), confirmed by
+   compiling a probe against this project's toolchain rather than assuming
+   from memory (this SDK's default `ODBCVER` selects that branch, not the
+   negative ODBC-2.x-era one sharing the same macro names). `COLUMN_SIZE`
+   is a character display-size bound (matching `DATE`/`DATETIME`'s
+   existing convention), not the leading field's own declared width alone
+   - confirmed via `sqlext.h` that leading precision has its own separate
+   ODBC descriptor field, so reporting it as `COLUMN_SIZE` would risk
+   truncating a `SQL_C_CHAR` fetch. Verified live by running the generated
+   SQL directly against the server (four distinct qualifier shapes, plus a
+   regression check that non-INTERVAL columns are unaffected), not yet
+   through the real Driver Manager (same Linux/WSL2 gap as item 3's bind
+   work). `SQLGetTypeInfo` is deliberately *not* extended for INTERVAL -
+   its `kTypeMap` design emits one row per type, and INTERVAL's 13
+   qualifier shapes don't fit that without a larger restructure nothing in
+   this project's verification bar currently needs. See
+   `docs/protocol-notes.md`'s "INTERVAL in SQLColumns" section for detail.
+
+   **A pre-existing bug was found (not fixed) while deriving the
+   `COLUMN_SIZE` formula**: `driver/convert.cpp`'s `formatIntervalDayFraction`
+   (the `SQL_C_CHAR` text surface, shipped in the DAY-FRACTION decode
+   commit) only receives `hasDayField`, not the qualifier's actual
+   start/end reach - its `!hasDayField` branch always prints `iv.hour` as
+   the first field regardless of which field is actually the qualifier's
+   leader, so a MINUTE-anchored or SECOND-anchored qualifier (`MINUTE TO
+   SECOND`, `SECOND TO SECOND`) prints the true leading value stranded in
+   the wrong slot, and it always prints the full `HH:MM:SS` shape even
+   when the qualifier doesn't reach that far (e.g. `HOUR TO MINUTE` shows
+   a spurious `:00` seconds field). This is exactly the
+   "MINUTE/SECOND-anchored leading fields... untested" gap already flagged
+   below, now diagnosed with a concrete cause and fix (pass the qualifier
+   into the formatter, not just `hasDayField`) - `sqli::
+   decodeIntervalDayFraction` itself is unaffected, this is purely a
+   `driver/convert.cpp` rendering gap. Next slice, not this one.
 4. **No DSN-based connect (`SQLConnect`).** Only `SQLDriverConnect` with an
    explicit keyword string works today. Fine for `isql -k`, but many
    GUI/ODBC-Admin tools default to the DSN path.
@@ -323,11 +365,12 @@ Roughly in the order they'd bite a real application:
    Linux/WSL2 + unixODBC + `isql`.
 6. **No Unicode.** ANSI (`SQL_C_CHAR`) only; no `SQLWCHAR`/`W`-suffixed
    functions.
-7. **Missing scalar types**: INTERVAL catalog rows (both classes' fetch and
-   sqli-layer bind are done, see item 3 above; ODBC `SQLBindParameter`
-   wiring for INTERVAL bind is still open too, needing `ColumnSize`/
+7. **Missing scalar types**: INTERVAL's ODBC `SQLBindParameter` wiring
+   (fetch, sqli-layer bind, and `SQLColumns` are all done for both
+   classes, see item 3 above - `SQLBindParameter` needs `ColumnSize`/
    `DecimalDigits` plumbed through in a way no other bind type has
-   required), and LOBs (BLOB/CLOB/BYTE/TEXT). BOOLEAN, FLOAT/SMALLFLOAT,
+   required, and `SQLGetTypeInfo` is a separate, deliberately deferred gap
+   - see item 3), and LOBs (BLOB/CLOB/BYTE/TEXT). BOOLEAN, FLOAT/SMALLFLOAT,
    and DATETIME (including sub-second FRACTION) are fully done, including
    catalog rows.
 8. **No real generated-key retrieval.** The `SQ_INSERTDONE` wire field is
@@ -383,18 +426,22 @@ write every column type a real database has, and has to actually be
 callable from BOP's own code; catalog-completeness and driver-manager
 polish don't block that.
 
-1. **Remaining scalar types beyond the MVP-8 set - INTERVAL catalog rows
-   (both classes' fetch and sqli-layer bind are done), INTERVAL's own
-   `SQLBindParameter` wiring (needs `ColumnSize`/`DecimalDigits` plumbed
-   through - see item 7), then LOBs (both bind and fetch sides). BOOLEAN,
-   FLOAT/SMALLFLOAT, and DATETIME (including sub-second FRACTION) are fully
-   done end to end (bind, fetch, and catalog rows, sqli-layer plus
-   ODBC-layer). All of this confirmed live - DATETIME/FRACTION and
+1. **Remaining scalar types beyond the MVP-8 set - fix
+   `formatIntervalDayFraction`'s MINUTE/SECOND-anchored rendering bug (see
+   item 3 - found this session, small and self-contained), then INTERVAL's
+   ODBC `SQLBindParameter` wiring (needs `ColumnSize`/`DecimalDigits`
+   plumbed through - see item 7; `SQLColumns` and sqli-layer bind are
+   already done for both classes), then LOBs (both bind and fetch sides).
+   BOOLEAN, FLOAT/SMALLFLOAT, and DATETIME (including sub-second FRACTION)
+   are fully done end to end (bind, fetch, and catalog rows, sqli-layer
+   plus ODBC-layer). All of this confirmed live - DATETIME/FRACTION and
    INTERVAL (both classes, both signs) through the sqli layer and
    driver-layer conversions directly (`driver/convert.cpp`/
-   `convert_native.cpp`/`bind_encode.cpp`), not yet through the real
-   Driver Manager, which currently needs the Linux/WSL2 path (see
-   item 5's Windows DM gap) not set up in this environment.**
+   `convert_native.cpp`/`bind_encode.cpp`), and INTERVAL's `SQLColumns`
+   rows via generated SQL run directly against the server - none of this
+   yet through the real Driver Manager, which currently needs the
+   Linux/WSL2 path (see item 5's Windows DM gap) not set up in this
+   environment.**
    Blocking: a real Informix database backup/restore tool can't skip
    columns of a type it doesn't support. LOBs in particular are likely to
    need their own multi-message wire handling, not just another entry in
