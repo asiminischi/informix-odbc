@@ -142,6 +142,13 @@ struct ParamBinding {
     SQLPOINTER parameterValuePtr = nullptr;
     SQLLEN bufferLength = 0;
     SQLLEN* strLenOrIndPtr = nullptr;
+    // Unused by every MVP-8 bind type (each is either self-describing or
+    // carries its own precision intrinsically - see driver/bind_encode.h's
+    // top comment) - INTERVAL is the first type that genuinely needs
+    // these: its leading field width has no other source at bind time
+    // (see encodeBindParam's SQL_INTERVAL_* branch).
+    SQLULEN columnSize = 0;
+    SQLSMALLINT decimalDigits = 0;
 };
 
 struct OdbcStatement {

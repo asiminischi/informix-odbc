@@ -10,6 +10,7 @@ FetchContent_MakeAvailable(doctest)
 unset(CMAKE_POLICY_VERSION_MINIMUM)
 
 add_subdirectory(sqli)
+add_subdirectory(driver)
 
 option(IFX_ENABLE_INTEGRATION_TESTS
        "Build/run tests that require a live Informix server (see tests/integration)" OFF)

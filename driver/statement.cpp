@@ -228,7 +228,8 @@ std::optional<std::vector<ifxsqli::BindParam>> buildBindParams(OdbcStatement* s)
             continue;
         }
         SQLLEN strLenOrInd = binding.strLenOrIndPtr ? *binding.strLenOrIndPtr : SQL_NTS;
-        auto encoded = encodeBindParam(binding.valueType, binding.parameterType, binding.parameterValuePtr, strLenOrInd);
+        auto encoded = encodeBindParam(binding.valueType, binding.parameterType, binding.parameterValuePtr, strLenOrInd,
+                                        binding.columnSize, binding.decimalDigits);
         if (encoded.status != BindEncodeStatus::kOk) {
             postDriverError(s->diag, "HYC00",
                             "SQLBindParameter: unsupported ValueType/ParameterType combination for parameter #" +
@@ -455,12 +456,14 @@ IFXODBC_EXPORT SQLRETURN SQL_API SQLColAttributes(SQLHSTMT hstmt, SQLUSMALLINT i
 // semantics (the application may change the pointed-to value any number of
 // times before SQLExecute actually reads it) - the same pattern
 // SQLBindCol already uses for output columns. ColumnSize/DecimalDigits are
-// still unused - CHAR's SQ_BIND framing is self-describing so this driver
-// currently doesn't need them (see sqli/types.h's encodeChar), but VARCHAR
-// will (see docs/protocol-notes.md's SQ_BIND notes).
+// captured but unused by every MVP-8 type - CHAR's SQ_BIND framing is
+// self-describing so this driver doesn't need them there (see
+// sqli/types.h's encodeChar) - INTERVAL is the one type that does (see
+// encodeBindParam's SQL_INTERVAL_* branch): its leading field width has no
+// other source at bind time.
 IFXODBC_EXPORT SQLRETURN SQL_API SQLBindParameter(SQLHSTMT StatementHandle, SQLUSMALLINT ParameterNumber,
                                     SQLSMALLINT /*InputOutputType*/, SQLSMALLINT ValueType, SQLSMALLINT ParameterType,
-                                    SQLULEN /*ColumnSize*/, SQLSMALLINT /*DecimalDigits*/, SQLPOINTER ParameterValuePtr,
+                                    SQLULEN ColumnSize, SQLSMALLINT DecimalDigits, SQLPOINTER ParameterValuePtr,
                                     SQLLEN /*BufferLength*/, SQLLEN* StrLen_or_IndPtr) {
     auto* s = static_cast<OdbcStatement*>(StatementHandle);
     if (!s) return SQL_INVALID_HANDLE;
@@ -471,7 +474,7 @@ IFXODBC_EXPORT SQLRETURN SQL_API SQLBindParameter(SQLHSTMT StatementHandle, SQLU
         return SQL_SUCCESS;
     }
     s->paramBindings[ParameterNumber] =
-        ParamBinding{ValueType, ParameterType, ParameterValuePtr, 0, StrLen_or_IndPtr};
+        ParamBinding{ValueType, ParameterType, ParameterValuePtr, 0, StrLen_or_IndPtr, ColumnSize, DecimalDigits};
     return SQL_SUCCESS;
 }
 

@@ -822,24 +822,90 @@ DATETIME's own FRACTION suffix. `IntervalDayFractionValue`'s own
 `fractionDigits` field isn't consulted on encode (same reasoning as
 `encodeDatetime`: the wire qualifier alone declares FRACTION's width).
 
-**Not yet wired to the ODBC surface.** Unlike DATE/DECIMAL/DATETIME, whose
-bind encoders need no target-column metadata, INTERVAL's leading field
-width is a genuine per-column, user-declared value (1-9 digits) that isn't
-recoverable from the bind value's magnitude alone - `43` bound to
-`YEAR(2) TO MONTH` and to `YEAR(9) TO MONTH` need different qualifier
-bytes and different exponents even though the numeric value is identical.
-That means correct ODBC-surface binding needs `SQLBindParameter`'s
-`ColumnSize`/`DecimalDigits` (which for `SQL_INTERVAL_*` parameter types
-carry the interval leading precision and seconds precision) - fields
-`driver/statement.cpp`'s `SQLBindParameter` currently receives but
-discards entirely (`/*ColumnSize*/`/`/*DecimalDigits*/`, unused, since none
-of the MVP-8 types need them), and `driver/bind_encode.cpp`'s
-`encodeBindParam` doesn't even have a parameter to receive them through.
-Wiring this - plus deciding whether INTERVAL parameters go through
-`SQL_C_INTERVAL_YEAR_TO_MONTH`/`SQL_C_INTERVAL_DAY_TO_FRACTION`'s native
-`SQL_INTERVAL_STRUCT` or a `SQL_C_CHAR` text-literal convention matching
-DECIMAL's - is deliberately left as its own follow-up investigation with
-its own Driver Manager-level live pass, not resolved here.
+**Now wired to the ODBC `SQLBindParameter` surface** (`driver/bind_encode.cpp`).
+Unlike DATE/DECIMAL/DATETIME, whose bind encoders need no target-column
+metadata, INTERVAL's leading field width is a genuine per-column,
+user-declared value (1-9 digits) that isn't recoverable from the bind
+value's magnitude alone - `43` bound to `YEAR(2) TO MONTH` and to
+`YEAR(9) TO MONTH` need different qualifier bytes and different exponents
+even though the numeric value is identical. Correct ODBC-surface binding
+therefore needs `SQLBindParameter`'s `ColumnSize`/`DecimalDigits` (which
+for `SQL_INTERVAL_*` parameter types carry the interval leading precision
+and fractional-seconds precision respectively) - previously received but
+discarded outright (`/*ColumnSize*/`/`/*DecimalDigits*/`, since none of
+the MVP-8 types need them), now plumbed through `ParamBinding`
+(`driver/handles.h`) into `encodeBindParam`'s signature.
+
+`intervalEncodedLengthFor` (`driver/bind_encode.cpp`) reconstructs the
+wire qualifier from the `ParameterType`/`ColumnSize`/`DecimalDigits`
+triple: `ParameterType` is one of the 13 `SQL_INTERVAL_*` concise type
+constants (an independent copy of `driver/catalog.cpp`'s
+`IntervalShapeEntry` shape table, kept separate per that file's own stated
+precedent), `ColumnSize` supplies the leading field's declared width, and
+`DecimalDigits` supplies FRACTION's digit count for the `*_TO_SECOND`
+shapes. Confirmed correct against three qualifier values `driver/catalog.cpp`'s
+SQLColumns work already captured live (`tests/driver/test_bind_encode.cpp`,
+no server needed) - a pure function is the right verification surface for
+this piece, since it's the one genuinely new logic in the INTERVAL bind
+path (everything downstream already routes through the live-verified
+`sqli::encodeIntervalYearMonth`/`encodeIntervalDayFraction`).
+
+The value itself comes through the native `SQL_INTERVAL_STRUCT`
+(`SQL_C_INTERVAL_*`), not a `SQL_C_CHAR` text literal like DECIMAL's -
+deliberately not this driver's own display-text convention
+(`formatIntervalYearMonth`/`DayFraction`): unlike DECIMAL's `"12345.67"`,
+which happens to already be the ODBC C-to-SQL representation for that
+type, this driver's interval text is a dbaccess-mimicking *output*
+convention it built itself, so a parser mirroring it would only prove
+self-consistency (any test feeding the formatter's own output back into
+its own parser passes circularly), not real interoperability - the whole
+point of the ODBC surface. `SQL_INTERVAL_STRUCT`'s layout is externally
+defined (`sqltypes.h`: `interval_type`/`interval_sign` plus a
+`year_month`/`day_second` union), so encoding/decoding it is meaningfully
+verifiable instead. `SQL_DAY_SECOND_STRUCT`'s `fraction` field is
+nanoseconds, the same convention `SQL_TIMESTAMP_STRUCT`'s own `fraction`
+field already uses (see the DATETIME bind section above) - scaled down to
+Informix's own digit count, truncating.
+
+Confirmed live end-to-end through this driver's own exported ODBC entry
+points (`SQLAllocHandle`/`SQLDriverConnect`/`SQLPrepare`/
+`SQLBindParameter`/`SQLExecute`, called directly against the built
+`ifxodbc` library rather than through a Driver Manager - the IM002
+registration gap only blocks *DM-mediated* loading, not a program calling
+the driver's exported C functions directly): both interval classes, both
+signs, a `FRACTION` value, and a NULL interval bind ahead of another
+parameter (the same desync-prone ordering `tests/integration/test_bind.cpp`'s
+`checkNullBind` already exercises for other types) all round-tripped
+correctly - insert via the real ODBC entry points, read back and decode
+via the already-trusted sqli layer. INTERVAL needs no extended-type
+owner/name for a NULL bind (unlike BOOLEAN): its `extendedId` is 0 (a
+plain scalar in DESCRIBE terms, confirmed live earlier in this section),
+and `writeBindBlock` never sends `precisionField` for a NULL parameter
+regardless of type, so the qualifier is irrelevant to the NULL case too.
+One caveat this pass doesn't close: whether a real Driver Manager passes
+the `SQL_INTERVAL_*` `ParameterType`/`ColumnSize`/`DecimalDigits` triple
+through to this driver unmolested - that needs the Linux/WSL2 unixODBC
+path not set up in this environment (same gap noted throughout this
+document).
+
+`intervalEncodedLengthFor` rejects `DecimalDigits > 5` on a `*_TO_SECOND`
+shape rather than silently truncating: Informix caps `FRACTION` at 5
+digits (the same limit DATETIME's `FRACTION` has), and past that the
+packed qualifier byte's low nibble (`10 + fractionDigits`) would overflow
+past `0xF` and corrupt the wire qualifier rather than just describe an
+oversized fraction - a real boundary check on a real ODBC entry point, not
+speculative validation. `encodeBindParam`'s `SQL_INTERVAL_STRUCT`
+field-reading itself (as opposed to `intervalEncodedLengthFor`'s pure
+qualifier math, already unit-tested) was previously verified only by the
+throwaway ODBC-surface probe above, which isn't part of the repo -
+`tests/driver/test_bind_encode.cpp` now also covers it directly, against
+`sqli::encodeIntervalYearMonth`/`encodeIntervalDayFraction` rather than
+against itself: the `MONTH TO MONTH` special case (`start == 2` reads
+`month` as the already-total value, not `year*12+month` - a struct with a
+nonzero `year` alongside `month` catches a regression that would silently
+fall through to the wrong branch), and `SQL_DAY_SECOND_STRUCT.fraction`'s
+nanosecond-to-`FRACTION`-digit scaling (a non-multiple-of-10^6 nanosecond
+value confirms truncation, not rounding).
 
 Both algorithms are implemented in `sqli/types.cpp` (`decodeDecimal`,
 `decodeDatetime`), with round-trip unit tests in `tests/sqli/test_types.cpp`

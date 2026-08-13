@@ -300,14 +300,28 @@ Roughly in the order they'd bite a real application:
    already caught only by testing the specific shape, so the sign +
    un-stripped-exponent combination got its own live check too rather than
    being assumed safe from DECIMAL's separately-confirmed negative-bind
-   mechanism. **Not yet wired to the ODBC `SQLBindParameter` surface**:
+   mechanism. **Now wired to the ODBC `SQLBindParameter` surface too**:
    unlike every other bind type so far, INTERVAL's leading field width is a
    genuine per-column, user-declared value that can't be recovered from the
-   bind value's magnitude alone, so it needs `SQLBindParameter`'s
-   `ColumnSize`/`DecimalDigits` - fields the ODBC layer currently receives
-   and discards outright, and that `driver/bind_encode.cpp`'s
-   `encodeBindParam` has no parameter to receive at all. See
-   `docs/protocol-notes.md`'s INTERVAL SQ_BIND encoding section for detail.
+   bind value's magnitude alone, so `ColumnSize`/`DecimalDigits` (previously
+   received and discarded outright) are now plumbed through `ParamBinding`
+   into `encodeBindParam`, which reconstructs the wire qualifier from the
+   `SQL_INTERVAL_*` `ParameterType` + `ColumnSize` + `DecimalDigits` triple
+   (`intervalEncodedLengthFor`, unit-tested against three live-captured
+   qualifier values with no server needed - `tests/driver/test_bind_encode.cpp`,
+   a new test target). The value itself comes through the native
+   `SQL_INTERVAL_STRUCT` (`SQL_C_INTERVAL_*`), not a `SQL_C_CHAR` text
+   literal like DECIMAL's - deliberately not this driver's own display-text
+   convention, since parsing that back would only prove self-consistency,
+   not real ODBC interoperability (see `docs/protocol-notes.md`'s INTERVAL
+   SQ_BIND encoding section for the full reasoning). Confirmed live
+   end-to-end through this driver's own exported ODBC entry points, called
+   directly against the built `ifxodbc` library (bypassing the Driver
+   Manager, which the IM002 registration gap blocks only for DM-mediated
+   loading, not direct calls) - both classes, both signs, `FRACTION`, and a
+   NULL bind ahead of another parameter all round-tripped correctly.
+   Remaining open question: whether a real Driver Manager passes this
+   triple through unmolested - needs the Linux/WSL2 path not set up here.
 
    `SQLColumns` now reports INTERVAL columns correctly for both classes -
    `driver/catalog.cpp` decodes each column's qualifier from
@@ -375,14 +389,15 @@ Roughly in the order they'd bite a real application:
    Linux/WSL2 + unixODBC + `isql`.
 6. **No Unicode.** ANSI (`SQL_C_CHAR`) only; no `SQLWCHAR`/`W`-suffixed
    functions.
-7. **Missing scalar types**: INTERVAL's ODBC `SQLBindParameter` wiring
-   (fetch, sqli-layer bind, and `SQLColumns` are all done for both
-   classes, see item 3 above - `SQLBindParameter` needs `ColumnSize`/
-   `DecimalDigits` plumbed through in a way no other bind type has
-   required, and `SQLGetTypeInfo` is a separate, deliberately deferred gap
-   - see item 3), and LOBs (BLOB/CLOB/BYTE/TEXT). BOOLEAN, FLOAT/SMALLFLOAT,
-   and DATETIME (including sub-second FRACTION) are fully done, including
-   catalog rows.
+7. **Missing scalar types**: LOBs (BLOB/CLOB/BYTE/TEXT, both bind and
+   fetch sides) - the only scalar type family left with no support at
+   all. INTERVAL is now fully done for both classes: fetch, sqli-layer
+   bind, ODBC `SQLBindParameter` wiring, and `SQLColumns` (see item 3
+   above) - only `SQLGetTypeInfo` remains a deliberately deferred gap for
+   INTERVAL specifically (its `kTypeMap` design doesn't fit INTERVAL's 13
+   qualifier shapes, and nothing in this project's verification bar
+   exercises it). BOOLEAN, FLOAT/SMALLFLOAT, and DATETIME (including
+   sub-second FRACTION) are fully done too, including catalog rows.
 8. **No real generated-key retrieval.** The `SQ_INSERTDONE` wire field is
    decoded, but the driver never sends the extra "SGK" request the server
    needs to actually populate it, so every INSERT currently reports a
@@ -436,20 +451,22 @@ write every column type a real database has, and has to actually be
 callable from BOP's own code; catalog-completeness and driver-manager
 polish don't block that.
 
-1. **Remaining scalar types beyond the MVP-8 set - INTERVAL's ODBC
-   `SQLBindParameter` wiring (needs `ColumnSize`/`DecimalDigits` plumbed
-   through - see item 7; `SQLColumns`, sqli-layer bind, and the
-   DAY-FRACTION text-rendering bug found and fixed this session are all
-   done for both classes - see item 3), then LOBs (both bind and fetch
-   sides).
+1. **Remaining scalar types beyond the MVP-8 set - LOBs (BLOB/CLOB/BYTE/
+   TEXT, both bind and fetch sides) are the only scalar family left
+   unstarted. INTERVAL is now fully done for both classes end to end,
+   including the ODBC `SQLBindParameter` surface (`ColumnSize`/
+   `DecimalDigits` now plumbed through - see item 7) - only
+   `SQLGetTypeInfo` remains a deliberately deferred INTERVAL gap.
    BOOLEAN, FLOAT/SMALLFLOAT, and DATETIME (including sub-second FRACTION)
-   are fully done end to end (bind, fetch, and catalog rows, sqli-layer
-   plus ODBC-layer). All of this confirmed live - DATETIME/FRACTION and
-   INTERVAL (both classes, both signs) through the sqli layer and
-   driver-layer conversions directly (`driver/convert.cpp`/
-   `convert_native.cpp`/`bind_encode.cpp`), and INTERVAL's `SQLColumns`
-   rows via generated SQL run directly against the server - none of this
-   yet through the real Driver Manager, which currently needs the
+   are fully done end to end too (bind, fetch, and catalog rows,
+   sqli-layer plus ODBC-layer). All of this confirmed live - DATETIME/
+   FRACTION and INTERVAL (both classes, both signs) through the sqli layer
+   and driver-layer conversions directly (`driver/convert.cpp`/
+   `convert_native.cpp`/`bind_encode.cpp`), INTERVAL's `SQLColumns` rows
+   via generated SQL run directly against the server, and INTERVAL's
+   `SQLBindParameter` wiring through this driver's own exported ODBC entry
+   points called directly (bypassing the Driver Manager) - none of this
+   yet through a *real* Driver Manager, which currently needs the
    Linux/WSL2 path (see item 5's Windows DM gap) not set up in this
    environment.**
    Blocking: a real Informix database backup/restore tool can't skip
