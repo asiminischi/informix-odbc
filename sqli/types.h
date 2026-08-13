@@ -413,4 +413,52 @@ struct DecimalBindEncoding {
 [[nodiscard]] std::expected<std::optional<IntervalDayFractionValue>, Error> decodeIntervalDayFraction(
     std::span<const std::byte> raw, std::uint32_t encodedLength);
 
+// INTERVAL SQ_BIND encoding, YEAR-MONTH class - genuinely asymmetric with
+// decodeIntervalYearMonth, not its mathematical inverse applied blindly.
+// Traced via the decompiled JDBC reference's
+// `Decimal(boolean sign, byte[] b, int blen, short inPrec)` constructor
+// (what `IfxIntervalYM.toIfx()` -> `JavaToIfxType.JavaToIfxInterval` ->
+// `convertIntervalToDecimal(...).javaToIfx()` routes through): unlike the
+// fetch/TUPLE direction, SQ_BIND does *not* strip leading zero digit-pairs
+// down to DECIMAL's floating form - the mantissa is built directly at the
+// qualifier's full, fixed field widths (the same un-normalized digit
+// layout `decodeIntervalDigits` reconstructs as an intermediate step
+// before the fetch side's own trimming), and the exponent byte's biased
+// magnitude is unconditionally the qualifier's own unnormalizedExp formula
+// `(totalDigits + 10 - end + 1) / 2` - never shifted down for a
+// leading-zero leading field the way a live fetch of the same value would
+// be. The server is expected to do its own normalizing when it later
+// re-serves the value (exactly as it already does for plain DECIMAL
+// binds, which also send a non-canonical/non-stripped encoding), not
+// require the client to pre-strip on the way in - confirmed live for a
+// case that specifically needs this (`INTERVAL YEAR(4) TO MONTH` bound
+// with a zero leading digit-pair) round-tripping correctly through a
+// plain SELECT afterward (tests/integration/test_bind.cpp), not merely
+// self-consistent.
+//
+// `months` is total months (negative for a negative interval), same
+// convention as decodeIntervalYearMonth's return value; `encodedLength` is
+// the same packed qualifier value both decode functions take. Like every
+// other bind encoder in this file, NULL isn't represented here - it's
+// signaled via the bind record's own indicator field (see BindParam),
+// never by encoding a value.
+[[nodiscard]] std::expected<std::vector<std::byte>, Error> encodeIntervalYearMonth(std::int64_t months,
+                                                                                       std::uint32_t encodedLength);
+
+// INTERVAL SQ_BIND encoding, DAY-FRACTION class - see
+// encodeIntervalYearMonth's doc comment for the shared no-stripping
+// mechanism (same source, `convertIntervalToDecimal(IntervalDF)`). Field
+// layout mirrors decodeIntervalDayFraction: `value`'s leading field
+// (whichever of day/hour/minute/second matches the qualifier's start
+// code) gets the qualifier's declared width, every subsequent whole field
+// is a plain 2-digit 0-99 value, and FRACTION digits (if the qualifier's
+// end code calls for them) continue the same mantissa stream after SECOND
+// with the same odd-digit-count trailing-zero-pad convention
+// decodeDatetime's own FRACTION support uses. `value.fractionDigits` is
+// not consulted (same reasoning as encodeDatetime: the wire qualifier
+// alone declares FRACTION's width, not the value struct) - only
+// `value.fraction` and `encodedLength`'s own end code matter.
+[[nodiscard]] std::expected<std::vector<std::byte>, Error> encodeIntervalDayFraction(
+    const IntervalDayFractionValue& value, std::uint32_t encodedLength);
+
 } // namespace ifxsqli

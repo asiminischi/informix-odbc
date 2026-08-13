@@ -767,8 +767,79 @@ slice's tests didn't catch:
   the exact bytes. `driver/convert.cpp`'s `SQL_C_CHAR` text surface
   (`formatIntervalDayFraction`, e.g. "12 03:04:05.67890") confirmed the
   same way as YEAR-MONTH's, directly against the captured bytes.
-  MINUTE/SECOND-anchored leading fields, bind encoding, and catalog rows
-  (`SQLColumns`/`SQLGetTypeInfo`) are all still open.
+  MINUTE/SECOND-anchored leading fields and catalog rows
+  (`SQLColumns`/`SQLGetTypeInfo`) are still open; bind encoding is now done
+  at the sqli layer (see below), not yet on the ODBC `SQLBindParameter`
+  surface.
+
+**INTERVAL SQ_BIND encoding** (`sqli::encodeIntervalYearMonth`/
+`encodeIntervalDayFraction`) turns out to be genuinely asymmetric with the
+fetch direction above, not its mathematical inverse applied blindly.
+Traced via the decompiled JDBC reference's
+`Decimal(boolean sign, byte[] b, int blen, short inPrec)` constructor
+(what `IfxIntervalYM.toIfx()`/`IfxIntervalDF.toIfx()` route through via
+`JavaToIfxType.convertIntervalToDecimal(...).javaToIfx()`): **SQ_BIND does
+not strip leading zero digit-pairs down to DECIMAL's floating form.** The
+mantissa is built directly at the qualifier's full, fixed field widths -
+the same un-normalized digit layout `decodeIntervalDigits` reconstructs as
+an intermediate step before the fetch side's own trimming - and the
+exponent byte's biased magnitude is unconditionally the qualifier's own
+`unnormalizedExp` formula, `(totalDigits + 10 - end + 1) / 2`, never
+shifted down for a leading-zero leading field the way a live fetch of the
+same value would be. The server evidently does its own normalizing when it
+later re-serves the value (exactly as it already does for plain DECIMAL
+binds, which also send a non-canonical/non-stripped mantissa width), not
+require the client to pre-strip on the way in.
+
+Confirmed live for both interval classes, both signs, via
+`tests/integration/test_bind.cpp`'s `checkIntervalYearMonthRoundTrip`/
+`checkIntervalDayFractionRoundTrip`, each deliberately using a value that
+needs stripping on the fetch side specifically to prove the point:
+`INTERVAL YEAR(4) TO MONTH` bound with months=43 (3-07, the leading
+field's high digit-pair is zero) sends exponent `0xC7`/mantissa
+`[00,03,07]` - one exponent step higher and a differently-shaped mantissa
+than the `0xC6`/`[03,07,00]` a live fetch of the same value returns (see
+the INTERVAL(qualifier) section above) - and the server accepts it,
+storing and re-serving the correct value. The negative case (hundred's
+complement applied over this *un-stripped* mantissa, combined with the
+*un-stripped* exponent, a combination not exercised by DECIMAL's own
+negative bind tests, which use DECIMAL's differently-derived canonical
+exponent) is confirmed live too, not just self-round-tripped through this
+driver's own decoder - this project's INTERVAL work has hit three separate
+bugs so far, each caught only by testing the specific shape rather than
+reasoning from a similar one, so the sign/stripping combination got its
+own live check rather than being assumed safe.
+
+Field construction otherwise mirrors the fetch side's per-field layout
+directly (no un-normalization needed since nothing is stripped): the
+leading field is zero-padded to its declared width with a front pad digit
+when that width is odd (the same convention decode's `trimLeadingField`
+undoes, reproduced here rather than inverted), every subsequent whole
+field is a plain 2-digit value, and FRACTION digits (DAY-FRACTION class
+only) back-pad with a trailing zero when the qualifier's fraction digit
+count is odd - the same convention `encodeDatetime` already uses for
+DATETIME's own FRACTION suffix. `IntervalDayFractionValue`'s own
+`fractionDigits` field isn't consulted on encode (same reasoning as
+`encodeDatetime`: the wire qualifier alone declares FRACTION's width).
+
+**Not yet wired to the ODBC surface.** Unlike DATE/DECIMAL/DATETIME, whose
+bind encoders need no target-column metadata, INTERVAL's leading field
+width is a genuine per-column, user-declared value (1-9 digits) that isn't
+recoverable from the bind value's magnitude alone - `43` bound to
+`YEAR(2) TO MONTH` and to `YEAR(9) TO MONTH` need different qualifier
+bytes and different exponents even though the numeric value is identical.
+That means correct ODBC-surface binding needs `SQLBindParameter`'s
+`ColumnSize`/`DecimalDigits` (which for `SQL_INTERVAL_*` parameter types
+carry the interval leading precision and seconds precision) - fields
+`driver/statement.cpp`'s `SQLBindParameter` currently receives but
+discards entirely (`/*ColumnSize*/`/`/*DecimalDigits*/`, unused, since none
+of the MVP-8 types need them), and `driver/bind_encode.cpp`'s
+`encodeBindParam` doesn't even have a parameter to receive them through.
+Wiring this - plus deciding whether INTERVAL parameters go through
+`SQL_C_INTERVAL_YEAR_TO_MONTH`/`SQL_C_INTERVAL_DAY_TO_FRACTION`'s native
+`SQL_INTERVAL_STRUCT` or a `SQL_C_CHAR` text-literal convention matching
+DECIMAL's - is deliberately left as its own follow-up investigation with
+its own Driver Manager-level live pass, not resolved here.
 
 Both algorithms are implemented in `sqli/types.cpp` (`decodeDecimal`,
 `decodeDatetime`), with round-trip unit tests in `tests/sqli/test_types.cpp`
@@ -951,8 +1022,12 @@ documented gaps rather than oversights.
 - DATETIME FRACTION (sub-second precision) is now supported (`YEAR TO
   FRACTION(5)` confirmed live, decode and bind - see the DATETIME(qualifier)
   section above). INTERVAL is now supported on the fetch side for both
-  classes, YEAR-MONTH and DAY-FRACTION (see the INTERVAL(qualifier)
-  section above); INTERVAL bind encoding remains open for both.
+  classes, YEAR-MONTH and DAY-FRACTION, and at the sqli bind-encoder layer
+  for both classes and both signs too (see the INTERVAL(qualifier) and
+  INTERVAL SQ_BIND encoding sections above) - what remains open is wiring
+  INTERVAL binds to the ODBC `SQLBindParameter` surface, which needs
+  `ColumnSize`/`DecimalDigits` plumbed through in a way none of the other
+  bind types so far have required.
 - DECIMAL/DATETIME qualifiers outside what's been directly tested (precision
   other than 10, qualifiers other than YEAR TO SECOND/YEAR TO FRACTION(5))
   are handled by a general formula derived from - and consistent with - the

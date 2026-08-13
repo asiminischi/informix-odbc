@@ -566,3 +566,144 @@ TEST_CASE("INTERVAL DAY TO FRACTION") {
     auto wrongClass = decodeIntervalDayFraction(fromHex("c6 03 07 00"), (6u << 8) | 0x02);
     CHECK(!wrongClass.has_value());
 }
+
+TEST_CASE("INTERVAL YEAR TO MONTH bind encoding") {
+    // encodeIntervalYearMonth never strips leading zero digit-pairs (see
+    // sqli/types.h's doc comment) - it's only byte-identical to a fetch
+    // capture when that capture itself happened not to need stripping.
+    // INTERVAL YEAR(2) TO MONTH holding 47-07 is exactly that case: the
+    // leading field already fills its 2-digit width, so this must produce
+    // the same exponent+mantissa as the live decode capture above (`c6 2f
+    // 07`), just with the 2-byte SQ_BIND length prefix prepended.
+    {
+        constexpr std::uint32_t kEncLen = (4u << 8) | 0x02;
+        auto encoded = encodeIntervalYearMonth(571, kEncLen); // 47*12 + 7
+        REQUIRE(encoded.has_value());
+        CHECK(*encoded == fromHex("0003 c6 2f 07"));
+    }
+    // INTERVAL YEAR(4) TO MONTH holding 3-07 (months=43): the matching
+    // decode capture above is `c6 03 07 00` (exponent 0xC6, server-side
+    // stripped), but the bind direction sends the full, un-stripped
+    // 4-digit leading field instead - exponent 0xC7 (unnormalizedExp
+    // directly, one higher than the stripped capture) and mantissa
+    // [00,03,07], not [03,07,00]. Confirmed live that the server accepts
+    // this un-stripped form and stores the correct value
+    // (tests/integration/test_bind.cpp) - not just self-consistent here.
+    {
+        constexpr std::uint32_t kEncLen = (6u << 8) | 0x02;
+        auto encoded = encodeIntervalYearMonth(43, kEncLen);
+        REQUIRE(encoded.has_value());
+        CHECK(*encoded == fromHex("0004 c7 00 03 07"));
+
+        auto decoded =
+            decodeIntervalYearMonth(std::span<const std::byte>(encoded->data() + 2, encoded->size() - 2), kEncLen);
+        REQUIRE(decoded.has_value());
+        REQUIRE(decoded->has_value());
+        CHECK(**decoded == 43);
+    }
+    // Negative, same qualifier: hundred's-complement mantissa, exponent's
+    // low 7 bits flipped - self round-trips through decodeIntervalYearMonth
+    // (the sign-bit/complement mechanism is already confirmed live via
+    // DECIMAL's own negative bind tests, so this only needs to confirm
+    // encodeIntervalYearMonth wires it correctly for INTERVAL specifically).
+    {
+        constexpr std::uint32_t kEncLen = (6u << 8) | 0x02;
+        auto encoded = encodeIntervalYearMonth(-43, kEncLen);
+        REQUIRE(encoded.has_value());
+        auto decoded =
+            decodeIntervalYearMonth(std::span<const std::byte>(encoded->data() + 2, encoded->size() - 2), kEncLen);
+        REQUIRE(decoded.has_value());
+        REQUIRE(decoded->has_value());
+        CHECK(**decoded == -43);
+    }
+    // MONTH(3) TO MONTH holding 43: single field, no years/12 split (the
+    // start==2 branch) - odd leadingWidth exercises the front-pad-not-
+    // back-pad convention on the encode side too. Self round-trips: since
+    // encodeIntervalYearMonth's exponent is always exactly unnormalizedExp,
+    // decodeIntervalYearMonth's shift computes to 0 for anything this
+    // function produces, so the un-stripped mantissa decodes back directly.
+    {
+        constexpr std::uint32_t kEncLen = (3u << 8) | 0x22;
+        auto encoded = encodeIntervalYearMonth(43, kEncLen);
+        REQUIRE(encoded.has_value());
+        auto decoded =
+            decodeIntervalYearMonth(std::span<const std::byte>(encoded->data() + 2, encoded->size() - 2), kEncLen);
+        REQUIRE(decoded.has_value());
+        REQUIRE(decoded->has_value());
+        CHECK(**decoded == 43);
+    }
+}
+
+TEST_CASE("INTERVAL DAY TO FRACTION bind encoding") {
+    // INTERVAL DAY(2) TO FRACTION(5) holding 12 03:04:05.67890: the
+    // leading DAY(2) field already fills its width, so - like the
+    // YEAR-MONTH no-stripping case above - this must be byte-identical to
+    // the live decode capture (`c4 0c 03 04 05 43 59 00`), length prefix
+    // aside.
+    {
+        constexpr std::uint32_t kEncLen = (13u << 8) | 0x4F;
+        IntervalDayFractionValue value{false, 12, 3, 4, 5, 67890, 5};
+        auto encoded = encodeIntervalDayFraction(value, kEncLen);
+        REQUIRE(encoded.has_value());
+        CHECK(*encoded == fromHex("0008 c4 0c 03 04 05 43 59 00"));
+    }
+    // INTERVAL DAY(4) TO FRACTION(3) holding 5 03:04:05.678: matches the
+    // decode capture's qualifier and field values, but that capture (`c4
+    // 05 03 04 05 43 50 00`) is the server's stripped form (leading DAY=5
+    // needed one pair stripped). The bind direction sends the full
+    // un-stripped 4-digit leading field - exponent 0xC5 (one higher than
+    // the stripped capture's 0xC4) and mantissa [00,05,...] not
+    // [05,...,00]. Confirmed live the server accepts this and stores the
+    // correct value (tests/integration/test_bind.cpp).
+    {
+        constexpr std::uint32_t kEncLen = (13u << 8) | 0x4D;
+        IntervalDayFractionValue value{false, 5, 3, 4, 5, 678, 3};
+        auto encoded = encodeIntervalDayFraction(value, kEncLen);
+        REQUIRE(encoded.has_value());
+        CHECK(*encoded == fromHex("0008 c5 00 05 03 04 05 43 50"));
+
+        auto decoded =
+            decodeIntervalDayFraction(std::span<const std::byte>(encoded->data() + 2, encoded->size() - 2), kEncLen);
+        REQUIRE(decoded.has_value());
+        REQUIRE(decoded->has_value());
+        CHECK(!(*decoded)->negative);
+        CHECK((*decoded)->day == 5);
+        CHECK((*decoded)->hour == 3);
+        CHECK((*decoded)->minute == 4);
+        CHECK((*decoded)->second == 5);
+        CHECK((*decoded)->fraction == 678);
+        CHECK((*decoded)->fractionDigits == 3);
+    }
+    // Negative, same qualifier and magnitude: self round-trips through
+    // decodeIntervalDayFraction the same way the YEAR-MONTH negative case
+    // above does.
+    {
+        constexpr std::uint32_t kEncLen = (13u << 8) | 0x4D;
+        IntervalDayFractionValue value{true, 12, 3, 4, 5, 678, 3};
+        auto encoded = encodeIntervalDayFraction(value, kEncLen);
+        REQUIRE(encoded.has_value());
+        auto decoded =
+            decodeIntervalDayFraction(std::span<const std::byte>(encoded->data() + 2, encoded->size() - 2), kEncLen);
+        REQUIRE(decoded.has_value());
+        REQUIRE(decoded->has_value());
+        CHECK((*decoded)->negative);
+        CHECK((*decoded)->day == 12);
+        CHECK((*decoded)->hour == 3);
+        CHECK((*decoded)->minute == 4);
+        CHECK((*decoded)->second == 5);
+        CHECK((*decoded)->fraction == 678);
+        CHECK((*decoded)->fractionDigits == 3);
+    }
+    // HOUR(3) TO SECOND holding 123:04:05, no FRACTION: HOUR (not DAY) is
+    // the leading field, matching the decode capture's no-stripping case
+    // exactly (`c4 01 17 04 05`) - HOUR's own value must come from
+    // `value.hour`, not `value.day`, confirming the start-code dispatch on
+    // the encode side too.
+    {
+        constexpr std::uint32_t kEncLen = (7u << 8) | 0x6A;
+        IntervalDayFractionValue value{false, 0, 123, 4, 5, 0, 0};
+        auto encoded = encodeIntervalDayFraction(value, kEncLen);
+        REQUIRE(encoded.has_value());
+        CHECK(*encoded == fromHex("0005 c4 01 17 04 05"));
+    }
+}

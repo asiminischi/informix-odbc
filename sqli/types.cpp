@@ -694,4 +694,137 @@ std::expected<std::optional<IntervalDayFractionValue>, Error> decodeIntervalDayF
     return result;
 }
 
+namespace {
+
+// Appends `value` as `width` zero-padded decimal digits to `mantissa`, one
+// pair per slot. When `width` is odd, one extra zero digit is prepended to
+// reach an even pair count - the front-padding convention
+// decodeIntervalDigits's trimLeadingField undoes on the fetch side (see its
+// doc comment), reproduced here directly rather than inverted, since the
+// bind direction never goes through un-normalization at all.
+void pushLeadingField(std::vector<int>& mantissa, std::int64_t value, unsigned width) {
+    char buf[16];
+    std::snprintf(buf, sizeof(buf), "%0*lld", static_cast<int>(width), static_cast<long long>(value));
+    std::string padded;
+    if (width % 2 != 0) padded += '0';
+    padded.append(buf, width);
+    for (std::size_t i = 0; i + 1 < padded.size(); i += 2) {
+        mantissa.push_back((padded[i] - '0') * 10 + (padded[i + 1] - '0'));
+    }
+}
+
+// Appends a FRACTION value's digits, back-padding with a trailing zero when
+// `fractionDigits` is odd - matching decodeDatetime's own FRACTION
+// convention (encodeDatetime does the identical thing for DATETIME's
+// FRACTION suffix).
+void pushFractionField(std::vector<int>& mantissa, int fractionValue, unsigned fractionDigits) {
+    char buf[8];
+    std::snprintf(buf, sizeof(buf), "%0*d", static_cast<int>(fractionDigits), fractionValue);
+    for (unsigned p = 0; p < fractionDigits; p += 2) {
+        int d1 = buf[p] - '0';
+        int d2 = (p + 1 < fractionDigits) ? (buf[p + 1] - '0') : 0;
+        mantissa.push_back(d1 * 10 + d2);
+    }
+}
+
+// Shared SQ_BIND framing for both interval classes: u16 length prefix, then
+// the exponent byte (positive sign bit vs. hundred's-complement negative,
+// same convention encodeDecimal/decodePackedDigits use), then the mantissa
+// bytes as-is - no stripping, unlike the fetch direction (see
+// encodeIntervalYearMonth's doc comment in sqli/types.h for why).
+std::vector<std::byte> packIntervalMantissa(std::vector<int> mantissa, int sign, int unnormalizedExp) {
+    std::uint8_t exponentByte;
+    if (sign < 0) {
+        hundredsComplementInPlace(mantissa);
+        auto positiveLow7 = static_cast<std::uint8_t>((64 + unnormalizedExp) & 0x7F);
+        exponentByte = static_cast<std::uint8_t>(0x7F - positiveLow7);
+    } else {
+        exponentByte = static_cast<std::uint8_t>(0x80 | ((64 + unnormalizedExp) & 0x7F));
+    }
+
+    std::vector<std::byte> data;
+    auto decNdgts = static_cast<std::uint16_t>(mantissa.size());
+    auto lengthField = writeBigEndian<std::uint16_t>(static_cast<std::uint16_t>(decNdgts + 1));
+    data.insert(data.end(), lengthField.begin(), lengthField.end());
+    data.push_back(std::byte{exponentByte});
+    for (int d : mantissa) data.push_back(static_cast<std::byte>(static_cast<unsigned char>(d)));
+    return data;
+}
+
+} // namespace
+
+std::expected<std::vector<std::byte>, Error> encodeIntervalYearMonth(std::int64_t months,
+                                                                         std::uint32_t encodedLength) {
+    unsigned totalDigits = (encodedLength >> 8) & 0xFF;
+    unsigned qualifierByte = encodedLength & 0xFF;
+    unsigned start = (qualifierByte >> 4) & 0xF;
+    unsigned end = qualifierByte & 0xF;
+    if (start > end || end > 2) {
+        return std::unexpected(Error{ErrorKind::Protocol, "INTERVAL: not a YEAR-MONTH class qualifier"});
+    }
+    unsigned leadingWidth = totalDigits - (end - start);
+    if (leadingWidth < 1 || leadingWidth > 9) {
+        return std::unexpected(Error{ErrorKind::Protocol, "INTERVAL: malformed qualifier byte"});
+    }
+    bool hasMonthField = (end == 2 && start != 2);
+
+    int sign = months < 0 ? -1 : 1;
+    std::int64_t magnitude = months < 0 ? -months : months;
+
+    std::vector<int> mantissa;
+    if (start == 2) {
+        // MONTH TO MONTH: a single field that's already a total-months
+        // value, no years/12 split (matches decodeIntervalYearMonth's
+        // start==2 branch).
+        pushLeadingField(mantissa, magnitude, leadingWidth);
+    } else {
+        pushLeadingField(mantissa, magnitude / 12, leadingWidth);
+        if (hasMonthField) mantissa.push_back(static_cast<int>(magnitude % 12));
+    }
+
+    int unnormalizedExp = (static_cast<int>(totalDigits) + 10 - static_cast<int>(end) + 1) / 2;
+    return packIntervalMantissa(std::move(mantissa), sign, unnormalizedExp);
+}
+
+std::expected<std::vector<std::byte>, Error> encodeIntervalDayFraction(const IntervalDayFractionValue& value,
+                                                                           std::uint32_t encodedLength) {
+    unsigned totalDigits = (encodedLength >> 8) & 0xFF;
+    unsigned qualifierByte = encodedLength & 0xFF;
+    unsigned start = (qualifierByte >> 4) & 0xF;
+    unsigned end = qualifierByte & 0xF;
+    if (start < 4 || start > 10 || start % 2 != 0 || end < start || end > 15) {
+        return std::unexpected(Error{ErrorKind::Protocol, "INTERVAL: not a DAY-FRACTION class qualifier"});
+    }
+    unsigned wholeEnd = std::min(end, 10u);
+    unsigned fractionDigits = end > 10 ? end - 10 : 0;
+    unsigned leadingWidth = totalDigits - (wholeEnd - start) - fractionDigits;
+    if (leadingWidth < 1 || leadingWidth > 9) {
+        return std::unexpected(Error{ErrorKind::Protocol, "INTERVAL: malformed qualifier byte"});
+    }
+
+    std::int64_t leadingValue = 0;
+    switch (start) {
+        case 4: leadingValue = value.day; break;
+        case 6: leadingValue = value.hour; break;
+        case 8: leadingValue = value.minute; break;
+        case 10: leadingValue = value.second; break;
+    }
+
+    std::vector<int> mantissa;
+    pushLeadingField(mantissa, leadingValue, leadingWidth);
+    for (unsigned tu = start + 2; tu <= wholeEnd; tu += 2) {
+        std::int64_t fieldValue = 0;
+        switch (tu) {
+            case 6: fieldValue = value.hour; break;
+            case 8: fieldValue = value.minute; break;
+            case 10: fieldValue = value.second; break;
+        }
+        mantissa.push_back(static_cast<int>(fieldValue));
+    }
+    if (fractionDigits > 0) pushFractionField(mantissa, value.fraction, fractionDigits);
+
+    int unnormalizedExp = (static_cast<int>(totalDigits) + 10 - static_cast<int>(end) + 1) / 2;
+    return packIntervalMantissa(std::move(mantissa), value.negative ? -1 : 1, unnormalizedExp);
+}
+
 } // namespace ifxsqli

@@ -263,8 +263,7 @@ Roughly in the order they'd bite a real application:
    decodeIntervalYearMonth`/`decodeIntervalDayFraction`), confirmed live
    across ten total wire captures covering every qualifier shape, both
    signs, and both leading-field-anchor cases (DAY vs HOUR) -
-   `tests/sqli/test_types.cpp`. Bind encoding and catalog rows remain
-   unimplemented - see item 7 below. INTERVAL turned out to share
+   `tests/sqli/test_types.cpp`. INTERVAL turned out to share
    DECIMAL's exact packed-digit byte format but *not* DATETIME's
    fixed-point exponent convention - it reuses DECIMAL's floating
    representation outright (leading zero digit-pairs stripped, exponent
@@ -287,6 +286,30 @@ Roughly in the order they'd bite a real application:
    assumed from a prior, superficially-similar case. See
    `docs/protocol-notes.md`'s INTERVAL(qualifier) section for the full
    byte-level writeup.
+
+   INTERVAL bind encoding is now done at the sqli layer for both classes
+   (`sqli::encodeIntervalYearMonth`/`encodeIntervalDayFraction`), and it's
+   genuinely *not* the fetch side's mathematical inverse: SQ_BIND sends the
+   full, un-stripped fixed-width mantissa (no floating-point stripping),
+   traced via the decompiled JDBC reference's `Decimal(sign, byte[], int,
+   short)` constructor. Confirmed live for both classes and both signs
+   (`tests/integration/test_bind.cpp`) using values that specifically need
+   fetch-side stripping, to prove the server accepts the client's
+   un-stripped bind form rather than just self-round-tripping through this
+   driver's own decoder - this project's INTERVAL work has hit three bugs
+   already caught only by testing the specific shape, so the sign +
+   un-stripped-exponent combination got its own live check too rather than
+   being assumed safe from DECIMAL's separately-confirmed negative-bind
+   mechanism. **Not yet wired to the ODBC `SQLBindParameter` surface**:
+   unlike every other bind type so far, INTERVAL's leading field width is a
+   genuine per-column, user-declared value that can't be recovered from the
+   bind value's magnitude alone, so it needs `SQLBindParameter`'s
+   `ColumnSize`/`DecimalDigits` - fields the ODBC layer currently receives
+   and discards outright, and that `driver/bind_encode.cpp`'s
+   `encodeBindParam` has no parameter to receive at all. See
+   `docs/protocol-notes.md`'s INTERVAL SQ_BIND encoding section for detail.
+   Catalog rows (`SQLColumns`/`SQLGetTypeInfo`) remain unimplemented for
+   both classes - see item 7 below.
 4. **No DSN-based connect (`SQLConnect`).** Only `SQLDriverConnect` with an
    explicit keyword string works today. Fine for `isql -k`, but many
    GUI/ODBC-Admin tools default to the DSN path.
@@ -300,10 +323,13 @@ Roughly in the order they'd bite a real application:
    Linux/WSL2 + unixODBC + `isql`.
 6. **No Unicode.** ANSI (`SQL_C_CHAR`) only; no `SQLWCHAR`/`W`-suffixed
    functions.
-7. **Missing scalar types**: INTERVAL bind encoding and catalog rows (both
-   classes' fetch side is done, see item 3 above), and LOBs (BLOB/CLOB/
-   BYTE/TEXT). BOOLEAN, FLOAT/SMALLFLOAT, and DATETIME (including
-   sub-second FRACTION) are fully done, including catalog rows.
+7. **Missing scalar types**: INTERVAL catalog rows (both classes' fetch and
+   sqli-layer bind are done, see item 3 above; ODBC `SQLBindParameter`
+   wiring for INTERVAL bind is still open too, needing `ColumnSize`/
+   `DecimalDigits` plumbed through in a way no other bind type has
+   required), and LOBs (BLOB/CLOB/BYTE/TEXT). BOOLEAN, FLOAT/SMALLFLOAT,
+   and DATETIME (including sub-second FRACTION) are fully done, including
+   catalog rows.
 8. **No real generated-key retrieval.** The `SQ_INSERTDONE` wire field is
    decoded, but the driver never sends the extra "SGK" request the server
    needs to actually populate it, so every INSERT currently reports a
@@ -357,12 +383,14 @@ write every column type a real database has, and has to actually be
 callable from BOP's own code; catalog-completeness and driver-manager
 polish don't block that.
 
-1. **Remaining scalar types beyond the MVP-8 set - INTERVAL bind/catalog
-   (both classes' fetch side is done), then LOBs (both bind and fetch
-   sides). BOOLEAN, FLOAT/SMALLFLOAT, and DATETIME (including sub-second
-   FRACTION) are fully done end to end (bind, fetch, and catalog rows,
-   sqli-layer plus ODBC-layer). All of this confirmed live - DATETIME/
-   FRACTION and INTERVAL (both classes) through the sqli layer and
+1. **Remaining scalar types beyond the MVP-8 set - INTERVAL catalog rows
+   (both classes' fetch and sqli-layer bind are done), INTERVAL's own
+   `SQLBindParameter` wiring (needs `ColumnSize`/`DecimalDigits` plumbed
+   through - see item 7), then LOBs (both bind and fetch sides). BOOLEAN,
+   FLOAT/SMALLFLOAT, and DATETIME (including sub-second FRACTION) are fully
+   done end to end (bind, fetch, and catalog rows, sqli-layer plus
+   ODBC-layer). All of this confirmed live - DATETIME/FRACTION and
+   INTERVAL (both classes, both signs) through the sqli layer and
    driver-layer conversions directly (`driver/convert.cpp`/
    `convert_native.cpp`/`bind_encode.cpp`), not yet through the real
    Driver Manager, which currently needs the Linux/WSL2 path (see

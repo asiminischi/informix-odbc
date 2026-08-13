@@ -164,6 +164,154 @@ void check(const char* label, bool condition) {
     return true;
 }
 
+// Live round trip for INTERVAL YEAR-MONTH bind encoding (col_interval_ym is
+// YEAR(4) TO MONTH): encode -> SQ_BIND -> server storage -> plain SELECT ->
+// decode, on its own connection/row. Deliberately uses a magnitude that
+// needs un-normalization stripping on the *fetch* side (43 months, i.e. 3
+// years 7 months - the leading YEAR(4) field's high digit-pair is zero), to
+// confirm the server accepts encodeIntervalYearMonth's un-stripped bind
+// encoding (exponent 0xC7, mantissa [00,03,07]) even though a live fetch of
+// the same value normally comes back stripped (exponent 0xC6, mantissa
+// [03,07,00] - see the "INTERVAL YEAR TO MONTH bind encoding" unit test).
+// This is the one thing the unit tests, which only self-round-trip through
+// this driver's own decoder, can't confirm: that the server itself treats
+// the un-stripped form as the same value, not just this driver's inverse
+// function. Called for both +43 and -43 - the negative case combines two
+// behaviors only separately confirmed live elsewhere (the un-stripped
+// exponent above, and DECIMAL's hundred's-complement mechanism, but with
+// DECIMAL's own canonical exponent, not this un-stripped one) - this
+// project's INTERVAL work has hit three bugs so far each only caught by
+// testing the specific shape, not reasoning from a similar one, so the
+// combination gets its own live check rather than trusting self-round-trip.
+[[nodiscard]] bool checkIntervalYearMonthRoundTrip(const std::string& host, int port, const ConnectParams& params,
+                                                    std::int64_t months) {
+    auto conn = SqliConnection::connect(host, port, params);
+    if (!conn) {
+        std::fprintf(stderr, "connect failed: %s\n", conn.error().message.c_str());
+        return false;
+    }
+    constexpr std::uint32_t kYearToMonth4 = (6u << 8) | 0x02; // YEAR(4) TO MONTH
+    auto encoded = encodeIntervalYearMonth(months, kYearToMonth4);
+    if (!encoded) {
+        std::fprintf(stderr, "encodeIntervalYearMonth failed: %s\n", encoded.error().message.c_str());
+        return false;
+    }
+    auto insertStmt = SqliStatement::prepare(*conn, "insert into bind_probe (col_interval_ym) values (?)");
+    if (!insertStmt) {
+        std::fprintf(stderr, "prepare insert failed: %s\n", insertStmt.error().message.c_str());
+        return false;
+    }
+    std::vector<BindParam> params2{
+        BindParam{ifxtype::kInterval, false, *encoded, static_cast<std::uint16_t>(kYearToMonth4)}};
+    if (auto r = insertStmt->execute(params2); !r) {
+        std::fprintf(stderr, "execute insert failed: %s\n", r.error().message.c_str());
+        return false;
+    }
+    if (auto r = insertStmt->close(); !r) return false;
+    if (auto r = insertStmt->release(); !r) return false;
+
+    auto selectStmt =
+        SqliStatement::prepare(*conn, "select col_interval_ym from bind_probe where col_interval_ym is not null");
+    if (!selectStmt) {
+        std::fprintf(stderr, "prepare select failed: %s\n", selectStmt.error().message.c_str());
+        return false;
+    }
+    if (auto r = selectStmt->execute(); !r) {
+        std::fprintf(stderr, "execute select failed: %s\n", r.error().message.c_str());
+        return false;
+    }
+    auto row = selectStmt->fetchRow();
+    if (!row || !*row) {
+        std::fprintf(stderr, "fetchRow failed or no row\n");
+        return false;
+    }
+    auto decoded = decodeIntervalYearMonth((**row)[0], kYearToMonth4);
+    if (auto r = selectStmt->close(); !r) return false;
+    if (auto r = selectStmt->release(); !r) return false;
+    if (auto r = conn->executeCommand("delete from bind_probe where col_interval_ym is not null"); !r) return false;
+    if (auto r = conn->disconnectOrderly(); !r) return false;
+    if (!decoded) {
+        std::fprintf(stderr, "decode failed: %s\n", decoded.error().message.c_str());
+        return false;
+    }
+    check((std::string("bound INTERVAL YEAR TO MONTH round-trips (un-stripped bind form accepted, ") +
+           std::to_string(months) + " months)")
+              .c_str(),
+          decoded->has_value() && **decoded == months);
+    return true;
+}
+
+// Live round trip for INTERVAL DAY-FRACTION bind encoding (col_interval_df
+// is DAY(4) TO FRACTION(3)) - same un-stripped-bind-form question as
+// checkIntervalYearMonthRoundTrip above: day=5 needs stripping on the fetch
+// side (see the "INTERVAL DAY TO FRACTION bind encoding" unit test's
+// hand-derived byte comparison), so this is the case that actually tests
+// whether the server accepts encodeIntervalDayFraction's un-stripped form.
+// Called for both a positive and a negative `value` - see
+// checkIntervalYearMonthRoundTrip's doc comment for why the negative case
+// (unstripped exponent + hundred's-complement combined) needs its own live
+// check rather than trusting unit-test self-round-trip.
+[[nodiscard]] bool checkIntervalDayFractionRoundTrip(const std::string& host, int port, const ConnectParams& params,
+                                                      const IntervalDayFractionValue& value) {
+    auto conn = SqliConnection::connect(host, port, params);
+    if (!conn) {
+        std::fprintf(stderr, "connect failed: %s\n", conn.error().message.c_str());
+        return false;
+    }
+    constexpr std::uint32_t kDayToFraction3 = (13u << 8) | 0x4D; // DAY(4) TO FRACTION(3)
+    auto encoded = encodeIntervalDayFraction(value, kDayToFraction3);
+    if (!encoded) {
+        std::fprintf(stderr, "encodeIntervalDayFraction failed: %s\n", encoded.error().message.c_str());
+        return false;
+    }
+    auto insertStmt = SqliStatement::prepare(*conn, "insert into bind_probe (col_interval_df) values (?)");
+    if (!insertStmt) {
+        std::fprintf(stderr, "prepare insert failed: %s\n", insertStmt.error().message.c_str());
+        return false;
+    }
+    std::vector<BindParam> params2{
+        BindParam{ifxtype::kInterval, false, *encoded, static_cast<std::uint16_t>(kDayToFraction3)}};
+    if (auto r = insertStmt->execute(params2); !r) {
+        std::fprintf(stderr, "execute insert failed: %s\n", r.error().message.c_str());
+        return false;
+    }
+    if (auto r = insertStmt->close(); !r) return false;
+    if (auto r = insertStmt->release(); !r) return false;
+
+    auto selectStmt =
+        SqliStatement::prepare(*conn, "select col_interval_df from bind_probe where col_interval_df is not null");
+    if (!selectStmt) {
+        std::fprintf(stderr, "prepare select failed: %s\n", selectStmt.error().message.c_str());
+        return false;
+    }
+    if (auto r = selectStmt->execute(); !r) {
+        std::fprintf(stderr, "execute select failed: %s\n", r.error().message.c_str());
+        return false;
+    }
+    auto row = selectStmt->fetchRow();
+    if (!row || !*row) {
+        std::fprintf(stderr, "fetchRow failed or no row\n");
+        return false;
+    }
+    auto decoded = decodeIntervalDayFraction((**row)[0], kDayToFraction3);
+    if (auto r = selectStmt->close(); !r) return false;
+    if (auto r = selectStmt->release(); !r) return false;
+    if (auto r = conn->executeCommand("delete from bind_probe where col_interval_df is not null"); !r) return false;
+    if (auto r = conn->disconnectOrderly(); !r) return false;
+    if (!decoded) {
+        std::fprintf(stderr, "decode failed: %s\n", decoded.error().message.c_str());
+        return false;
+    }
+    check((std::string("bound INTERVAL DAY TO FRACTION round-trips (un-stripped bind form accepted, ") +
+           (value.negative ? "negative" : "positive") + ")")
+              .c_str(),
+          decoded->has_value() && (*decoded)->negative == value.negative && (*decoded)->day == value.day &&
+              (*decoded)->hour == value.hour && (*decoded)->minute == value.minute &&
+              (*decoded)->second == value.second && (*decoded)->fraction == value.fraction &&
+              (*decoded)->fractionDigits == value.fractionDigits);
+    return true;
+}
+
 // Confirms SQ_BIND's NULL path: binds a NULL indicator (-1) into every
 // non-char column with the column's real ifxType attached (mirroring the
 // fix in driver/statement.cpp's buildBindParams, which used to leave
@@ -264,7 +412,8 @@ void check(const char* label, bool condition) {
             "create table bind_probe (col_smallint smallint, col_integer integer, col_bigint bigint,"
             " col_char char(20), col_varchar varchar(32), col_date date, col_decimal decimal(10,2),"
             " col_datetime datetime year to second, col_float float, col_smallfloat smallfloat,"
-            " col_boolean boolean, col_datetime_frac datetime year to fraction(5))");
+            " col_boolean boolean, col_datetime_frac datetime year to fraction(5),"
+            " col_interval_ym interval year(4) to month, col_interval_df interval day(4) to fraction(3))");
         !r) {
         std::fprintf(stderr, "create table failed: %s\n", r.error().message.c_str());
         return false;
@@ -280,8 +429,15 @@ void check(const char* label, bool condition) {
         return false;
     }
 
-    auto insertStmt =
-        SqliStatement::prepare(*conn, "insert into bind_probe values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    // Named explicitly, not the unqualified "values (...)" form, so this
+    // insert stays a fixed 12-column shape even though bind_probe has since
+    // grown col_interval_ym/col_interval_df (left NULL here - see
+    // checkIntervalYearMonthRoundTrip/checkIntervalDayFractionRoundTrip for
+    // those).
+    auto insertStmt = SqliStatement::prepare(
+        *conn, "insert into bind_probe (col_smallint, col_integer, col_bigint, col_char, col_varchar, col_date,"
+               " col_decimal, col_datetime, col_float, col_smallfloat, col_boolean, col_datetime_frac)"
+               " values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
     if (!insertStmt) {
         std::fprintf(stderr, "prepare insert failed: %s\n", insertStmt.error().message.c_str());
         return false;
@@ -437,6 +593,22 @@ int main() {
         return 1;
     }
     if (!checkDatetimeFractionRoundTrip(host, port, params)) {
+        std::printf("\nbind integration test FAILED to complete (see error above)\n");
+        return 1;
+    }
+    if (!checkIntervalYearMonthRoundTrip(host, port, params, 43)) {
+        std::printf("\nbind integration test FAILED to complete (see error above)\n");
+        return 1;
+    }
+    if (!checkIntervalYearMonthRoundTrip(host, port, params, -43)) {
+        std::printf("\nbind integration test FAILED to complete (see error above)\n");
+        return 1;
+    }
+    if (!checkIntervalDayFractionRoundTrip(host, port, params, IntervalDayFractionValue{false, 5, 3, 4, 5, 678, 3})) {
+        std::printf("\nbind integration test FAILED to complete (see error above)\n");
+        return 1;
+    }
+    if (!checkIntervalDayFractionRoundTrip(host, port, params, IntervalDayFractionValue{true, 5, 3, 4, 5, 678, 3})) {
         std::printf("\nbind integration test FAILED to complete (see error above)\n");
         return 1;
     }
