@@ -490,11 +490,15 @@ Roughly in the order they'd bite a real application:
    driver, and `ifx_lo_create`'s full 3-param bind shape, 2-value return
    shape, and `LO_WRITE`'s request/reply shape are all confirmed live too
    (see `docs/protocol-notes.md`). What's still genuinely open: the
-   600-byte `ifx_lo_spec` creation-spec parameter's field layout isn't
-   understood, and the captured live sample has this dev container's
-   sbspace name baked in, so it isn't safely reusable verbatim across
-   environments. Implementation is gated on resolving whether a portable
-   spec exists, not on any remaining wire-format unknown.
+   600-byte `ifx_lo_spec` creation-spec parameter isn't a hardcodable
+   constant (its content varied across capture attempts), and a previously-
+   missed fastpath call, `informix.ifx_lo_col_sbinfo(lvarchar,ifx_lo_spec)`,
+   was found preceding `ifx_lo_create` and is hypothesized (not yet
+   confirmed) to be the server-side spec resolver, given a column name.
+   Implementation is gated on confirming that hypothesis within a single,
+   handle-tracked capture (cross-run byte diffing turned out to be
+   unreliable due to nondeterministic TCP chunking), not on any remaining
+   `ifx_lo_create` wire-format unknown, which is fully decoded.
 8. **No real generated-key retrieval.** The `SQ_INSERTDONE` wire field is
    decoded, but the driver never sends the extra "SGK" request the server
    needs to actually populate it, so every INSERT currently reports a
@@ -581,8 +585,9 @@ polish don't block that.
    source alone both hung live first). Still remaining: smart LOB
    bind/write and its own ODBC `SQLBindParameter` surface - the wire type
    `40` return that previously blocked this is now decoded, gated instead
-   on whether `ifx_lo_create`'s 600-byte creation-spec parameter has a
-   portable (non-environment-specific) form (see `docs/protocol-notes.md`).**
+   on confirming a likely `informix.ifx_lo_col_sbinfo` spec-resolver call
+   this session found but didn't fully verify (see
+   `docs/protocol-notes.md`).**
    Blocking: a real Informix database backup/restore tool can't skip
    columns of a type it doesn't support.
 2. **Decide and prototype the BOP integration mechanism** (CGO, subprocess

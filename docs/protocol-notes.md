@@ -1399,19 +1399,47 @@ bytes could be inspected directly rather than trusting the driver's own
     shape already predicted (without live confirmation) in the previous
     revision of this note, now confirmed live.
 
-**Open question blocking a clean implementation**: whether a portable
-(non-environment-specific) `ifx_lo_spec` exists. Two ways to resolve it,
-neither attempted yet:
-1. Cheap: capture a third golden trace against a table with no `PUT ... IN`
-   clause (system-default sbspace) and check whether the spec's sbspace
-   field comes back empty/sentinel rather than a real name.
-2. Definitive: a C++ probe that first replays the captured 600 bytes
-   verbatim (guaranteed valid, since it's exactly what the real JDBC driver
-   sent) to prove out the create/write/close sequence end-to-end from this
-   driver's own code, then bisects individual fields toward zero/sentinel
-   values to find the minimal spec that's still accepted.
-Shipping the captured 600 bytes verbatim (hardcoding `sbspace1`) would only
-work against this exact dev container and was deliberately not done.
+**Open question, revised, tentative and not yet confirmed**: the 600-byte
+`ifx_lo_spec` is not a portable hardcodable constant - across several
+capture attempts its content varied (an all-zero/sentinel template in one
+place, `sbspace1` embedded in another, `sysmaster` in another), and a
+**third fastpath call was found that a previous revision of this note
+missed entirely**: `function informix.ifx_lo_col_sbinfo(lvarchar,ifx_lo_spec)`,
+called with the target column's `"table.column"` name (as a self-describing
+`[4-byte length][ASCII bytes]` `lvarchar`, wire type `43`, a type this
+project hadn't encountered before) and an all-zero template spec, evidently
+*before* `ifx_lo_create` and evidently to resolve a column-specific spec
+server-side rather than have the client construct one from scratch. The
+likely full sequence is `col_sbinfo(column_name, template) -> resolved_spec
+-> ifx_lo_create(resolved_spec, mode, blank_locator) -> (new_locator, fd)
+-> LO_WRITE -> ifx_lo_close -> INSERT-bind new_locator`, which would mean
+portability comes from calling `col_sbinfo`, not from finding a magic
+constant. **This is a hypothesis, not a confirmed finding** - attempting to
+verify it by diffing bytes across multiple separate capture runs produced
+contradictory results (nondeterministic TCP chunking made it unsafe to
+assume the same marker-occurrence-index means the same logical call across
+runs, and the dev container was also mutated between some of those runs -
+see below), so `col_sbinfo`'s own exact input/output byte shapes remain
+unconfirmed. Whoever picks this up next should decode it within a *single*
+capture only, following each `SQ_GETROUTINE` reply's own handle into its
+matching `SQ_EXFPROUTINE`/`SQ_FPROUTINE` round trip, rather than comparing
+byte offsets across separate runs.
+
+Capture method for anyone continuing this: `jdbc-4.50.10.jar` with
+`TRACE=3`/`TRACEFILE` alone is not enough (its own text trace omits the
+byte dump for at least the type-`40` field) - route the connection through
+a small raw TCP proxy (plain `python3`, listening on a spare local port,
+forwarding to the container's `9088`, hex-dumping both directions to a
+file) and read the wire bytes directly instead of trusting the driver's
+trace formatter.
+
+Also note: this session's exploration left the dev container non-pristine
+- a second sbspace named `sbspace` (matching the server's own configured
+but previously-nonexistent `SBSPACENAME`) was created via `onspaces`, and
+a scratch table `ifxodbc_locreate_probe` was left in `sysmaster`. Low
+stakes for a disposable dev container, but future captures against it
+won't be against the server's original state, and that itself contributed
+to the cross-run confusion above.
 
 ## Transactions
 
