@@ -1439,11 +1439,12 @@ exactly one caller (`fetchSmartLob`) whose payload is pre-prefixed by
 convention, and must not be "simplified" to share `appendFastPathExtendedParam`'s
 auto-prefixing again.
 
-Also note: earlier exploration left the dev container non-pristine - a
-second sbspace named `sbspace` (matching the server's own configured but
-previously-nonexistent `SBSPACENAME`) was created via `onspaces`, and a
-scratch table `ifxodbc_locreate_probe` was left in `sysmaster`. Low stakes
-for a disposable dev container.
+Also note: earlier exploration left the dev container's `sysmaster`
+database with a second sbspace named `sbspace` (matching the server's own
+configured but previously-nonexistent `SBSPACENAME`), created via
+`onspaces` - harmless but unremoved, since dropping an sbspace isn't a
+casual operation. The scratch tables from that exploration (`ifxodbc_
+locreate_probe`, `ifxodbc_lobtest`) have been dropped.
 
 ## Transactions
 
