@@ -504,15 +504,52 @@ Roughly in the order they'd bite a real application:
    silently broke `fetchSmartLob` for every locator (not just self-created
    ones) with `sqlcode -937: blobrecv` - caught by cross-checking a
    self-written row against a real JDBC driver's read of the same row (see
-   `docs/protocol-notes.md` for the full writeup and the fix). Still
-   missing: the ODBC `SQLBindParameter` surface for smart LOBs - real
-   `SQLDescribeParam`/`SQLNumParams` support (needed to tell a smart-LOB
-   bind target apart from a simple-LOB one, since ODBC gives no other way
-   to know at bind time), wiring `SQLBindParameter`/`doExecute` to call
-   `createSmartLob` for such params, and parsing the target table name out
-   of the prepared SQL text (not something `SQLDescribeParam` provides) -
-   deliberately scoped as follow-on work. Not yet usable for real
-   backup/restore until that ODBC-layer piece lands.
+   `docs/protocol-notes.md` for the full writeup and the fix).
+   **The ODBC `SQLBindParameter` surface for smart LOBs is also now done
+   and confirmed live through the real Driver Manager** (`tools/
+   odbc_dm_probe`, WSL2/unixODBC): real `SQLNumParams`/`SQLDescribeParam`
+   support (`driver/statement.cpp`, built on `SqliStatement::paramDescs()`
+   - DESCRIBE's own per-parameter data, already parsed for SELECT output
+   columns, just not previously exposed for input parameters) resolves the
+   ambiguity ODBC itself can't: `SQLDescribeParam` reports the same
+   `SQL_LONGVARBINARY`/`SQL_LONGVARCHAR` for both a simple-LOB and a
+   smart-LOB bind target, so `buildBindParams` consults the target
+   column's real `paramDescs()` type to decide which path a `?` bind
+   actually needs, rather than guessing from `ParameterType` alone (this
+   was the user's explicit design decision for resolving the ambiguity).
+   A `?` targeting a smart LOB column is routed to `SqliConnection::
+   createSmartLob` instead of the simple-LOB placeholder path; the target
+   table name (which `paramDescs()` doesn't carry - only the column name)
+   comes from a narrow `insert into <table>` scan of the prepared SQL text
+   (`driver/insert_table_name.cpp`, independently unit-tested including
+   Informix's `db:owner.table`/`db@server:owner.table` qualified forms).
+   Confirmed live: BLOB and CLOB columns, a NULL smart-LOB bind, a rebind-
+   and-re-execute on the same prepared statement (three separate
+   `createSmartLob` calls), and - specifically because every earlier test
+   of this feature happened to fit in one `LO_WRITE` chunk - a 70000-byte
+   value that exercises `writeLoData`'s multi-chunk request framing for
+   the first time, all byte-exact on read-back. Also had to add
+   `SQL_API_SQLNUMPARAMS`/`SQL_API_SQLDESCRIBEPARAM` to `SQLGetFunctions`'
+   capability bitmap (`driver/info.cpp`) - unixODBC's Driver Manager
+   checks this before calling either function at all, so both new exports
+   were unreachable (`IM001`) until this was added, even though the
+   functions themselves were correct.
+   **Known limitation, not yet fixed - a conscious tradeoff, not an
+   oversight**: `createSmartLob` runs inside `buildBindParams`, which
+   completes *before* `doExecute` sends the `INSERT`. In autocommit (this
+   driver's default), if the `INSERT` itself then fails for an unrelated
+   reason (a constraint violation, a bad value in another column, ...),
+   the smart LOB `createSmartLob` already wrote is left allocated in its
+   sbspace with no row ever referencing it - a storage leak on the
+   `INSERT`'s error path, not a correctness bug (nothing reads or trusts
+   the orphaned LOB) but a real one for a tool whose job is bulk data
+   movement. Fixing this properly means moving the `createSmartLob` call
+   to fire from inside `doExecute`'s own transaction boundary (wrapping
+   create+insert in one transaction, committed together) rather than
+   eagerly during parameter binding - deliberately not done yet, since it
+   changes where in the bind/execute lifecycle the network round trip
+   happens and deserves its own scoped pass rather than folding into this
+   one.
 8. **No real generated-key retrieval.** The `SQ_INSERTDONE` wire field is
    decoded, but the driver never sends the extra "SGK" request the server
    needs to actually populate it, so every INSERT currently reports a
@@ -596,12 +633,22 @@ polish don't block that.
    `docs/protocol-notes.md`. The sqli-layer piece was found only after
    getting a real JDBC driver protocol trace against the same dev
    container (two plausible-looking framings guessed from the decompiled
-   source alone both hung live first). Smart LOB **create/write is now done
-   at the sqli layer too** (`SqliConnection::createSmartLob`, confirmed live
-   for BLOB and CLOB, cross-checked against a real JDBC driver's read of the
-   same row - see `docs/protocol-notes.md`). Still remaining: the ODBC
-   `SQLBindParameter` surface for smart LOBs (real `SQLDescribeParam`
-   support, the bind dispatch, and prepared-SQL table-name parsing).**
+   source alone both hung live first). Smart LOB **create/write, including
+   the ODBC `SQLBindParameter` surface, is now done end to end too** -
+   `SqliConnection::createSmartLob` plus real `SQLNumParams`/
+   `SQLDescribeParam` support and the bind dispatch (`driver/statement.cpp`)
+   that resolves the smart-LOB-vs-simple-LOB bind-target ambiguity ODBC
+   itself can't (both share `SQL_LONGVARBINARY`/`SQL_LONGVARCHAR`),
+   confirmed live through the real unixODBC Driver Manager for BLOB, CLOB,
+   NULL, and a 70000-byte value that exercises the multi-chunk `LO_WRITE`
+   framing for the first time - see `docs/protocol-notes.md`. **One
+   deliberately-deferred limitation**: a smart LOB is created before the
+   `INSERT` referencing it executes, so an `INSERT` that fails for an
+   unrelated reason after a successful `createSmartLob` orphans that LOB
+   in its sbspace (see item 7's own write-up for why this wasn't folded
+   into this pass). All 8 MVP scalar types plus both LOB families are now
+   fully done end to end (bind, fetch, catalog rows, sqli layer and ODBC
+   layer) - LOBs were the last scalar-type gap this driver had.
    Blocking: a real Informix database backup/restore tool can't skip
    columns of a type it doesn't support.
 2. **Decide and prototype the BOP integration mechanism** (CGO, subprocess

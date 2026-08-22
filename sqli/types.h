@@ -67,9 +67,12 @@ inline constexpr int kBooleanBindType = 45;
 // covered by a plain scalar type - e.g. the 72-byte smart-LOB locator
 // bind_encode.cpp's SqliConnection::fetchSmartLob passes to
 // informix.ifx_lo_open - travels as, confirmed live via a JDBC golden-
-// capture trace). Not used for ordinary SQ_BIND/SQ_RETURN_TYPE (BOOLEAN
-// uses its own kBooleanBindType instead), only the fastpath subsystem's
-// own SQ_BIND sub-block.
+// capture trace). Also confirmed live for an *ordinary* column bind: the
+// smart-LOB locator SqliConnection::createSmartLob returns binds into a
+// real INSERT/UPDATE with ifxType=kUdt directly, ExtendedOwner="informix"
+// (matching BOOLEAN's own ExtendedOwner convention for its ordinary bind,
+// even though BOOLEAN itself remaps to kBooleanBindType rather than using
+// kUdt) - unlike BOOLEAN, a smart LOB has no separate "bind type" remap.
 inline constexpr int kUdt = 44;
 // LVARCHAR's own base type code (long varchar) - confirmed live as
 // informix.ifx_lo_col_sbinfo's own first-parameter type (the target

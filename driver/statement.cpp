@@ -9,11 +9,14 @@
 #include "driver/convert_native.h"
 #include "driver/error_map.h"
 #include "driver/handles.h"
+#include "driver/insert_table_name.h"
 #include "sqli/types.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <span>
 
 using namespace ifxodbc;
 
@@ -337,9 +340,62 @@ SQLRETURN doPrepare(OdbcStatement* s, const std::string& sql) {
         return SQL_ERROR;
     }
     s->stmt.emplace(std::move(*result));
+    s->preparedSql = sql;
     s->state = StmtState::kPrepared;
     s->currentRow.reset();
     return SQL_SUCCESS;
+}
+
+// Extracts a smart-LOB bind's raw content bytes from an application's
+// SQLBindParameter binding - the value-reading half of what
+// encodeBindParam's SQL_LONGVARBINARY/SQL_LONGVARCHAR branches do for a
+// simple LOB, kept separate here because a smart-LOB bind doesn't produce
+// a BindParam directly - it needs a live SqliConnection::createSmartLob
+// round trip first (see buildBindParams). Accepts the same ValueType
+// pairings encodeBindParam does for those two ParameterTypes: SQL_C_BINARY
+// (or SQL_C_DEFAULT) for SQL_LONGVARBINARY, SQL_C_CHAR (or SQL_C_DEFAULT)
+// for SQL_LONGVARCHAR.
+std::optional<std::vector<std::byte>> smartLobBindContent(const ParamBinding& binding, SQLLEN strLenOrInd) {
+    if (binding.parameterType == SQL_LONGVARBINARY &&
+        (binding.valueType == SQL_C_BINARY || binding.valueType == SQL_C_DEFAULT)) {
+        if (strLenOrInd < 0) return std::nullopt;
+        const auto* bytes = static_cast<const std::byte*>(binding.parameterValuePtr);
+        return std::vector<std::byte>(bytes, bytes + strLenOrInd);
+    }
+    if (binding.parameterType == SQL_LONGVARCHAR &&
+        (binding.valueType == SQL_C_CHAR || binding.valueType == SQL_C_DEFAULT)) {
+        const auto* text = static_cast<const char*>(binding.parameterValuePtr);
+        std::string_view s = strLenOrInd == SQL_NTS ? std::string_view(text)
+                                                      : std::string_view(text, static_cast<std::size_t>(strLenOrInd));
+        std::vector<std::byte> content(s.size());
+        std::memcpy(content.data(), s.data(), s.size());
+        return content;
+    }
+    return std::nullopt;
+}
+
+// Builds the ordinary-column-bind BindParam for a smart LOB locator
+// SqliConnection::createSmartLob just returned: ifxType=kUdt,
+// ExtendedOwner="informix" (matching BOOLEAN's own ordinary-bind
+// convention - see sqli/types.h's kUdt doc comment), ExtendedTypeName the
+// target column's own "blob"/"clob", data=[4-byte length=72][the 72
+// locator bytes] - confirmed live (tools/ifx_probe, tests/integration/
+// test_smart_lob.cpp).
+ifxsqli::BindParam buildSmartLobBindParam(std::span<const std::byte> locator, const std::string& extendedTypeName) {
+    ifxsqli::BindParam p;
+    p.ifxType = ifxsqli::ifxtype::kUdt;
+    p.isNull = false;
+    p.extendedOwnerName = "informix";
+    p.extendedTypeName = extendedTypeName;
+    p.precisionField = static_cast<std::uint16_t>(locator.size());
+    p.data.resize(4 + locator.size());
+    auto len = static_cast<std::uint32_t>(locator.size());
+    p.data[0] = static_cast<std::byte>((len >> 24) & 0xFF);
+    p.data[1] = static_cast<std::byte>((len >> 16) & 0xFF);
+    p.data[2] = static_cast<std::byte>((len >> 8) & 0xFF);
+    p.data[3] = static_cast<std::byte>(len & 0xFF);
+    std::copy(locator.begin(), locator.end(), p.data.begin() + 4);
+    return p;
 }
 
 // Reads each bound parameter's current value (from wherever
@@ -348,6 +404,19 @@ SQLRETURN doPrepare(OdbcStatement* s, const std::string& sql) {
 // and encodes it into a sqli::BindParam list ready for SqliStatement::
 // execute(). Returns SQL_ERROR (with a diagnostic already posted) on a
 // count mismatch or an unsupported ValueType/ParameterType pairing.
+//
+// Parameters #i targeting a smart LOB (BLOB/CLOB) column - per
+// s->stmt->paramDescs()[i-1], the real DESCRIBE-sourced type this
+// driver's own SQLDescribeParam also reports - are dispatched here to
+// SqliConnection::createSmartLob rather than encodeBindParam's ordinary
+// SQL_LONGVARBINARY/SQL_LONGVARCHAR path: ODBC gives no way to tell a
+// smart-LOB bind target apart from a simple-LOB one at SQLBindParameter
+// time (sqlTypeFor collapses both to the same SQL_LONGVARBINARY/
+// SQL_LONGVARCHAR - see driver/statement.cpp's sqlTypeFor), so this
+// driver resolves the ambiguity itself via the target column's real
+// paramDescs() type, per the project's decision to build this on real
+// SQLDescribeParam/SQLNumParams support rather than SQL-text sniffing or
+// a caller-side escape hatch.
 std::optional<std::vector<ifxsqli::BindParam>> buildBindParams(OdbcStatement* s) {
     const std::size_t expected = s->stmt->paramCount();
     if (expected == 0) return std::vector<ifxsqli::BindParam>{};
@@ -357,6 +426,8 @@ std::optional<std::vector<ifxsqli::BindParam>> buildBindParams(OdbcStatement* s)
                             " parameter marker(s), " + std::to_string(s->paramBindings.size()) + " bound");
         return std::nullopt;
     }
+
+    const auto& paramDescs = s->stmt->paramDescs();
 
     std::vector<ifxsqli::BindParam> params;
     params.reserve(expected);
@@ -368,6 +439,67 @@ std::optional<std::vector<ifxsqli::BindParam>> buildBindParams(OdbcStatement* s)
         }
         const auto& binding = it->second;
         bool isNull = binding.strLenOrIndPtr && *binding.strLenOrIndPtr == SQL_NULL_DATA;
+
+        // If paramDescs() is empty or too short for this parameter -
+        // confirmed live it's reliably populated for the "insert into
+        // <table> (...) values (?, ...)" shape this driver supports (see
+        // parseInsertTableName's own doc comment for the scope this is
+        // tied to), but not proven for every statement shape a caller
+        // might prepare - paramDesc is null and this falls through to the
+        // ordinary encodeBindParam path below, which encodes a
+        // SQL_LONGVARBINARY/SQL_LONGVARCHAR bind as a *simple* LOB
+        // (kByte/kText). That's not silent data corruption: a simple-LOB
+        // placeholder's wire shape (kByte/kText, a 56-byte descriptor) is
+        // fundamentally incompatible with what a smart-LOB column's
+        // SQ_BIND expects (kUdt, a 76-byte locator payload), so the server
+        // rejects the mismatch with a type error rather than accepting
+        // wrong bytes - a loud failure, not a quiet one.
+        const ifxsqli::ColumnDesc* paramDesc = (i - 1 < paramDescs.size()) ? &paramDescs[i - 1] : nullptr;
+        bool isSmartLobTarget = paramDesc && isSmartLobColumn(*paramDesc) &&
+                                 (binding.parameterType == SQL_LONGVARBINARY ||
+                                  binding.parameterType == SQL_LONGVARCHAR);
+
+        if (isSmartLobTarget) {
+            if (isNull) {
+                // Same "real target type, not a placeholder" convention as
+                // the ordinary NULL path below - a smart LOB's plain wire
+                // type (kBoolean, shared with real BOOLEAN) plus its
+                // ExtendedTypeName is what tells a fetched NULL smart LOB
+                // apart from a NULL BOOLEAN elsewhere in this driver, so a
+                // NULL bind needs the same identity even though it carries
+                // no locator.
+                ifxsqli::BindParam p;
+                p.ifxType = ifxsqli::ifxtype::kBoolean;
+                p.isNull = true;
+                p.extendedOwnerName = "informix";
+                p.extendedTypeName = paramDesc->extendedTypeName;
+                params.push_back(std::move(p));
+                continue;
+            }
+            SQLLEN strLenOrInd = binding.strLenOrIndPtr ? *binding.strLenOrIndPtr : SQL_NTS;
+            auto content = smartLobBindContent(binding, strLenOrInd);
+            if (!content) {
+                postDriverError(s->diag, "HYC00",
+                                "SQLBindParameter: unsupported ValueType for smart LOB parameter #" +
+                                    std::to_string(i));
+                return std::nullopt;
+            }
+            auto table = parseInsertTableName(s->preparedSql);
+            if (!table) {
+                postDriverError(s->diag, "HYC00",
+                                "cannot determine target table for smart LOB parameter #" + std::to_string(i) +
+                                    " (only a leading INSERT INTO <table> is currently supported)");
+                return std::nullopt;
+            }
+            auto locator = s->conn->sqli->createSmartLob(*table + "." + paramDesc->name, *content);
+            if (!locator) {
+                postSqliError(s->diag, locator.error());
+                return std::nullopt;
+            }
+            params.push_back(buildSmartLobBindParam(*locator, paramDesc->extendedTypeName));
+            continue;
+        }
+
         if (isNull) {
             // SQ_BIND's ifxType field should be the target column's real
             // type, not a placeholder, per the decompiled JDBC reference's
@@ -513,6 +645,54 @@ IFXODBC_EXPORT SQLRETURN SQL_API SQLDescribeCol(SQLHSTMT StatementHandle, SQLUSM
 
     if (DataTypePtr) *DataTypePtr = sqlTypeFor(col);
     if (ColumnSizePtr) *ColumnSizePtr = columnSizeFor(col);
+    if (DecimalDigitsPtr) *DecimalDigitsPtr = decimalDigitsFor(col);
+    if (NullablePtr) *NullablePtr = col.notNull ? SQL_NO_NULLS : SQL_NULLABLE;
+    return SQL_SUCCESS;
+}
+
+IFXODBC_EXPORT SQLRETURN SQL_API SQLNumParams(SQLHSTMT StatementHandle, SQLSMALLINT* ParameterCountPtr) {
+    auto* s = static_cast<OdbcStatement*>(StatementHandle);
+    if (!s) return SQL_INVALID_HANDLE;
+    s->diag.clear();
+    if (!s->stmt) {
+        postDriverError(s->diag, "HY010", "function sequence error: statement is not prepared");
+        return SQL_ERROR;
+    }
+    if (ParameterCountPtr) *ParameterCountPtr = static_cast<SQLSMALLINT>(s->stmt->paramCount());
+    return SQL_SUCCESS;
+}
+
+// The mirror image of SQLDescribeCol, for input "?" parameters instead of
+// output columns - built on SqliStatement::paramDescs() (DESCRIBE's own
+// per-parameter reply data, already parsed for the SELECT-output-column
+// case, just not previously exposed for this one), per this project's
+// decision to solve smart-LOB bind-target disambiguation the ODBC-
+// idiomatic way (real parameter metadata) rather than SQL-text sniffing
+// or a caller-side escape hatch. Reuses sqlTypeFor/columnSizeFor/
+// decimalDigitsFor unchanged - they already take a ColumnDesc, and
+// already handle isSmartLobColumn correctly (that check was written for
+// the fetch side, but a described smart-LOB parameter's ColumnDesc has
+// the same ifxType/extendedTypeName shape a fetched smart-LOB column's
+// does).
+IFXODBC_EXPORT SQLRETURN SQL_API SQLDescribeParam(SQLHSTMT StatementHandle, SQLUSMALLINT ParameterNumber,
+                                    SQLSMALLINT* DataTypePtr, SQLULEN* ParameterSizePtr,
+                                    SQLSMALLINT* DecimalDigitsPtr, SQLSMALLINT* NullablePtr) {
+    auto* s = static_cast<OdbcStatement*>(StatementHandle);
+    if (!s) return SQL_INVALID_HANDLE;
+    s->diag.clear();
+    if (!s->stmt) {
+        postDriverError(s->diag, "HY010", "function sequence error: statement is not prepared");
+        return SQL_ERROR;
+    }
+    const auto& params = s->stmt->paramDescs();
+    if (ParameterNumber < 1 || ParameterNumber > params.size()) {
+        postDriverError(s->diag, "07009", "invalid parameter number");
+        return SQL_ERROR;
+    }
+    const auto& col = params[ParameterNumber - 1];
+
+    if (DataTypePtr) *DataTypePtr = sqlTypeFor(col);
+    if (ParameterSizePtr) *ParameterSizePtr = columnSizeFor(col);
     if (DecimalDigitsPtr) *DecimalDigitsPtr = decimalDigitsFor(col);
     if (NullablePtr) *NullablePtr = col.notNull ? SQL_NO_NULLS : SQL_NULLABLE;
     return SQL_SUCCESS;

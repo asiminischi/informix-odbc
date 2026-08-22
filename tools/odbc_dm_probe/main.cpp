@@ -428,6 +428,188 @@ bool runBindParamTest(SQLHDBC dbc) {
     return ok;
 }
 
+// Verifies the smart LOB (BLOB/CLOB) SQLBindParameter surface through the
+// real Driver Manager: SQLNumParams/SQLDescribeParam report the right
+// shape for a "?" targeting a smart-LOB column, and SQLBindParameter with
+// SQL_LONGVARBINARY/SQL_LONGVARCHAR - the same ParameterType a simple LOB
+// (BYTE/TEXT) bind also uses - is correctly routed to
+// SqliConnection::createSmartLob rather than the simple-LOB bind path
+// (driver/statement.cpp's buildBindParams, dispatching on the target
+// column's real paramDescs() type since ODBC itself can't tell the two
+// apart at bind time). Also covers a NULL smart-LOB bind and a
+// same-prepared-statement rebind, mirroring runBindParamTest's own
+// coverage shape for the INTEGER case.
+bool runSmartLobBindTest(SQLHDBC dbc) {
+    bool ok = true;
+    auto expectEq = [&ok](const char* label, bool cond) {
+        std::printf("  [%s] %s\n", cond ? "ok" : "FAIL", label);
+        if (!cond) ok = false;
+    };
+
+    ok &= execDirect(dbc, "drop table if exists smart_lob_bind_probe");
+    ok &= execDirect(dbc, "create table smart_lob_bind_probe (id integer, b blob, c clob)"
+                          " put b in (sbspace1), c in (sbspace1)");
+    if (!ok) {
+        std::printf("[smart-lob-bind] fixture setup failed, aborting smart LOB bind test\n");
+        return false;
+    }
+
+    SQLHSTMT insStmt = SQL_NULL_HSTMT;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &insStmt);
+    const char* insSql = "insert into smart_lob_bind_probe (id, b) values (?, ?)";
+    SQLRETURN rc = SQLPrepare(insStmt, reinterpret_cast<SQLCHAR*>(const_cast<char*>(insSql)), SQL_NTS);
+    expectEq("SQLPrepare(insert ... b values (?, ?)) succeeds", rc == SQL_SUCCESS);
+    if (rc != SQL_SUCCESS) printDiag(SQL_HANDLE_STMT, insStmt, "insStmt");
+
+    SQLSMALLINT numParams = 0;
+    rc = SQLNumParams(insStmt, &numParams);
+    expectEq("SQLNumParams succeeds", rc == SQL_SUCCESS);
+    expectEq("SQLNumParams reports 2", numParams == 2);
+
+    SQLSMALLINT paramDataType = 0;
+    SQLULEN paramSize = 0;
+    SQLSMALLINT paramDecimalDigits = 0;
+    SQLSMALLINT paramNullable = 0;
+    rc = SQLDescribeParam(insStmt, 2, &paramDataType, &paramSize, &paramDecimalDigits, &paramNullable);
+    expectEq("SQLDescribeParam(2) succeeds", rc == SQL_SUCCESS);
+    if (rc != SQL_SUCCESS) printDiag(SQL_HANDLE_STMT, insStmt, "insStmt");
+    expectEq("SQLDescribeParam(2) reports SQL_LONGVARBINARY for the blob column",
+             paramDataType == SQL_LONGVARBINARY);
+
+    SQLINTEGER idVal = 1;
+    SQLLEN idInd = 0;
+    rc = SQLBindParameter(insStmt, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &idVal, 0, &idInd);
+    expectEq("SQLBindParameter(1, id) succeeds", rc == SQL_SUCCESS);
+
+    std::string content1 = "smart lob bind through the real driver manager";
+    SQLLEN contentInd = static_cast<SQLLEN>(content1.size());
+    rc = SQLBindParameter(insStmt, 2, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_LONGVARBINARY, 0, 0,
+                           const_cast<char*>(content1.data()), 0, &contentInd);
+    expectEq("SQLBindParameter(2, blob content, SQL_LONGVARBINARY) succeeds", rc == SQL_SUCCESS);
+
+    rc = SQLExecute(insStmt);
+    expectEq("SQLExecute(insert with smart-LOB bind, id=1) succeeds", rc == SQL_SUCCESS);
+    if (rc != SQL_SUCCESS) printDiag(SQL_HANDLE_STMT, insStmt, "insStmt");
+
+    // Rebind to a NULL value and a different id, same prepared statement -
+    // proves the NULL smart-LOB bind path (buildBindParams' isSmartLobTarget
+    // NULL branch) doesn't hang the connection the way an extended-type
+    // bind missing its owner/name fields is known to elsewhere in this
+    // driver (see BindParam's doc comment in sqli/statement.h).
+    idVal = 2;
+    contentInd = SQL_NULL_DATA;
+    rc = SQLExecute(insStmt);
+    expectEq("SQLExecute(insert with NULL smart-LOB bind, id=2) succeeds", rc == SQL_SUCCESS);
+    if (rc != SQL_SUCCESS) printDiag(SQL_HANDLE_STMT, insStmt, "insStmt");
+
+    // Rebind to a third value and a payload well over writeLoData's 30000-
+    // byte LO_WRITE chunk size (sqli/connection.cpp's kMaxChunk) - every
+    // other smart-LOB write this driver has ever run (sqli's own
+    // integration test, ifx_probe, this test's own id=1/id=2 above) fit in
+    // one chunk, so the multi-chunk request-side framing (several
+    // length-prefixed chunks under one declared total, one trailing EOT)
+    // had never actually executed before this. A non-repeating byte
+    // pattern (not e.g. all 'x') so a chunk-boundary reordering/truncation
+    // bug would show up as a content mismatch rather than being masked by
+    // uniform bytes.
+    idVal = 3;
+    std::string content3(70000, '\0');
+    for (std::size_t k = 0; k < content3.size(); ++k) {
+        content3[k] = static_cast<char>(static_cast<unsigned char>(k % 251));
+    }
+    contentInd = static_cast<SQLLEN>(content3.size());
+    rc = SQLBindParameter(insStmt, 2, SQL_PARAM_INPUT, SQL_C_BINARY, SQL_LONGVARBINARY, 0, 0,
+                           const_cast<char*>(content3.data()), 0, &contentInd);
+    rc = SQLExecute(insStmt);
+    expectEq("SQLExecute(insert with 70000-byte (multi-chunk LO_WRITE) smart-LOB bind, id=3) succeeds",
+             rc == SQL_SUCCESS);
+    if (rc != SQL_SUCCESS) printDiag(SQL_HANDLE_STMT, insStmt, "insStmt");
+
+    SQLFreeHandle(SQL_HANDLE_STMT, insStmt);
+
+    // Read every row back through an ordinary SQLGetData fetch (the
+    // already-confirmed-live smart-LOB fetch surface, driver/statement.cpp's
+    // writeSmartLobColumnValue) to confirm what buildBindParams actually
+    // wrote is byte-exact, not just "SQLExecute didn't fail".
+    SQLHSTMT selStmt = SQL_NULL_HSTMT;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &selStmt);
+    const char* selSql = "select id, b from smart_lob_bind_probe order by id";
+    rc = SQLExecDirect(selStmt, reinterpret_cast<SQLCHAR*>(const_cast<char*>(selSql)), SQL_NTS);
+    expectEq("select-back after smart-LOB bind inserts succeeds", rc == SQL_SUCCESS);
+
+    static char buf[80000]; // big enough for content3's 70000 bytes in one SQLGetData call
+    for (int expectedId = 1; expectedId <= 3; ++expectedId) {
+        rc = SQLFetch(selStmt);
+        expectEq(("row found for id=" + std::to_string(expectedId)).c_str(), rc == SQL_SUCCESS);
+        if (rc != SQL_SUCCESS) break;
+
+        SQLINTEGER fetchedId = 0;
+        SQLLEN fetchedIdInd = 0;
+        SQLGetData(selStmt, 1, SQL_C_SLONG, &fetchedId, 0, &fetchedIdInd);
+        expectEq(("fetched id == " + std::to_string(expectedId)).c_str(),
+                 fetchedIdInd != SQL_NULL_DATA && fetchedId == expectedId);
+
+        SQLLEN bInd = 0;
+        SQLRETURN getRc = SQLGetData(selStmt, 2, SQL_C_BINARY, buf, sizeof(buf), &bInd);
+        if (expectedId == 2) {
+            expectEq("id=2 blob round-trips as NULL", bInd == SQL_NULL_DATA);
+        } else {
+            const std::string& expected = expectedId == 1 ? content1 : content3;
+            bool matches = getRc == SQL_SUCCESS && bInd == static_cast<SQLLEN>(expected.size()) &&
+                            std::memcmp(buf, expected.data(), expected.size()) == 0;
+            expectEq(("id=" + std::to_string(expectedId) + " blob content round-trips byte-exact").c_str(), matches);
+        }
+    }
+    rc = SQLFetch(selStmt);
+    expectEq("no unexpected 4th row", rc == SQL_NO_DATA);
+    SQLFreeHandle(SQL_HANDLE_STMT, selStmt);
+
+    // CLOB column: SQLDescribeParam should report SQL_LONGVARCHAR (not
+    // SQL_LONGVARBINARY) - proves the dispatch consults the *described*
+    // column's own extendedTypeName ("blob" vs "clob"), not just "is this
+    // a smart LOB at all".
+    SQLHSTMT clobStmt = SQL_NULL_HSTMT;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &clobStmt);
+    const char* clobInsSql = "insert into smart_lob_bind_probe (id, c) values (?, ?)";
+    rc = SQLPrepare(clobStmt, reinterpret_cast<SQLCHAR*>(const_cast<char*>(clobInsSql)), SQL_NTS);
+    expectEq("SQLPrepare(insert ... c values (?, ?)) succeeds", rc == SQL_SUCCESS);
+
+    SQLSMALLINT clobParamDataType = 0;
+    rc = SQLDescribeParam(clobStmt, 2, &clobParamDataType, &paramSize, &paramDecimalDigits, &paramNullable);
+    expectEq("SQLDescribeParam(2) succeeds for clob column", rc == SQL_SUCCESS);
+    expectEq("SQLDescribeParam(2) reports SQL_LONGVARCHAR for the clob column",
+             clobParamDataType == SQL_LONGVARCHAR);
+
+    SQLINTEGER clobId = 10;
+    SQLLEN clobIdInd = 0;
+    SQLBindParameter(clobStmt, 1, SQL_PARAM_INPUT, SQL_C_SLONG, SQL_INTEGER, 0, 0, &clobId, 0, &clobIdInd);
+    std::string clobContent = "smart lob bind, clob column, through the real driver manager";
+    SQLLEN clobContentInd = static_cast<SQLLEN>(clobContent.size());
+    rc = SQLBindParameter(clobStmt, 2, SQL_PARAM_INPUT, SQL_C_CHAR, SQL_LONGVARCHAR, 0, 0,
+                           const_cast<char*>(clobContent.data()), 0, &clobContentInd);
+    rc = SQLExecute(clobStmt);
+    expectEq("SQLExecute(insert with clob smart-LOB bind) succeeds", rc == SQL_SUCCESS);
+    if (rc != SQL_SUCCESS) printDiag(SQL_HANDLE_STMT, clobStmt, "clobStmt");
+    SQLFreeHandle(SQL_HANDLE_STMT, clobStmt);
+
+    SQLHSTMT clobSelStmt = SQL_NULL_HSTMT;
+    SQLAllocHandle(SQL_HANDLE_STMT, dbc, &clobSelStmt);
+    const char* clobSelSql = "select c from smart_lob_bind_probe where id = 10";
+    rc = SQLExecDirect(clobSelStmt, reinterpret_cast<SQLCHAR*>(const_cast<char*>(clobSelSql)), SQL_NTS);
+    expectEq("select-back for clob row succeeds", rc == SQL_SUCCESS);
+    rc = SQLFetch(clobSelStmt);
+    expectEq("clob row found", rc == SQL_SUCCESS);
+    SQLLEN clobFetchInd = 0;
+    SQLRETURN clobGetRc = SQLGetData(clobSelStmt, 1, SQL_C_CHAR, buf, sizeof(buf), &clobFetchInd);
+    bool clobMatches = clobGetRc == SQL_SUCCESS && clobFetchInd == static_cast<SQLLEN>(clobContent.size()) &&
+                        std::memcmp(buf, clobContent.data(), clobContent.size()) == 0;
+    expectEq("clob content round-trips byte-exact", clobMatches);
+    SQLFreeHandle(SQL_HANDLE_STMT, clobSelStmt);
+
+    execDirect(dbc, "drop table if exists smart_lob_bind_probe");
+    return ok;
+}
+
 // Verifies the driver-layer transaction wiring added on top of the
 // already-confirmed-live SqliConnection::begin/commit/rollbackTransaction
 // primitives: SQL_ATTR_AUTOCOMMIT actually changing behavior (not just
@@ -1040,7 +1222,12 @@ bool runTypeInfoTest(SQLHDBC dbc) {
         expectEq("SQL_ALL_TYPES found a 'varchar' row", foundChar);
         expectEq("SQL_ALL_TYPES found a 'date' row", foundDate);
         expectEq("SQL_ALL_TYPES found a 'datetime' row", foundDatetime);
-        expectEq("SQL_ALL_TYPES returned all 14 kTypeMap rows", rowCount == 14);
+        // 16, not the 14 this assertion originally hardcoded: byte/text
+        // (simple LOB) rows were added to kTypeMap in a later commit
+        // without updating this count - a pre-existing staleness bug
+        // unrelated to the smart LOB bind work, caught incidentally while
+        // verifying that work through this same tool.
+        expectEq("SQL_ALL_TYPES returned all 16 kTypeMap rows", rowCount == 16);
         SQLFreeHandle(SQL_HANDLE_STMT, stmt);
     }
 
@@ -1198,6 +1385,10 @@ int main(int argc, char** argv) {
     bool bindOk = runBindParamTest(dbc);
     std::printf("bind-parameter test: %s\n", bindOk ? "PASS" : "FAIL");
 
+    std::printf("--- Smart LOB (BLOB/CLOB) bind parameters ---\n");
+    bool smartLobBindOk = runSmartLobBindTest(dbc);
+    std::printf("smart-LOB bind-parameter test: %s\n", smartLobBindOk ? "PASS" : "FAIL");
+
     std::printf("--- SQLEndTran + SQL_ATTR_AUTOCOMMIT ---\n");
     bool txnOk = runTransactionTest(env, dbc, connStr);
     std::printf("transaction test: %s\n", txnOk ? "PASS" : "FAIL");
@@ -1222,5 +1413,8 @@ int main(int argc, char** argv) {
     SQLFreeHandle(SQL_HANDLE_ENV, env);
     std::printf("done.\n");
     bool disconnectOk = (rc == SQL_SUCCESS || rc == SQL_SUCCESS_WITH_INFO);
-    return (disconnectOk && nativeOk && diagOk && bindOk && txnOk && catalogOk && columnsOk && typeInfoOk) ? 0 : 1;
+    return (disconnectOk && nativeOk && diagOk && bindOk && smartLobBindOk && txnOk && catalogOk && columnsOk &&
+            typeInfoOk)
+               ? 0
+               : 1;
 }

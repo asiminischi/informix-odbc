@@ -201,6 +201,15 @@ struct OdbcStatement {
     StmtState state = StmtState::kUnprepared;
     std::map<SQLUSMALLINT, BoundColumn> boundColumns;
     std::map<SQLUSMALLINT, ParamBinding> paramBindings;
+
+    // The exact text last passed to SQLPrepare/SQLExecDirect - sqli::
+    // SqliStatement doesn't retain it (see sqli/statement.h), but a smart
+    // LOB "?" bind (driver/statement.cpp's buildBindParams) needs the
+    // target table name to call SqliConnection::createSmartLob, and
+    // DESCRIBE's own paramDescs() only carries the target *column* name,
+    // not its table - so this driver has to keep the SQL text around and
+    // narrowly parse "insert into <table>" out of it itself.
+    std::string preparedSql;
     // The most recently fetched row's raw per-column byte buffers (as
     // returned by SqliStatement::fetchRow), consulted by SQLGetData for
     // columns that weren't bound via SQLBindCol.

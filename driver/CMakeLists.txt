@@ -9,6 +9,7 @@ add_library(ifxodbc SHARED
   convert.cpp
   convert_native.cpp
   bind_encode.cpp
+  insert_table_name.cpp
   statement.cpp
   stmt_attr.cpp
   transaction.cpp

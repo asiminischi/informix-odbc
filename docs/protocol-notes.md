@@ -1307,16 +1307,49 @@ doesn't go through this file's catalog-query mechanism at all (it
 synthesizes rows directly from `kTypeMap` in C++), so it still has no
 BLOB/CLOB rows - a real, separate gap, not fixed here.
 
-**Status: verified, at the sqli layer.** `SqliConnection::createSmartLob`
+**Status: verified, sqli layer and ODBC layer.** `SqliConnection::createSmartLob`
 (`sqli/connection.cpp`) implements the full create/write sequence and is
-confirmed live end-to-end (`tools/ifx_probe`, BLOB and CLOB columns, against
-this project's IDS 14.10 dev container): create a new smart LOB, write
-content into it, bind the resulting locator into a real `INSERT`, and read
-it back both through this driver's own `fetchSmartLob` (on a fresh
-connection) and through a real JDBC driver - byte-for-byte matches in both
-directions. **Not yet implemented**: the ODBC `SQLBindParameter` surface for
-BLOB/CLOB (real `SQLDescribeParam` support, wired to
-`SqliConnection::createSmartLob` - deliberately scoped as follow-on work).
+confirmed live end-to-end (`tools/ifx_probe`, `tests/integration/
+test_smart_lob.cpp`, BLOB and CLOB columns, against this project's IDS
+14.10 dev container): create a new smart LOB, write content into it, bind
+the resulting locator into a real `INSERT`, and read it back both through
+this driver's own `fetchSmartLob` (on a fresh connection) and through a
+real JDBC driver - byte-for-byte matches in both directions.
+
+The ODBC `SQLBindParameter` surface is also done: real `SQLNumParams`/
+`SQLDescribeParam` (`driver/statement.cpp`, built on `SqliStatement::
+paramDescs()`) let `buildBindParams` tell a smart-LOB bind target apart
+from a simple-LOB one - both share `SQL_LONGVARBINARY`/`SQL_LONGVARCHAR`
+at the `SQLBindParameter` level, so ODBC alone can't distinguish them; the
+target column's real described type is what resolves it, per this
+project's decision to solve that ambiguity via real parameter metadata
+rather than SQL-text sniffing or a caller-side escape hatch. The target
+table name (which `paramDescs()` doesn't carry) comes from a narrow
+`insert into <table>` scan of the prepared SQL text
+(`driver/insert_table_name.cpp`, independently unit-tested, including
+Informix's `db:owner.table`/`db@server:owner.table` qualified forms).
+Confirmed live through the real unixODBC Driver Manager
+(`tools/odbc_dm_probe`): BLOB, CLOB, NULL, a same-prepared-statement
+rebind (three separate `createSmartLob` calls), and a 70000-byte value
+that exercises `writeLoData`'s multi-chunk `LO_WRITE` request framing for
+the first time (every earlier test of this feature fit in one 30000-byte
+chunk) - all byte-exact on read-back. Needed one additional fix beyond the
+bind dispatch itself: `SQL_API_SQLNUMPARAMS`/`SQL_API_SQLDESCRIBEPARAM`
+weren't in `SQLGetFunctions`' capability bitmap (`driver/info.cpp`), so
+unixODBC's Driver Manager refused to call either function at all
+(`IM001`, "Driver does not support this function") even though both were
+otherwise correct - the same class of DM-capability gap
+`SQL_TXN_CAPABLE`/`SQLEndTran` hit earlier (see the Transactions section).
+
+**Known limitation, deliberately not fixed here**: `createSmartLob` runs
+during `buildBindParams`, before `doExecute` sends the `INSERT` - so in
+autocommit, an `INSERT` that fails for an unrelated reason after a
+successful `createSmartLob` leaves that LOB orphaned in its sbspace (no
+row references it, nothing reads or trusts it, but it's a real storage
+leak on the error path). Fixing this means moving the `createSmartLob`
+call inside `doExecute`'s own transaction boundary so create+insert commit
+together - a scoped change to where in the bind/execute lifecycle the
+network round trip happens, not folded into this pass.
 
 Reverse-engineered the same way as the fetch path: `jdbc-4.50.10.jar`,
 `TRACE=3`/`TRACEFILE`, routed through a raw TCP proxy (the JDBC driver's own
