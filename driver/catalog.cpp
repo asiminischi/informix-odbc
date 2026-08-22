@@ -284,14 +284,42 @@ constexpr TypeMapEntry kTypeMap[] = {
 // this server for the same reason). The explicit CAST forces the driver-
 // visible type regardless of what any individual branch would otherwise
 // infer to.
-std::string caseInt(std::string_view label, SQLSMALLINT TypeMapEntry::*field, std::string_view elseSql) {
-    std::string sql = "cast(case basetype";
+// Raw, unaliased form of caseInt's generated expression - split out so
+// call sites that need to wrap it further (see wrapSmartLob below) can,
+// without string-surgery on an already-cast-and-aliased result.
+std::string caseIntExpr(SQLSMALLINT TypeMapEntry::*field, std::string_view elseSql) {
+    std::string sql = "case basetype";
     for (const auto& e : kTypeMap) {
         SQLSMALLINT v = e.*field;
         sql += " when " + std::to_string(e.ifxBaseType) + " then " + (v == 0 ? "null" : std::to_string(v));
     }
-    sql += " else " + std::string(elseSql) + " end as integer) as " + std::string(label);
+    sql += " else " + std::string(elseSql) + " end";
     return sql;
+}
+
+std::string caseInt(std::string_view label, SQLSMALLINT TypeMapEntry::*field, std::string_view elseSql) {
+    return "cast(" + caseIntExpr(field, elseSql) + " as integer) as " + std::string(label);
+}
+
+// BLOB/CLOB (smart LOBs) share basetype 41 with BOOLEAN - see
+// driver/statement.cpp's isSmartLobColumn, which uses
+// ColumnDesc::extendedTypeName to tell them apart at the wire DESCRIBE
+// layer. This file's catalog queries have no DESCRIBE result to consult,
+// only syscolumns, so the equivalent discriminator here is
+// syscolumns.extended_id (10=blob, 11=clob, confirmed live against this
+// project's dev container - see docs/protocol-notes.md's Smart large
+// objects section) - added to buildColumnsSql's inner derived table
+// alongside basetype/nullable_flag for the same "an outer CASE can't
+// reference another outer CASE's own alias" reason those are split out.
+// Wraps an already-built basetype-keyed expression with two
+// higher-priority branches, evaluated before the wrapped expression's own
+// (which would otherwise report smart LOB columns as BOOLEAN, matching
+// simple LOBs' own SQL_LONGVARBINARY/SQL_LONGVARCHAR convention instead
+// - see driver/statement.cpp's sqlTypeFor/columnSizeFor).
+std::string wrapSmartLob(const std::string& innerSql, const std::string& blobValue, const std::string& clobValue) {
+    return "case when basetype = " + std::to_string(ifxsqli::ifxtype::kBoolean) + " and extended_id = 10 then " +
+           blobValue + " when basetype = " + std::to_string(ifxsqli::ifxtype::kBoolean) +
+           " and extended_id = 11 then " + clobValue + " else (" + innerSql + ") end";
 }
 
 std::string caseRadix() {
@@ -473,7 +501,7 @@ std::string intervalCaseColumnSize() {
 // as CHAR sized to the widest branch ('bigserial', 9 characters) and pads
 // shorter results ('smallint') to that width.
 std::string caseTypeName() {
-    std::string sql = "trim(case basetype";
+    std::string sql = "case basetype";
     for (const auto& e : kTypeMap) {
         sql += " when " + std::to_string(e.ifxBaseType) + " then '" + e.typeName + "'";
     }
@@ -482,11 +510,11 @@ std::string caseTypeName() {
     // see IntervalShapeEntry's doc comment.
     sql += " when 14 then (" + intervalCaseTypeName() + ")";
     // Matches driver/statement.cpp's sqlTypeFor fallback: an Informix type
-    // this driver doesn't otherwise model (LOBs/opaque types, outside the
-    // MVP-8-plus-BOOLEAN-plus-FLOAT-plus-INTERVAL set) still shows up as a
-    // column rather than being silently dropped from the result.
-    sql += " else 'unknown' end) as type_name";
-    return sql;
+    // this driver doesn't otherwise model (opaque types outside the
+    // MVP-8-plus-BOOLEAN-plus-FLOAT-plus-INTERVAL-plus-LOB set) still shows
+    // up as a column rather than being silently dropped from the result.
+    sql += " else 'unknown' end";
+    return "trim(" + wrapSmartLob(sql, "'blob'", "'clob'") + ") as type_name";
 }
 
 // COLUMN_SIZE's meaning is type-specific (see driver/statement.cpp's
@@ -510,7 +538,8 @@ std::string caseTypeName() {
 // are: the DECIMAL branch (trunc(collength / 256)) would otherwise type
 // the whole expression as DECIMAL, not INTEGER - see caseInt's comment.
 std::string caseColumnSize() {
-    return "cast(case basetype"
+    std::string inner =
+           "case basetype"
            " when " +
            std::to_string(ifxsqli::ifxtype::kSmallInt) +
            " then 5"
@@ -570,7 +599,14 @@ std::string caseColumnSize() {
            " when 14 then (" +
            intervalCaseColumnSize() +
            ")"
-           " else null end as integer)";
+           " else null end";
+    // Smart LOBs (BLOB/CLOB) have no declared width either, same
+    // unconfirmed-first-hypothesis sentinel as simple LOBs above - they
+    // share basetype 41 with BOOLEAN (whose own branch above would
+    // otherwise report COLUMN_SIZE=1), so this needs the same
+    // extended_id-keyed override as caseTypeName - see wrapSmartLob's doc
+    // comment.
+    return "cast(" + wrapSmartLob(inner, "2147483647", "2147483647") + " as integer)";
 }
 
 // Builds the SQLColumns query text and its WHERE-clause bind params.
@@ -597,10 +633,23 @@ std::pair<std::string, std::vector<ifxsqli::BindParam>> buildColumnsSql(const st
     std::string sqlDataTypeElse = "case when basetype = 14 then 10 else " + std::to_string(SQL_VARCHAR) + " end";
     std::string sqlDatetimeSubElse =
         "case when basetype = 14 then (" + intervalCaseInt(&IntervalShapeEntry::sqlDatetimeSub) + ") else null end";
+    // data_type/sql_data_type: BLOB maps to the same SQL_LONGVARBINARY
+    // simple LOBs (BYTE) use, CLOB to SQL_LONGVARCHAR (TEXT's mapping) -
+    // matching driver/statement.cpp's sqlTypeFor, and matching kTypeMap's
+    // own convention that sql_data_type mirrors data_type for every
+    // non-datetime/non-interval type.
+    std::string dataTypeCase = "cast(" +
+        wrapSmartLob(caseIntExpr(&TypeMapEntry::dataType, dataTypeElse), std::to_string(SQL_LONGVARBINARY),
+                     std::to_string(SQL_LONGVARCHAR)) +
+        " as integer) as data_type";
+    std::string sqlDataTypeCase = "cast(" +
+        wrapSmartLob(caseIntExpr(&TypeMapEntry::sqlDataType, sqlDataTypeElse), std::to_string(SQL_LONGVARBINARY),
+                     std::to_string(SQL_LONGVARCHAR)) +
+        " as integer) as sql_data_type";
     std::string sql =
         "select " + catalogLiteral(database) +
         " as table_cat, table_schem, table_name, column_name, " +
-        caseInt("data_type", &TypeMapEntry::dataType, dataTypeElse) +
+        dataTypeCase +
         ", " + caseTypeName() + ", (" + columnSize + ") as column_size, (" + columnSize +
         ") as buffer_length,"
         " cast(case when basetype = " +
@@ -616,7 +665,7 @@ std::pair<std::string, std::vector<ifxsqli::BindParam>> buildColumnsSql(const st
         " cast(null as varchar(254)) as remarks,"
         " cast(null as varchar(254)) as column_def,"
         " " +
-        caseInt("sql_data_type", &TypeMapEntry::sqlDataType, sqlDataTypeElse) + ", " +
+        sqlDataTypeCase + ", " +
         caseInt("sql_datetime_sub", &TypeMapEntry::sqlDatetimeSub, sqlDatetimeSubElse) +
         ","
         " case when basetype in (" +
@@ -628,7 +677,7 @@ std::pair<std::string, std::vector<ifxsqli::BindParam>> buildColumnsSql(const st
         " from ("
         " select trim(t.owner) as table_schem, t.tabname as table_name, c.colname as column_name,"
         " case when c.coltype >= 256 then c.coltype - 256 else c.coltype end as basetype,"
-        " c.collength as collength, c.colno as colno,"
+        " c.collength as collength, c.colno as colno, c.extended_id as extended_id,"
         " case when c.coltype >= 256 then 0 else 1 end as nullable_flag,"
         // Decoded once here (see IntervalShapeEntry's doc comment), read as
         // plain aliases by every INTERVAL-aware CASE above and in

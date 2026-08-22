@@ -45,12 +45,25 @@ bool writeCharResult(const CellText& cell, SQLPOINTER targetValuePtr, SQLLEN buf
     return toCopy < fullLen;
 }
 
+// Smart LOBs (BLOB/CLOB) share wire type kBoolean (41) with real BOOLEAN
+// columns - the only way to tell them apart is ColumnDesc::extendedTypeName
+// (see sqli/statement.cpp's splitRow and docs/protocol-notes.md's Smart
+// large objects section). Centralized here since sqlTypeFor/columnSizeFor/
+// writeColumnValue/SQLGetData's lobState setup all need the same check.
+bool isSmartLobColumn(const ifxsqli::ColumnDesc& col) {
+    return col.ifxType == ifxsqli::ifxtype::kBoolean &&
+           (col.extendedTypeName == "blob" || col.extendedTypeName == "clob");
+}
+
 // Maps an Informix base type code to the nearest standard SQL_* type, for
 // SQLDescribeCol/SQLColAttribute. Approximate by design (Phase 4 slice 2 is
 // about proving the round trip works, not full catalog-metadata fidelity).
-SQLSMALLINT sqlTypeFor(int ifxType) {
+SQLSMALLINT sqlTypeFor(const ifxsqli::ColumnDesc& col) {
     using namespace ifxsqli::ifxtype;
-    switch (ifxType) {
+    if (isSmartLobColumn(col)) {
+        return col.extendedTypeName == "clob" ? SQL_LONGVARCHAR : SQL_LONGVARBINARY;
+    }
+    switch (col.ifxType) {
         case kSmallInt: return SQL_SMALLINT;
         case kInteger:
         case kSerial: return SQL_INTEGER;
@@ -73,6 +86,9 @@ SQLSMALLINT sqlTypeFor(int ifxType) {
 
 SQLULEN columnSizeFor(const ifxsqli::ColumnDesc& col) {
     using namespace ifxsqli::ifxtype;
+    // Smart LOBs have no declared width, same unconfirmed-first-hypothesis
+    // sentinel as simple LOBs (kByte/kText below).
+    if (isSmartLobColumn(col)) return 2147483647;
     switch (col.ifxType) {
         case kSmallInt: return 5;
         case kInteger:
@@ -101,6 +117,42 @@ SQLULEN columnSizeFor(const ifxsqli::ColumnDesc& col) {
 
 SQLSMALLINT decimalDigitsFor(const ifxsqli::ColumnDesc& col) {
     return (col.ifxType == ifxsqli::ifxtype::kDecimal) ? static_cast<SQLSMALLINT>(col.encodedLength & 0xFF) : 0;
+}
+
+// Copies from an already-fetched LOB's resumable state into the caller's
+// buffer, per the truncate-and-report-full-length/resumable-offset contract
+// both simple and smart LOBs share once their content is in memory (only
+// how `st.content` gets populated differs between the two - see
+// writeSimpleLobColumnValue/writeSmartLobColumnValue). `st.loaded` must
+// already be true; `st.exhausted` is the caller's responsibility to check
+// before deciding whether a fetch is even needed.
+SQLRETURN writeLobBytesFromState(DiagQueue& diag, LobFetchState& st, SQLSMALLINT effectiveType,
+                                  SQLPOINTER targetValuePtr, SQLLEN bufferLength, SQLLEN* strLenOrIndPtr) {
+    std::size_t available = st.content.size() - st.offset;
+    std::size_t capacity = 0;
+    if (bufferLength > 0) {
+        capacity = effectiveType == SQL_C_CHAR ? static_cast<std::size_t>(bufferLength) - 1
+                                                : static_cast<std::size_t>(bufferLength);
+    }
+    // Written as a ternary, not std::min, to avoid colliding with
+    // windows.h's own min macro in this translation unit (same avoidance
+    // driver/bind_encode.cpp uses).
+    std::size_t toCopy = capacity < available ? capacity : available;
+    if (targetValuePtr && toCopy > 0) {
+        std::memcpy(targetValuePtr, st.content.data() + st.offset, toCopy);
+    }
+    if (effectiveType == SQL_C_CHAR && targetValuePtr && bufferLength > 0) {
+        static_cast<char*>(targetValuePtr)[toCopy] = '\0';
+    }
+    if (strLenOrIndPtr) *strLenOrIndPtr = static_cast<SQLLEN>(available);
+    st.offset += toCopy;
+    bool truncated = toCopy < available;
+    if (!truncated) st.exhausted = true;
+    if (truncated) {
+        postDriverError(diag, "01004", "string data, right-truncated");
+        return SQL_SUCCESS_WITH_INFO;
+    }
+    return SQL_SUCCESS;
 }
 
 // Simple LOB (BYTE/TEXT) column fetch: genuinely can't live in
@@ -159,32 +211,51 @@ SQLRETURN writeSimpleLobColumnValue(OdbcStatement* s, const ifxsqli::ColumnDesc&
         st.content = std::move(*content);
         st.loaded = true;
     }
+    return writeLobBytesFromState(s->diag, st, effectiveType, targetValuePtr, bufferLength, strLenOrIndPtr);
+}
 
-    std::size_t available = st.content.size() - st.offset;
-    std::size_t capacity = 0;
-    if (bufferLength > 0) {
-        capacity = effectiveType == SQL_C_CHAR ? static_cast<std::size_t>(bufferLength) - 1
-                                                : static_cast<std::size_t>(bufferLength);
+// Smart LOB (BLOB/CLOB) column fetch: the mirror of
+// writeSimpleLobColumnValue above for the other LOB mechanism (see
+// isSmartLobColumn's doc comment). `raw` here is the TUPLE row's own
+// [nullFlag(1)][length(4)][locator(72) if non-null] slice (splitRow in
+// sqli/statement.cpp) - SqliConnection::fetchSmartLob wants that with just
+// the leading null-flag byte stripped (its own doc comment), so the null
+// check happens directly on raw[0] rather than via a type-specific sentinel
+// field the way simple LOBs' tb_flags is.
+SQLRETURN writeSmartLobColumnValue(OdbcStatement* s, const ifxsqli::ColumnDesc& col, std::span<const std::byte> raw,
+                                    SQLSMALLINT targetType, SQLPOINTER targetValuePtr, SQLLEN bufferLength,
+                                    SQLLEN* strLenOrIndPtr, LobFetchState* state) {
+    if (raw.empty()) {
+        postDriverError(s->diag, "HY000", "malformed smart LOB column");
+        return SQL_ERROR;
     }
-    // Written as a ternary, not std::min, to avoid colliding with
-    // windows.h's own min macro in this translation unit (same avoidance
-    // driver/bind_encode.cpp uses).
-    std::size_t toCopy = capacity < available ? capacity : available;
-    if (targetValuePtr && toCopy > 0) {
-        std::memcpy(targetValuePtr, st.content.data() + st.offset, toCopy);
+    if (raw[0] == std::byte{1}) {
+        if (strLenOrIndPtr) *strLenOrIndPtr = SQL_NULL_DATA;
+        return SQL_SUCCESS;
     }
-    if (effectiveType == SQL_C_CHAR && targetValuePtr && bufferLength > 0) {
-        static_cast<char*>(targetValuePtr)[toCopy] = '\0';
+
+    SQLSMALLINT effectiveType = targetType;
+    if (effectiveType == SQL_C_DEFAULT) {
+        effectiveType = (col.extendedTypeName == "clob") ? SQL_C_CHAR : SQL_C_BINARY;
     }
-    if (strLenOrIndPtr) *strLenOrIndPtr = static_cast<SQLLEN>(available);
-    st.offset += toCopy;
-    bool truncated = toCopy < available;
-    if (!truncated) st.exhausted = true;
-    if (truncated) {
-        postDriverError(s->diag, "01004", "string data, right-truncated");
-        return SQL_SUCCESS_WITH_INFO;
+    if (effectiveType != SQL_C_CHAR && effectiveType != SQL_C_BINARY) {
+        postDriverError(s->diag, "07006", "restricted data type attribute violation");
+        return SQL_ERROR;
     }
-    return SQL_SUCCESS;
+
+    LobFetchState localState;
+    LobFetchState& st = state ? *state : localState;
+    if (st.exhausted) return SQL_NO_DATA;
+    if (!st.loaded) {
+        auto content = s->conn->sqli->fetchSmartLob(raw.subspan(1));
+        if (!content) {
+            postSqliError(s->diag, content.error());
+            return SQL_ERROR;
+        }
+        st.content = std::move(*content);
+        st.loaded = true;
+    }
+    return writeLobBytesFromState(s->diag, st, effectiveType, targetValuePtr, bufferLength, strLenOrIndPtr);
 }
 
 // Shared by SQLFetch's bound-column loop and SQLGetData: writes one cell to
@@ -192,14 +263,18 @@ SQLRETURN writeSimpleLobColumnValue(OdbcStatement* s, const ifxsqli::ColumnDesc&
 // diagnostic fits the outcome. SQL_C_CHAR/SQL_C_DEFAULT stays on the
 // existing text path (driver/convert.h); every other supported C type
 // (slice 3) goes through driver/convert_native.h. `lobState` is only
-// consulted for BYTE/TEXT columns - see writeSimpleLobColumnValue's doc
-// comment.
+// consulted for BYTE/TEXT/BLOB/CLOB columns - see
+// writeSimpleLobColumnValue's/writeSmartLobColumnValue's doc comments.
 SQLRETURN writeColumnValue(OdbcStatement* s, const ifxsqli::ColumnDesc& col, std::span<const std::byte> raw,
                            SQLSMALLINT targetType, SQLPOINTER targetValuePtr, SQLLEN bufferLength,
                            SQLLEN* strLenOrIndPtr, LobFetchState* lobState = nullptr) {
     if (col.ifxType == ifxsqli::ifxtype::kByte || col.ifxType == ifxsqli::ifxtype::kText) {
         return writeSimpleLobColumnValue(s, col, raw, targetType, targetValuePtr, bufferLength, strLenOrIndPtr,
                                           lobState);
+    }
+    if (isSmartLobColumn(col)) {
+        return writeSmartLobColumnValue(s, col, raw, targetType, targetValuePtr, bufferLength, strLenOrIndPtr,
+                                         lobState);
     }
     if (targetType == SQL_C_CHAR || targetType == SQL_C_DEFAULT) {
         auto cell = formatCellAsText(col, raw);
@@ -436,7 +511,7 @@ IFXODBC_EXPORT SQLRETURN SQL_API SQLDescribeCol(SQLHSTMT StatementHandle, SQLUSM
         *NameLengthPtr = static_cast<SQLSMALLINT>(col.name.size());
     }
 
-    if (DataTypePtr) *DataTypePtr = sqlTypeFor(col.ifxType);
+    if (DataTypePtr) *DataTypePtr = sqlTypeFor(col);
     if (ColumnSizePtr) *ColumnSizePtr = columnSizeFor(col);
     if (DecimalDigitsPtr) *DecimalDigitsPtr = decimalDigitsFor(col);
     if (NullablePtr) *NullablePtr = col.notNull ? SQL_NO_NULLS : SQL_NULLABLE;
@@ -496,7 +571,7 @@ SQLRETURN doColAttribute(OdbcStatement* s, SQLUSMALLINT ColumnNumber, SQLUSMALLI
         }
         case SQL_DESC_TYPE:
         case SQL_COLUMN_TYPE:
-            if (NumericAttributePtr) *NumericAttributePtr = sqlTypeFor(col.ifxType);
+            if (NumericAttributePtr) *NumericAttributePtr = sqlTypeFor(col);
             return SQL_SUCCESS;
         case SQL_DESC_LENGTH:
         case SQL_COLUMN_LENGTH:
@@ -658,16 +733,16 @@ IFXODBC_EXPORT SQLRETURN SQL_API SQLGetData(SQLHSTMT StatementHandle, SQLUSMALLI
         return SQL_ERROR;
     }
 
-    // Simple LOB (BYTE/TEXT) columns get a persistent, per-column resumable
-    // fetch state so repeated SQLGetData calls on the same column (the
-    // standard ODBC idiom for pulling a large value through a small
-    // buffer) continue from where the previous call left off, rather than
-    // re-fetching/re-copying from the start - see LobFetchState's doc
-    // comment. Every other column type ignores this (writeColumnValue only
-    // consults it for kByte/kText).
+    // Simple LOB (BYTE/TEXT) and smart LOB (BLOB/CLOB) columns get a
+    // persistent, per-column resumable fetch state so repeated SQLGetData
+    // calls on the same column (the standard ODBC idiom for pulling a large
+    // value through a small buffer) continue from where the previous call
+    // left off, rather than re-fetching/re-copying from the start - see
+    // LobFetchState's doc comment. Every other column type ignores this
+    // (writeColumnValue only consults it for kByte/kText/isSmartLobColumn).
     const auto& col = cols[ColumnNumber - 1];
     LobFetchState* lobState = nullptr;
-    if (col.ifxType == ifxsqli::ifxtype::kByte || col.ifxType == ifxsqli::ifxtype::kText) {
+    if (col.ifxType == ifxsqli::ifxtype::kByte || col.ifxType == ifxsqli::ifxtype::kText || isSmartLobColumn(col)) {
         lobState = &s->lobFetchState[ColumnNumber];
     }
     return writeColumnValue(s, col, (*s->currentRow)[ColumnNumber - 1], TargetType, TargetValuePtr, BufferLength,

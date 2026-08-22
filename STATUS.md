@@ -454,11 +454,37 @@ Roughly in the order they'd bite a real application:
    extended owner is empty, not "informix" like BOOLEAN's bind) and a new
    `SQ_PROTOCOLS` capability bit this driver now tracks
    (`SqliConnection::namedParametersSupported()`, needed for
-   `SQ_GETROUTINE`'s request framing). Still missing: smart LOB bind/write
-   (`informix.ifx_lo_create`, `SQ_LODATA LO_WRITE`) and the ODBC
-   driver-layer surface (`SQLGetData`/`SQLBindParameter`) - deliberately
-   scoped as follow-on work, matching every other type's established
-   fetch-then-bind-then-ODBC-surface sequencing.
+   `SQ_GETROUTINE`'s request framing). **The ODBC fetch surface
+   (`SQLGetData`/`SQLBindCol`) is now done too**, reusing simple LOBs'
+   `LobFetchState`/resumable-offset mechanism via a shared
+   `writeLobBytesFromState` helper (`driver/statement.cpp`) - the only new
+   piece is `isSmartLobColumn`, which tells a BLOB/CLOB column apart from a
+   real BOOLEAN one (both share wire type 41) via `extendedTypeName`, and
+   is now the single check `sqlTypeFor`/`columnSizeFor`/`writeColumnValue`
+   all consult. Confirmed live through the real unixODBC Driver Manager
+   (`isql`, plus a `SQLGetData`-loop harness against `libodbc.so`
+   directly): a small value, NULL, and a 75000-byte value across 20
+   chunked `SQLGetData` calls with a 4096-byte buffer, byte-exact against
+   the source, plus `SQLBindCol` with an undersized buffer (correct
+   `01004` truncation). **`SQLColumns` now reports BLOB/CLOB correctly
+   too** (`driver/catalog.cpp`) - not just a missing-feature gap, a real
+   mislabeling bug caught during review: `basetype` 41 is shared with
+   BOOLEAN, so without this fix `SQLColumns` would silently report every
+   BLOB/CLOB column as `SQL_BIT`/`"boolean"`/size `1`. Fixed via
+   `syscolumns.extended_id` (10=blob, 11=clob), added to `buildColumnsSql`'s
+   derived table and consulted by a new `wrapSmartLob` helper wrapping
+   `DATA_TYPE`/`TYPE_NAME`/`COLUMN_SIZE`/`SQL_DATA_TYPE`. Confirmed live: a
+   direct `SQLColumns` call now reports `DATA_TYPE=-4 TYPE_NAME=blob` /
+   `DATA_TYPE=-1 TYPE_NAME=clob` correctly. `SQLGetTypeInfo` still has no
+   BLOB/CLOB rows (it synthesizes rows from `kTypeMap` directly, not
+   through this catalog-query mechanism) - a real, separate, lower-stakes
+   gap (nothing mislabeled, just absent). Still missing: smart LOB
+   bind/write (`informix.ifx_lo_create`,
+   `SQ_LODATA LO_WRITE`) and the ODBC `SQLBindParameter` surface for it -
+   deliberately scoped as follow-on work, matching every other type's
+   established fetch-then-bind-then-ODBC-surface sequencing. Gated on
+   decoding `informix.ifx_lo_create`'s wire type `40` return value, not
+   yet reverse-engineered (see `docs/protocol-notes.md`).
 8. **No real generated-key retrieval.** The `SQ_INSERTDONE` wire field is
    decoded, but the driver never sends the extra "SGK" request the server
    needs to actually populate it, so every INSERT currently reports a
@@ -534,13 +560,18 @@ polish don't block that.
    bind, and the full ODBC surface (`SQLBindParameter`/`SQLGetData`/
    `SQLBindCol`, including a new resumable-chunk `SQLGetData` mechanism -
    see item 7) are all done and confirmed live**. Smart LOB **fetch is now
-   done too** at the sqli layer (`SqliConnection::fetchSmartLob` - the
-   fastpath RPC subsystem plus `SQ_LODATA`, confirmed live including a
-   multi-chunk value and NULL - see `docs/protocol-notes.md`), found only
-   after getting a real JDBC driver protocol trace against the same dev
+   done end to end too, sqli layer and ODBC layer** - `SqliConnection::
+   fetchSmartLob` (the fastpath RPC subsystem plus `SQ_LODATA`) wired onto
+   `SQLGetData`/`SQLBindCol` (`driver/statement.cpp`), confirmed live
+   through the real unixODBC Driver Manager including a 75000-byte value
+   across 20 chunked `SQLGetData` calls, byte-exact - see
+   `docs/protocol-notes.md`. The sqli-layer piece was found only after
+   getting a real JDBC driver protocol trace against the same dev
    container (two plausible-looking framings guessed from the decompiled
    source alone both hung live first). Still remaining: smart LOB
-   bind/write and its own ODBC driver-layer surface.**
+   bind/write (gated on decoding `informix.ifx_lo_create`'s wire type `40`
+   return, captured in the same trace but not yet reverse-engineered) and
+   its own ODBC `SQLBindParameter` surface.**
    Blocking: a real Informix database backup/restore tool can't skip
    columns of a type it doesn't support.
 2. **Decide and prototype the BOP integration mechanism** (CGO, subprocess

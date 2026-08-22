@@ -1265,16 +1265,57 @@ contradicted by observed behavior (as it was for both the missing
 protocol trace from the vendor's own driver rather than continuing to
 iterate on guessed field shapes.
 
+**ODBC driver-layer fetch surface: confirmed live.** `driver/statement.cpp`'s
+`writeSmartLobColumnValue` wires `SQLGetData`/`SQLBindCol` onto
+`fetchSmartLob`, mirroring simple LOBs' own ODBC-layer wiring
+(`writeSimpleLobColumnValue`) - both now share a `writeLobBytesFromState`
+helper for the resumable-offset copy-into-buffer logic once content is in
+memory, since that part is identical between the two LOB mechanisms even
+though how `content` gets populated differs. `isSmartLobColumn` (checks
+`ifxType == kBoolean` plus `extendedTypeName == "blob"/"clob"`) is the
+single place that distinguishes a smart LOB column from a real BOOLEAN one
+at the driver layer, consulted by `sqlTypeFor`/`columnSizeFor`
+(`SQLDescribeCol`/`SQLColAttribute` report `SQL_LONGVARBINARY`/
+`SQL_LONGVARCHAR`, matching simple LOBs' own type mapping) and by
+`writeColumnValue`'s dispatch. Confirmed live through the real unixODBC
+Driver Manager (`isql`, plus a direct `SQLGetData`-loop harness against
+libodbc.so): a small BLOB/CLOB value, a NULL value reported correctly via
+`SQLGetData`'s indicator, a 75000-byte value spanning 20 chunked
+`SQLGetData` calls with a 4096-byte buffer (byte-exact against the source
+file), and `SQLBindCol` with a deliberately undersized buffer (correct
+`01004`/truncated-string contract).
+
+**`SQLColumns` now reports BLOB/CLOB correctly too** (`driver/catalog.cpp`).
+This one isn't optional the way a missing feature would be: `kTypeMap`/
+`caseColumnSize`/`caseTypeName` are keyed by `basetype` alone, and BLOB/CLOB
+share `basetype`(`ifxBaseType`) 41 with BOOLEAN - without a fix, `SQLColumns`
+would have actively mislabeled every BLOB/CLOB column as `SQL_BIT`/
+`"boolean"`/`COLUMN_SIZE=1` (confirmed live before the fix, via
+`syscolumns`: both `b`/`c` test columns report `coltype=41` same as a real
+BOOLEAN would). The discriminator at this layer is `syscolumns.extended_id`
+(10=blob, 11=clob, confirmed live - same values `sysxtdtypes` reports for
+their `name`/`owner` rows), added to `buildColumnsSql`'s inner derived
+table alongside `basetype`/`nullable_flag`. `wrapSmartLob` wraps the
+existing basetype-keyed CASE expressions for `DATA_TYPE`/`TYPE_NAME`/
+`COLUMN_SIZE`/`SQL_DATA_TYPE` with two higher-priority branches so BLOB/CLOB
+report `SQL_LONGVARBINARY`/`"blob"`/`SQL_LONGVARCHAR`/`"clob"` (matching
+simple LOBs' own mapping) instead of falling through to BOOLEAN's. Confirmed
+live via a direct `SQLColumns` call: `b` now reports
+`DATA_TYPE=-4 TYPE_NAME=blob COLUMN_SIZE=2147483647`, `c` reports
+`DATA_TYPE=-1 TYPE_NAME=clob COLUMN_SIZE=2147483647`. `SQLGetTypeInfo`
+doesn't go through this file's catalog-query mechanism at all (it
+synthesizes rows directly from `kTypeMap` in C++), so it still has no
+BLOB/CLOB rows - a real, separate gap, not fixed here.
+
 **Not yet implemented**: bind/write (`informix.ifx_lo_create`, `SQ_LODATA`
-`LO_WRITE`) and the ODBC driver-layer surface (`SQLGetData`/
-`SQLBindParameter` for BLOB/CLOB) - deliberately scoped as follow-on work,
-matching this project's established fetch-first sequencing (simple LOBs,
-INTERVAL, DATETIME FRACTION all landed fetch-then-bind-then-ODBC-surface
-in that order). The `informix.ifx_lo_create` fastpath call was captured in
-the same golden trace (return value type `40`, not `44` - a genuinely
-different wire type code for the *created* locator than the `44` used to
-*bind* one in, not yet reverse-engineered) if a future session picks this
-up.
+`LO_WRITE`) and the ODBC `SQLBindParameter` surface for BLOB/CLOB -
+deliberately scoped as follow-on work, matching this project's established
+fetch-first sequencing (simple LOBs, INTERVAL, DATETIME FRACTION all landed
+fetch-then-bind-then-ODBC-surface in that order). The `informix.ifx_lo_create`
+fastpath call was captured in the same golden trace (return value type `40`,
+not `44` - a genuinely different wire type code for the *created* locator
+than the `44` used to *bind* one in, not yet reverse-engineered) if a future
+session picks this up.
 
 ## Transactions
 
