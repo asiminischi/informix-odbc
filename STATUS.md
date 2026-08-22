@@ -482,9 +482,19 @@ Roughly in the order they'd bite a real application:
    bind/write (`informix.ifx_lo_create`,
    `SQ_LODATA LO_WRITE`) and the ODBC `SQLBindParameter` surface for it -
    deliberately scoped as follow-on work, matching every other type's
-   established fetch-then-bind-then-ODBC-surface sequencing. Gated on
-   decoding `informix.ifx_lo_create`'s wire type `40` return value, not
-   yet reverse-engineered (see `docs/protocol-notes.md`).
+   established fetch-then-bind-then-ODBC-surface sequencing. The wire type
+   `40` return value that previously blocked this is now decoded (a second
+   golden JDBC trace, this time captured via a raw TCP proxy since the
+   driver's own text trace omitted that field's byte dump): it's the same
+   `[4-byte length][72-byte locator]` shape used everywhere else in this
+   driver, and `ifx_lo_create`'s full 3-param bind shape, 2-value return
+   shape, and `LO_WRITE`'s request/reply shape are all confirmed live too
+   (see `docs/protocol-notes.md`). What's still genuinely open: the
+   600-byte `ifx_lo_spec` creation-spec parameter's field layout isn't
+   understood, and the captured live sample has this dev container's
+   sbspace name baked in, so it isn't safely reusable verbatim across
+   environments. Implementation is gated on resolving whether a portable
+   spec exists, not on any remaining wire-format unknown.
 8. **No real generated-key retrieval.** The `SQ_INSERTDONE` wire field is
    decoded, but the driver never sends the extra "SGK" request the server
    needs to actually populate it, so every INSERT currently reports a
@@ -569,9 +579,10 @@ polish don't block that.
    getting a real JDBC driver protocol trace against the same dev
    container (two plausible-looking framings guessed from the decompiled
    source alone both hung live first). Still remaining: smart LOB
-   bind/write (gated on decoding `informix.ifx_lo_create`'s wire type `40`
-   return, captured in the same trace but not yet reverse-engineered) and
-   its own ODBC `SQLBindParameter` surface.**
+   bind/write and its own ODBC `SQLBindParameter` surface - the wire type
+   `40` return that previously blocked this is now decoded, gated instead
+   on whether `ifx_lo_create`'s 600-byte creation-spec parameter has a
+   portable (non-environment-specific) form (see `docs/protocol-notes.md`).**
    Blocking: a real Informix database backup/restore tool can't skip
    columns of a type it doesn't support.
 2. **Decide and prototype the BOP integration mechanism** (CGO, subprocess

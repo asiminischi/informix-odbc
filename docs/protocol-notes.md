@@ -1311,11 +1311,107 @@ BLOB/CLOB rows - a real, separate gap, not fixed here.
 `LO_WRITE`) and the ODBC `SQLBindParameter` surface for BLOB/CLOB -
 deliberately scoped as follow-on work, matching this project's established
 fetch-first sequencing (simple LOBs, INTERVAL, DATETIME FRACTION all landed
-fetch-then-bind-then-ODBC-surface in that order). The `informix.ifx_lo_create`
-fastpath call was captured in the same golden trace (return value type `40`,
-not `44` - a genuinely different wire type code for the *created* locator
-than the `44` used to *bind* one in, not yet reverse-engineered) if a future
-session picks this up.
+fetch-then-bind-then-ODBC-surface in that order).
+
+**Write-path framing: mostly decoded, one open question remains (the LO_SPEC
+struct).** A second golden-trace session (same technique as the fetch path:
+`jdbc-4.50.10.jar`, `TRACE=3`/`TRACEFILE` connection properties plus raised
+`java.util.logging` level) captured a real `PreparedStatement.setBytes()`
+insert into a BLOB column. This time the JDBC driver's own text trace omitted
+byte counts for the one field that mattered (the type-`40` return value showed
+no `Data (N bytes)` line at all, unlike every other field), so the capture was
+redone through a small raw TCP proxy (`python3`, listening on 19088, forwarding
+to the container's 9088 and hex-dumping both directions) so the actual wire
+bytes could be inspected directly rather than trusting the driver's own
+(incomplete) trace formatter.
+
+- `informix.ifx_lo_create` resolves via `SQ_GETROUTINE` exactly like
+  `ifx_lo_open`/`ifx_lo_close` (same 4-byte signature length, same DbName/
+  handle reply shape) - signature confirmed live as
+  `"function informix.ifx_lo_create( ifx_lo_spec,integer,blob)"`.
+- **Bind shape (3 params, confirmed live byte-for-byte)**:
+  1. `ifx_lo_spec` (UDT, `ifxtype::kUdt`=44, ExtendedOwner=`""`,
+     ExtendedTypeName=`"ifx_lo_spec"`): a **600-byte** opaque creation-spec
+     structure, no length prefix on the wire (its size is evidently a fixed,
+     out-of-band constant for this UDT, the same way `blob`'s own 76-byte
+     locator payload has none - confirmed live via exact byte-count
+     reconciliation, see below). **Not yet reverse-engineered field-by-field.**
+     The captured 600 bytes are mostly zero/`0xFFFFFFFF` (a common "use
+     default" sentinel), but the target column's own sbspace name (`sbspace1`,
+     this project's dev container) is embedded verbatim as an ASCII string
+     inside the struct - meaning the captured bytes are almost certainly
+     environment-specific, not safely reusable verbatim as a portable
+     default across any table/sbspace. Whether a genuinely portable
+     "use the column's own schema default" spec exists (e.g. an all-zero or
+     all-sentinel 600 bytes with no explicit sbspace name) is unresolved and
+     blocks a clean implementation - see the open question below.
+  2. Plain `INTEGER` (mode flags): precision `2560` (the same fastpath-only
+     precision convention `ifx_lo_open`'s mode parameter uses), value `8`
+     (matches `fetchSmartLob`'s own `kLoOpenMode`).
+  3. `blob`-typed UDT locator (`ExtendedOwner=""`, `ExtendedTypeName="blob"`,
+     76-byte `[4-byte length=72][72-byte locator]` payload): a *template*
+     locator, not a real one - unclear whether its content matters (worth
+     testing with an all-zero payload before assuming it needs to be a real
+     captured locator).
+- **Return shape (2 values, confirmed live byte-for-byte)**: total message
+  size 102 bytes reconciles exactly as opcode(2) + returnCount(2) + return#1
+  (86) + return#2(10) + EOT(2) = 102.
+  1. **Type `40`** (the "New locator" the JDBC trace's own text formatter
+     failed to log any data for - the actual gap this session closed):
+     `type(2)=40, ExtendedOwner len(2)=0, ExtendedTypeName len(2)=0,
+     indicator(2)=0, precision(2)=0, dataLen(4)=72, data(72 bytes)` - i.e.
+     **the exact same `[4-byte length][72-byte locator]` shape** `fetchSmartLob`
+     already treats opaquely everywhere else in this driver, just wrapped in
+     an extended-type return-value header instead of a TUPLE row's null-flag
+     header. `ExtendedOwner`/`ExtendedTypeName` are genuinely empty here
+     (confirmed live), unlike a plain UDT-typed row/bind value.
+  2. Plain `INTEGER`: the file descriptor (confirmed live as `39` in this
+     capture), same shape `receiveFpRoutineIntReturn` already decodes for
+     `ifx_lo_open`'s single return value - i.e. `ifx_lo_create` is
+     `receiveFpRoutineIntReturn` plus one preceding locator-shaped return,
+     not a wholly new reply parser.
+- **Locator stability, confirmed live**: the 72 locator bytes returned by
+  `ifx_lo_create` are byte-for-byte identical to the 72 locator bytes later
+  bound into the real `INSERT`'s blob column parameter, after the
+  create/write/close sequence completes - `LO_WRITE` does not mutate the
+  locator's own identity. Safe to hold onto the create-time locator bytes
+  and bind them as-is once writing is done, no need to re-fetch or
+  re-derive them afterward.
+- **One real, confirmed-live asymmetry**: the *fastpath* locator bind
+  parameter (`ifx_lo_open`/`ifx_lo_create`'s own template/input locator,
+  `appendFastPathLocatorParam`'s existing convention) uses
+  `ExtendedOwner=""`, but the **ordinary column bind** for the final
+  `INSERT`'s blob parameter uses `ExtendedOwner="informix"` - matching
+  BOOLEAN's own bind convention, not the fastpath one. These are two
+  different bind contexts with two different owner conventions; don't
+  conflate them.
+- **`SQ_LODATA` `LO_WRITE`, confirmed live, request and reply**:
+  - Request: `u16(97 SQ_LODATA) + u16(2 LO_WRITE) + u16(fd) + u32(total bytes
+    to write) + u16(32000 R_W_BUFSIZE) + u16(chunk length) + chunk bytes +
+    ... + SQ_EOT` - the same length-prefixed-chunk shape `LO_READ`'s reply
+    uses, just in the request direction and with an extra total-byte-count
+    field up front (mirroring `LO_READ`'s own "declare an upper bound"
+    field). Only a single, small (26-byte) chunk was exercised live; larger
+    values presumably need multiple chunks summing to the declared total,
+    by analogy with `LO_READ`'s reply, but that's extrapolation, not yet
+    confirmed for a real multi-chunk write.
+  - Reply: `u16(97) + u16(2) + u32(bytes written) + SQ_EOT` - exactly the
+    shape already predicted (without live confirmation) in the previous
+    revision of this note, now confirmed live.
+
+**Open question blocking a clean implementation**: whether a portable
+(non-environment-specific) `ifx_lo_spec` exists. Two ways to resolve it,
+neither attempted yet:
+1. Cheap: capture a third golden trace against a table with no `PUT ... IN`
+   clause (system-default sbspace) and check whether the spec's sbspace
+   field comes back empty/sentinel rather than a real name.
+2. Definitive: a C++ probe that first replays the captured 600 bytes
+   verbatim (guaranteed valid, since it's exactly what the real JDBC driver
+   sent) to prove out the create/write/close sequence end-to-end from this
+   driver's own code, then bisects individual fields toward zero/sentinel
+   values to find the minimal spec that's still accepted.
+Shipping the captured 600 bytes verbatim (hardcoding `sbspace1`) would only
+work against this exact dev container and was deliberately not done.
 
 ## Transactions
 
