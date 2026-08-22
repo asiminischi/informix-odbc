@@ -15,3 +15,9 @@ target_link_libraries(bind_integration_test PRIVATE ifx_sqli)
 
 add_test(NAME bind_integration COMMAND bind_integration_test)
 set_tests_properties(bind_integration PROPERTIES LABELS "integration")
+
+add_executable(smart_lob_integration_test test_smart_lob.cpp)
+target_link_libraries(smart_lob_integration_test PRIVATE ifx_sqli)
+
+add_test(NAME smart_lob_integration COMMAND smart_lob_integration_test)
+set_tests_properties(smart_lob_integration PROPERTIES LABELS "integration")

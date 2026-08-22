@@ -71,6 +71,17 @@ inline constexpr int kBooleanBindType = 45;
 // uses its own kBooleanBindType instead), only the fastpath subsystem's
 // own SQ_BIND sub-block.
 inline constexpr int kUdt = 44;
+// LVARCHAR's own base type code (long varchar) - confirmed live as
+// informix.ifx_lo_col_sbinfo's own first-parameter type (the target
+// column's "table.column" identifier), a fastpath call
+// SqliConnection::createSmartLob makes. Unlike kUdt, this isn't a generic
+// opaque-UDT wrapper - lvarchar is its own scalar-ish type - but on the
+// wire it's still extended-framed (type > 18) with the exact same
+// [ExtendedOwner][ExtendedTypeName="lvarchar"][indicator][precision]
+// [4-byte length][bytes] shape kUdt parameters use (confirmed live -
+// see appendFastPathLvarcharParam in sqli/connection.cpp). Not used
+// anywhere else in this driver yet (no LVARCHAR column/bind support).
+inline constexpr int kLvarchar = 43;
 } // namespace ifxtype
 
 // A decoded calendar DATETIME value. Any contiguous qualifier span within

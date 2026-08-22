@@ -4,6 +4,8 @@
 #include "sqli/protocol.h"
 #include "sqli/types.h"
 
+#include <algorithm>
+#include <array>
 #include <cstdio>
 #include <optional>
 #include <utility>
@@ -458,15 +460,50 @@ void appendFastPathIntParam(ByteWriter& w, std::int32_t value) {
     w.bytes(encodeInteger(value));
 }
 
-// Appends one SQ_BIND-shaped UDT-wrapped fastpath parameter body carrying
-// a smart LOB locator. `payload` must be exactly [4-byte big-endian
-// length=72][72-byte locator bytes] - see fetchSmartLob's doc comment.
-// ExtendedOwner is the empty string, not "informix" - confirmed live via
-// the golden trace (unlike BOOLEAN's bind, which does use "informix"; see
-// ifxtype::kUdt's doc comment). ExtendedTypeName is unconditionally
-// "blob", matching informix.ifx_lo_open's own function signature
-// (`function informix.ifx_lo_open(blob ,integer)`) regardless of whether
-// the real column is BLOB or CLOB - confirmed live.
+// Appends one SQ_BIND-shaped UDT-wrapped fastpath parameter body: type,
+// ExtendedOwner (always empty for a fastpath call's own parameters -
+// confirmed live via the golden trace, unlike BOOLEAN's or a smart LOB's
+// *ordinary column* bind, both of which use "informix" - see
+// ifxtype::kUdt's doc comment and createSmartLob's own INSERT-bind
+// encoding), ExtendedTypeName, indicator, precision=0, then the payload
+// self-length-prefixed as [4-byte big-endian length][that many bytes],
+// padded to even. This single shape, confirmed live, covers every
+// fastpath UDT parameter this driver sends: a smart LOB locator
+// (typeName="blob", 72-byte payload - what this function was originally
+// written for), an ifx_lo_spec creation-spec (typeName="ifx_lo_spec",
+// 596-byte payload), and (via appendFastPathLvarcharParam below, which
+// shares this same wire shape despite lvarchar being its own base type
+// code rather than a UDT) a column-name string.
+void appendFastPathExtendedParam(ByteWriter& w, std::uint16_t type, std::string_view typeName,
+                                  std::span<const std::byte> payload) {
+    w.u16(type);
+    w.ifxChar2("");
+    w.ifxChar2(typeName);
+    w.u16(0); // indicator: not NULL
+    w.u16(0); // precision
+    w.u32(static_cast<std::uint32_t>(payload.size()));
+    w.bytes(payload);
+    if (payload.size() & 1) w.u8(0);
+}
+
+// `payload` must be exactly [4-byte big-endian length=72][72-byte locator
+// bytes] - see fetchSmartLob's doc comment. ExtendedTypeName is
+// unconditionally "blob", matching informix.ifx_lo_open's own function
+// signature (`function informix.ifx_lo_open(blob ,integer)`) regardless
+// of whether the real column is BLOB or CLOB - confirmed live.
+//
+// Deliberately does NOT go through appendFastPathExtendedParam's own
+// auto length-prefixing: `payload` already carries its own leading
+// 4-byte length (the locator's own shape, identical to a TUPLE row's
+// smart-LOB column slice minus its leading null-flag byte) - the wire
+// has exactly one length field here, confirmed live. An earlier version
+// of this function routed through appendFastPathExtendedParam and added
+// a second, outer length field on top of that, which is a genuine
+// double-encoding bug: it broke fetchSmartLob for every locator
+// (self-created or not) with sqlcode -937 "blobrecv", caught by
+// comparing a locator round-tripped through a real JDBC driver (which
+// read it fine) against this driver's own fetchSmartLob (which
+// mis-parsed its own malformed request and got the UDR error back).
 void appendFastPathLocatorParam(ByteWriter& w, std::span<const std::byte> payload) {
     w.u16(ifxtype::kUdt);
     w.ifxChar2("");
@@ -475,6 +512,20 @@ void appendFastPathLocatorParam(ByteWriter& w, std::span<const std::byte> payloa
     w.u16(0); // precision
     w.bytes(payload);
     if (payload.size() & 1) w.u8(0);
+}
+
+// A fastpath lvarchar-typed parameter (only used by
+// informix.ifx_lo_col_sbinfo's first argument so far, confirmed live -
+// see createSmartLob). lvarchar is its own base type code (43, "L" for
+// long varchar), not a UDT wrapper the way blob/ifx_lo_spec are (44) -
+// confirmed live it still uses the exact same
+// [type][ownerLen=0][typeNameLen]["lvarchar"][indicator][precision=0]
+// [4-byte length][bytes] shape appendFastPathExtendedParam already
+// implements, just with ExtendedTypeName="lvarchar" and a plain type
+// code above 18 (still extended-framed) rather than 44.
+void appendFastPathLvarcharParam(ByteWriter& w, std::string_view text) {
+    appendFastPathExtendedParam(w, ifxtype::kLvarchar, "lvarchar",
+                                 std::as_bytes(std::span<const char>(text.data(), text.size())));
 }
 
 // SQ_EXFPROUTINE(102) + its embedded SQ_BIND sub-block, sent as one
@@ -548,17 +599,228 @@ std::expected<std::int32_t, Error> receiveFpRoutineIntReturn(TcpSocket& sock) {
     return value;
 }
 
+// Reads one SQ_FPROUTINE return value's extended/opaque-type framing
+// (type, ExtendedOwner, ExtendedTypeName, indicator, precision) followed
+// by its self-length-prefixed data - confirmed live this is wire type 40
+// for every fastpath call this driver makes that returns a "new object"
+// (informix.ifx_lo_col_sbinfo's resolved spec, informix.ifx_lo_create's
+// new locator), both with empty ExtendedOwner/ExtendedTypeName in every
+// capture so far. Doesn't assume type==40 or empty owner/typeName -
+// reads and returns them generically (a caller that cares can validate),
+// matching this driver's own existing print-what-you-see documentation
+// caveats elsewhere (e.g. SQ_GETROUTINE's dbName echo). NULL (indicator
+// -1) is handled by returning an empty vector rather than misreading a
+// nonexistent length/data field - not confirmed live (no capture so far
+// exercised it), but a defensive read rather than an assumption.
+std::expected<std::vector<std::byte>, Error> readFpRoutineExtendedValue(TcpSocket& sock) {
+    auto type = readU16(sock);
+    if (!type) return std::unexpected(type.error());
+    if (*type <= 18) {
+        return std::unexpected(Error{ErrorKind::Protocol, "expected an extended-type SQ_FPROUTINE return value"});
+    }
+    auto owner = readIfxChar2(sock);
+    if (!owner) return std::unexpected(owner.error());
+    auto typeName = readIfxChar2(sock);
+    if (!typeName) return std::unexpected(typeName.error());
+    auto ind = readU16(sock);
+    if (!ind) return std::unexpected(ind.error());
+    if (!readU16(sock)) {
+        return std::unexpected(Error{ErrorKind::Transport, "read failed (fproutine return precision)"});
+    }
+    if (static_cast<std::int16_t>(*ind) == -1) {
+        return std::vector<std::byte>{};
+    }
+    auto len = readU32(sock);
+    if (!len) return std::unexpected(len.error());
+    auto data = sock.readExactN(*len);
+    if (!data) return std::unexpected(data.error());
+    if (*len & 1) {
+        auto pad = sock.readExactN(1);
+        if (!pad) return std::unexpected(pad.error());
+    }
+    return *data;
+}
+
+// Reads an SQ_FPROUTINE(103) reply shaped as [extended-type return value,
+// then a plain INTEGER return value] - confirmed live this is the shape
+// both informix.ifx_lo_col_sbinfo (the resolved spec, then a status code
+// this driver discards - never observed non-zero) and
+// informix.ifx_lo_create (the new locator, then the fastpath file
+// descriptor - the same INTEGER-return shape receiveFpRoutineIntReturn
+// decodes for informix.ifx_lo_open, precision field also 2560) use, not
+// two unrelated shapes needing their own readers.
+std::expected<std::pair<std::vector<std::byte>, std::int32_t>, Error> receiveExtendedPlusIntReply(TcpSocket& sock) {
+    auto tag = readU16(sock);
+    if (!tag) return std::unexpected(tag.error());
+    if (*tag == opcode::kError) {
+        auto err = readErrorRecord(sock);
+        if (!err) return std::unexpected(err.error());
+        return std::unexpected(*err);
+    }
+    if (*tag != opcode::kFpRoutine) {
+        return std::unexpected(Error{ErrorKind::Protocol, "unexpected reply tag to SQ_EXFPROUTINE"});
+    }
+    auto count = readU16(sock);
+    if (!count) return std::unexpected(count.error());
+    if (*count != 2) {
+        return std::unexpected(Error{ErrorKind::Protocol, "unexpected SQ_FPROUTINE return count"});
+    }
+
+    auto extended = readFpRoutineExtendedValue(sock);
+    if (!extended) return std::unexpected(extended.error());
+
+    auto intType = readU16(sock);
+    if (!intType) return std::unexpected(intType.error());
+    if (*intType != ifxtype::kInteger) {
+        return std::unexpected(Error{ErrorKind::Protocol, "unexpected second SQ_FPROUTINE return type"});
+    }
+    auto intInd = readU16(sock);
+    if (!intInd) return std::unexpected(intInd.error());
+    if (!readU16(sock)) {
+        return std::unexpected(Error{ErrorKind::Transport, "read failed (fproutine second return precision)"});
+    }
+    std::int32_t intValue = 0;
+    if (static_cast<std::int16_t>(*intInd) != -1) {
+        auto v = readU32(sock);
+        if (!v) return std::unexpected(v.error());
+        intValue = static_cast<std::int32_t>(*v);
+    }
+
+    auto eot = readU16(sock);
+    if (!eot) return std::unexpected(eot.error());
+    if (*eot != opcode::kEot) {
+        return std::unexpected(Error{ErrorKind::Protocol, "missing SQ_EOT after SQ_FPROUTINE reply"});
+    }
+    return std::make_pair(*extended, intValue);
+}
+
+// informix.ifx_lo_create's own ifx_lo_spec parameter needs a starting
+// template - resolved per-column by informix.ifx_lo_col_sbinfo before
+// use (see createSmartLob), not sent to ifx_lo_create directly. Captured
+// byte-for-byte from a real JDBC driver's own such template via a golden
+// protocol trace (jdbc-4.50.10.jar, TRACE=3, routed through a raw TCP
+// proxy - see docs/protocol-notes.md's Smart large objects section).
+// Mostly zero/0xFFFFFFFF ("use default") sentinel bytes; the leading 8
+// bytes ("da da fe ed 00 00 00 00") look like a fixed struct magic/version
+// tag rather than anything session-specific, confirmed identical across
+// every capture regardless of target column or sbspace.
+constexpr std::array<std::uint8_t, 596> kSmartLobSpecTemplate = {
+    0xda, 0xda, 0xfe, 0xed, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+    0xff, 0xff, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
+};
+
+// LO_RDWR - the exact mode value confirmed live via the JDBC golden-capture
+// trace for both informix.ifx_lo_open (fetchSmartLob) and
+// informix.ifx_lo_create (createSmartLob); LO_RDONLY is untested and, since
+// the mode value isn't otherwise validated by this driver, not worth an
+// extra live check to swap in for a fetch-only code path.
+constexpr std::int32_t kLoOpenMode = 8;
+
+// SQ_LODATA(97)/LO_WRITE(2): the mirror-image request of fetchSmartLob's own
+// LO_READ - u16(fd) + u32(total byte count) + u16(32000 R_W_BUFSIZE), then
+// the content itself as length-prefixed chunks (u16 length + that many
+// bytes, padded to even - the same shape LO_READ's reply chunks use, just
+// in the request direction), then SQ_EOT. Confirmed live for a single small
+// (26-byte) chunk; larger content is chunked here at a conservative 30000
+// bytes per chunk (safely under the 32000 R_W_BUFSIZE and the u16 length
+// field's own 65535 ceiling) - the multi-chunk case itself is not yet
+// confirmed live (extrapolated from LO_READ's own confirmed multi-chunk
+// reply shape, not independently verified for the write direction).
+//
+// Reply: u16(97) + u16(2) + u32(bytes written) + SQ_EOT, confirmed live -
+// no chunk stream in the reply, unlike LO_READ's.
+std::expected<void, Error> writeLoData(TcpSocket& sock, std::int32_t fd, std::span<const std::byte> content) {
+    constexpr std::size_t kMaxChunk = 30000;
+
+    ByteWriter req;
+    req.u16(opcode::kLoData);
+    req.u16(2); // LO_WRITE
+    req.u16(static_cast<std::uint16_t>(fd));
+    req.u32(static_cast<std::uint32_t>(content.size()));
+    req.u16(32000); // R_W_BUFSIZE
+    std::size_t offset = 0;
+    while (offset < content.size()) {
+        std::size_t chunkLen = std::min(kMaxChunk, content.size() - offset);
+        req.u16(static_cast<std::uint16_t>(chunkLen));
+        req.bytes(content.subspan(offset, chunkLen));
+        if (chunkLen & 1) req.u8(0);
+        offset += chunkLen;
+    }
+    req.u16(opcode::kEot);
+    if (auto r = sock.writeAll(req.view()); !r) return std::unexpected(r.error());
+
+    auto tag = readU16(sock);
+    if (!tag) return std::unexpected(tag.error());
+    if (*tag == opcode::kError) {
+        auto err = readErrorRecord(sock);
+        if (!err) return std::unexpected(err.error());
+        return std::unexpected(*err);
+    }
+    if (*tag != opcode::kLoData) {
+        return std::unexpected(Error{ErrorKind::Protocol, "unexpected reply tag to SQ_LODATA (LO_WRITE)"});
+    }
+    auto optype = readU16(sock);
+    if (!optype) return std::unexpected(optype.error());
+    if (*optype != 2) {
+        return std::unexpected(Error{ErrorKind::Protocol, "unexpected SQ_LODATA optype in LO_WRITE reply"});
+    }
+    auto bytesWritten = readU32(sock);
+    if (!bytesWritten) return std::unexpected(bytesWritten.error());
+    if (*bytesWritten != content.size()) {
+        return std::unexpected(Error{ErrorKind::Protocol,
+            "SQ_LODATA LO_WRITE wrote " + std::to_string(*bytesWritten) + " bytes, expected " +
+                std::to_string(content.size())});
+    }
+    auto eot = readU16(sock);
+    if (!eot) return std::unexpected(eot.error());
+    if (*eot != opcode::kEot) {
+        return std::unexpected(Error{ErrorKind::Protocol, "missing SQ_EOT after SQ_LODATA LO_WRITE reply"});
+    }
+    return {};
+}
+
 } // namespace
 
 std::expected<std::vector<std::byte>, Error> SqliConnection::fetchSmartLob(std::span<const std::byte> locatorPayload) {
     auto openHandle = getRoutineHandle(sock_, "function informix.ifx_lo_open(blob ,integer)");
     if (!openHandle) return std::unexpected(openHandle.error());
 
-    // LO_RDWR(8), not LO_RDONLY(4) - the exact mode value confirmed live via
-    // the JDBC golden-capture trace; LO_RDONLY is untested and, since the
-    // mode value isn't otherwise validated by this driver, not worth an
-    // extra live check to swap in for a fetch-only code path.
-    constexpr std::int32_t kLoOpenMode = 8;
     ByteWriter openParams;
     appendFastPathLocatorParam(openParams, locatorPayload);
     appendFastPathIntParam(openParams, kLoOpenMode);
@@ -638,6 +900,70 @@ std::expected<std::vector<std::byte>, Error> SqliConnection::fetchSmartLob(std::
     if (!closeStatus) return std::unexpected(closeStatus.error());
 
     return content;
+}
+
+std::expected<std::vector<std::byte>, Error> SqliConnection::createSmartLob(std::string_view tableDotColumn,
+                                                                              std::span<const std::byte> content) {
+    // Step 1: resolve a column-specific creation spec. informix.ifx_lo_
+    // col_sbinfo(lvarchar, ifx_lo_spec) takes the target column's
+    // "table.column" name plus a fixed starting template
+    // (kSmartLobSpecTemplate) and returns a resolved spec with the
+    // column's own schema-declared sbspace (and a couple of other fields)
+    // patched in - confirmed live this is what ifx_lo_create actually
+    // needs, not the template directly (see docs/protocol-notes.md).
+    auto sbinfoHandle = getRoutineHandle(sock_, "function informix.ifx_lo_col_sbinfo(lvarchar,ifx_lo_spec)");
+    if (!sbinfoHandle) return std::unexpected(sbinfoHandle.error());
+
+    ByteWriter sbinfoParams;
+    appendFastPathLvarcharParam(sbinfoParams, tableDotColumn);
+    appendFastPathExtendedParam(sbinfoParams, ifxtype::kUdt, "ifx_lo_spec",
+                                 std::as_bytes(std::span(kSmartLobSpecTemplate)));
+    if (auto r = sendExfpRoutine(sock_, sbinfoHandle->first, sbinfoHandle->second, sbinfoParams.view(), 2); !r) {
+        return std::unexpected(r.error());
+    }
+    auto sbinfoResult = receiveExtendedPlusIntReply(sock_);
+    if (!sbinfoResult) return std::unexpected(sbinfoResult.error());
+    auto& resolvedSpec = sbinfoResult->first;
+
+    // Step 2: create the smart LOB. informix.ifx_lo_create(ifx_lo_spec,
+    // integer, blob) takes the resolved spec, an open mode, and a blank
+    // template locator (an all-zero 72-byte payload - confirmed live this
+    // is what the real driver sends here too, not a real locator; the
+    // parameter exists to satisfy the function's own signature, not to
+    // carry input data), and returns the new locator plus a fastpath file
+    // descriptor for the write that follows.
+    auto createHandle = getRoutineHandle(sock_, "function informix.ifx_lo_create( ifx_lo_spec,integer,blob)");
+    if (!createHandle) return std::unexpected(createHandle.error());
+
+    ByteWriter createParams;
+    appendFastPathExtendedParam(createParams, ifxtype::kUdt, "ifx_lo_spec", resolvedSpec);
+    appendFastPathIntParam(createParams, kLoOpenMode);
+    std::array<std::byte, 72> blankLocator{};
+    appendFastPathExtendedParam(createParams, ifxtype::kUdt, "blob", blankLocator);
+    if (auto r = sendExfpRoutine(sock_, createHandle->first, createHandle->second, createParams.view(), 3); !r) {
+        return std::unexpected(r.error());
+    }
+    auto created = receiveExtendedPlusIntReply(sock_);
+    if (!created) return std::unexpected(created.error());
+    auto& [newLocator, fd] = *created;
+
+    // Step 3: write the content, then close the fastpath file handle -
+    // the locator's own identity is unaffected by either (confirmed live
+    // it's byte-for-byte the same value later bound into the real
+    // INSERT), so newLocator can be returned as-is once these succeed.
+    if (auto r = writeLoData(sock_, fd, content); !r) return std::unexpected(r.error());
+
+    auto closeHandle = getRoutineHandle(sock_, "function informix.ifx_lo_close(integer)");
+    if (!closeHandle) return std::unexpected(closeHandle.error());
+    ByteWriter closeParams;
+    appendFastPathIntParam(closeParams, fd);
+    if (auto r = sendExfpRoutine(sock_, closeHandle->first, closeHandle->second, closeParams.view(), 1); !r) {
+        return std::unexpected(r.error());
+    }
+    auto closeStatus = receiveFpRoutineIntReturn(sock_);
+    if (!closeStatus) return std::unexpected(closeStatus.error());
+
+    return newLocator;
 }
 
 namespace {

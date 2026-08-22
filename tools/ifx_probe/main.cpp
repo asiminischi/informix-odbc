@@ -273,6 +273,16 @@ int main(int argc, char** argv) {
                         col.name.c_str(), col.ifxType, col.notNull ? " NOT NULL" : "", col.encodedLength,
                         col.extendedId, col.extendedOwnerName.c_str(), col.extendedTypeName.c_str());
         }
+        std::printf("paramDescs (statementType=%d, paramCount=%zu):\n", stmt->statementType(), stmt->paramCount());
+        for (const auto& col : stmt->paramDescs()) {
+            std::printf("  %-20s type=%d%s encodedLength=%u extendedId=%u owner=\"%s\" name=\"%s\"\n",
+                        col.name.c_str(), col.ifxType, col.notNull ? " NOT NULL" : "", col.encodedLength,
+                        col.extendedId, col.extendedOwnerName.c_str(), col.extendedTypeName.c_str());
+        }
+        if (!stmt->paramDescs().empty()) {
+            std::printf("(param describe test - skipping execute)\n");
+            return 0;
+        }
 
         if (auto r = stmt->execute(); !r) {
             std::fprintf(stderr, "execute failed: %s\n", r.error().message.c_str());

@@ -93,6 +93,19 @@ public:
     }
     [[nodiscard]] int statementType() const { return statementType_; }
 
+    // Input parameter placeholder descriptions, for a non-SELECT statement
+    // with "?" markers only - the mirror image of columns() above, exposing
+    // the same underlying columns_ storage from the other side of the same
+    // hasResultSet() split (see columns()'s doc comment for why DESCRIBE
+    // reuses one reply shape for both meanings). Empty for a SELECT (where
+    // DESCRIBE reports output columns instead, even if the SELECT also has
+    // its own "?" markers - this driver has no way to get parameter
+    // descriptions for that case) or a statement with no placeholders.
+    [[nodiscard]] const std::vector<ColumnDesc>& paramDescs() const {
+        static const std::vector<ColumnDesc> kEmpty;
+        return hasResultSet() ? kEmpty : columns_;
+    }
+
     // True for a SELECT (SQ_SELECT, confirmed via the decompiled JDBC
     // driver's IfxStatementTypes constants against a live DESCRIBE
     // response) - the only statement shape this driver treats as having a

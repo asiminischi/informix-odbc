@@ -128,6 +128,42 @@ public:
     // is the empty string (not "informix", unlike BOOLEAN's bind).
     [[nodiscard]] std::expected<std::vector<std::byte>, Error> fetchSmartLob(std::span<const std::byte> locatorPayload);
 
+    // Creates a new smart LOB (BLOB/CLOB) holding `content` in the sbspace
+    // the target column's own schema declares (its `PUT ... IN` clause, or
+    // the server's configured default if none), and returns the new
+    // locator's raw 72 opaque bytes - the same shape a TUPLE row's own
+    // smart-LOB column slice carries (minus the leading null-flag byte and
+    // 4-byte length prefix), ready to be embedded into an ordinary column
+    // bind for an INSERT/UPDATE (ExtendedOwner="informix",
+    // ExtendedTypeName="blob"/"clob" matching the target column's own type,
+    // precisionField=72, data=[4-byte length=72][the 72 bytes returned
+    // here]).
+    //
+    // `tableDotColumn` must be exactly "table.column" (no database
+    // qualification - confirmed live the server resolves it against the
+    // already-connected database) - the identifier
+    // informix.ifx_lo_col_sbinfo needs to resolve a column-specific
+    // creation spec (sbspace, extent sizes, ...) server-side, given as its
+    // own fastpath call's lvarchar-typed first parameter. This is a
+    // materially different, larger sequence than fetchSmartLob's own
+    // open-read-close: informix.ifx_lo_col_sbinfo(columnName, <a fixed
+    // template spec, see kSmartLobSpecTemplate>) resolves the spec, then
+    // informix.ifx_lo_create(resolvedSpec, LO_RDWR, <a blank template
+    // locator>) creates the LOB and returns (newLocator, fd), then
+    // SQ_LODATA LO_WRITE streams `content` in chunks, then
+    // informix.ifx_lo_close(fd) releases the fastpath file handle (the new
+    // locator's own identity is unaffected by any of the write/close
+    // steps - confirmed live it's byte-for-byte the same value bound into
+    // the real INSERT afterward). Confirmed live against this project's
+    // IDS 14.10 dev container via a real JDBC driver protocol trace
+    // (jdbc-4.50.10.jar, TRACE=3, routed through a raw TCP proxy since the
+    // JDBC driver's own trace formatter omits the byte dump for the
+    // type-40 return value) - see docs/protocol-notes.md's Smart large
+    // objects section for the full writeup, including the exact template
+    // spec bytes and which 28 of its 596 bytes get resolved per column.
+    [[nodiscard]] std::expected<std::vector<std::byte>, Error> createSmartLob(std::string_view tableDotColumn,
+                                                                                std::span<const std::byte> content);
+
     // Exposed for SqliStatement (sqli/statement.h), which sits on top of the
     // same connection and needs to send/receive statement-protocol messages
     // over it directly.

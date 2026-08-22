@@ -478,27 +478,41 @@ Roughly in the order they'd bite a real application:
    `DATA_TYPE=-1 TYPE_NAME=clob` correctly. `SQLGetTypeInfo` still has no
    BLOB/CLOB rows (it synthesizes rows from `kTypeMap` directly, not
    through this catalog-query mechanism) - a real, separate, lower-stakes
-   gap (nothing mislabeled, just absent). Still missing: smart LOB
-   bind/write (`informix.ifx_lo_create`,
-   `SQ_LODATA LO_WRITE`) and the ODBC `SQLBindParameter` surface for it -
-   deliberately scoped as follow-on work, matching every other type's
-   established fetch-then-bind-then-ODBC-surface sequencing. The wire type
-   `40` return value that previously blocked this is now decoded (a second
-   golden JDBC trace, this time captured via a raw TCP proxy since the
-   driver's own text trace omitted that field's byte dump): it's the same
-   `[4-byte length][72-byte locator]` shape used everywhere else in this
-   driver, and `ifx_lo_create`'s full 3-param bind shape, 2-value return
-   shape, and `LO_WRITE`'s request/reply shape are all confirmed live too
-   (see `docs/protocol-notes.md`). What's still genuinely open: the
-   600-byte `ifx_lo_spec` creation-spec parameter isn't a hardcodable
-   constant (its content varied across capture attempts), and a previously-
-   missed fastpath call, `informix.ifx_lo_col_sbinfo(lvarchar,ifx_lo_spec)`,
-   was found preceding `ifx_lo_create` and is hypothesized (not yet
-   confirmed) to be the server-side spec resolver, given a column name.
-   Implementation is gated on confirming that hypothesis within a single,
-   handle-tracked capture (cross-run byte diffing turned out to be
-   unreliable due to nondeterministic TCP chunking), not on any remaining
-   `ifx_lo_create` wire-format unknown, which is fully decoded.
+   gap (nothing mislabeled, just absent). **Smart LOB create/write is now
+   implemented and confirmed live at the sqli layer**:
+   `SqliConnection::createSmartLob` (`sqli/connection.cpp`) runs the full
+   `informix.ifx_lo_col_sbinfo` (resolve a column-specific creation spec)
+   -> `informix.ifx_lo_create` (create the LOB, get a locator + fd) ->
+   `SQ_LODATA LO_WRITE` (stream the content) -> `informix.ifx_lo_close`
+   sequence, then the new locator binds into a real `INSERT` exactly like
+   any other smart-LOB column value. Confirmed live via `tools/ifx_probe`
+   for both BLOB and CLOB columns: written content reads back byte-exact
+   both through this driver's own `fetchSmartLob` (on a separate, fresh
+   connection - not just the one that wrote it) and through a real JDBC
+   driver reading the same row. Also confirmed live through the real
+   unixODBC Driver Manager (WSL2, `isql`): a row written by
+   `SqliConnection::createSmartLob` directly (bypassing the ODBC surface
+   entirely) reads back correctly through this driver's *existing*
+   ODBC-layer smart-LOB fetch path (`writeSmartLobColumnValue` ->
+   `SqliConnection::fetchSmartLob`, from item 7 below) - i.e. the fetch
+   surface genuinely still works end to end after the double-length-prefix
+   regression below was fixed, not just at the sqli layer. No explicit
+   transaction wrapping is needed;
+   default per-statement autocommit is sufficient. A real bug was caught
+   and fixed during this verification: an early refactor made
+   `appendFastPathLocatorParam` double-length-prefix its payload, which
+   silently broke `fetchSmartLob` for every locator (not just self-created
+   ones) with `sqlcode -937: blobrecv` - caught by cross-checking a
+   self-written row against a real JDBC driver's read of the same row (see
+   `docs/protocol-notes.md` for the full writeup and the fix). Still
+   missing: the ODBC `SQLBindParameter` surface for smart LOBs - real
+   `SQLDescribeParam`/`SQLNumParams` support (needed to tell a smart-LOB
+   bind target apart from a simple-LOB one, since ODBC gives no other way
+   to know at bind time), wiring `SQLBindParameter`/`doExecute` to call
+   `createSmartLob` for such params, and parsing the target table name out
+   of the prepared SQL text (not something `SQLDescribeParam` provides) -
+   deliberately scoped as follow-on work. Not yet usable for real
+   backup/restore until that ODBC-layer piece lands.
 8. **No real generated-key retrieval.** The `SQ_INSERTDONE` wire field is
    decoded, but the driver never sends the extra "SGK" request the server
    needs to actually populate it, so every INSERT currently reports a
@@ -582,12 +596,12 @@ polish don't block that.
    `docs/protocol-notes.md`. The sqli-layer piece was found only after
    getting a real JDBC driver protocol trace against the same dev
    container (two plausible-looking framings guessed from the decompiled
-   source alone both hung live first). Still remaining: smart LOB
-   bind/write and its own ODBC `SQLBindParameter` surface - the wire type
-   `40` return that previously blocked this is now decoded, gated instead
-   on confirming a likely `informix.ifx_lo_col_sbinfo` spec-resolver call
-   this session found but didn't fully verify (see
-   `docs/protocol-notes.md`).**
+   source alone both hung live first). Smart LOB **create/write is now done
+   at the sqli layer too** (`SqliConnection::createSmartLob`, confirmed live
+   for BLOB and CLOB, cross-checked against a real JDBC driver's read of the
+   same row - see `docs/protocol-notes.md`). Still remaining: the ODBC
+   `SQLBindParameter` surface for smart LOBs (real `SQLDescribeParam`
+   support, the bind dispatch, and prepared-SQL table-name parsing).**
    Blocking: a real Informix database backup/restore tool can't skip
    columns of a type it doesn't support.
 2. **Decide and prototype the BOP integration mechanism** (CGO, subprocess
