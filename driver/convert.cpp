@@ -155,7 +155,8 @@ std::expected<CellText, ifxsqli::Error> formatCellAsText(const ifxsqli::ColumnDe
             if (!*v) return CellText{true, {}};
             return CellText{false, formatDate(**v)};
         }
-        case ifxtype::kDecimal: {
+        case ifxtype::kDecimal:
+        case ifxtype::kMoney: {
             unsigned precision = (col.encodedLength >> 8) & 0xFF;
             unsigned scale = col.encodedLength & 0xFF;
             auto v = decodeDecimal(raw, precision, scale);

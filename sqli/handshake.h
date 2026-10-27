@@ -17,6 +17,11 @@ struct ConnectParams {
     std::string serverName;   // Informix INFORMIXSERVER (e.g. "informix")
     std::string database;     // optional; empty = no database selected
     std::string appName = "informix-odbc";
+    // Transport-only, never encoded into the connect request: bounds the
+    // TCP connect and every handshake/setup round trip in
+    // SqliConnection::connect, then is cleared, so statements run without a
+    // bound unless the caller sets one via transport().setTimeouts(). 0 = none.
+    int timeoutMs = 0;
 };
 
 struct ConnectResult {

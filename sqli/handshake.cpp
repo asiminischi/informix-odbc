@@ -222,8 +222,14 @@ std::expected<ConnectResult, Error> recvConnectResponse(TcpSocket& sock) {
         }
 
         if (slType == kSlTypeConAccWithErr && svcError != 0) {
-            return std::unexpected(Error{ErrorKind::Server, "server rejected connection (svcError=" +
-                                                                  std::to_string(svcError) + ")"});
+            // svcError is the Informix sqlcode as a signed 16-bit value
+            // (confirmed live: 64585 = -951 bad user/password, 64775 = -761
+            // INFORMIXSERVER mismatch). Using the usual "sqlcode N:" prefix
+            // lets callers extract it the same way as any SQ_ERROR's.
+            auto sqlcode = static_cast<std::int16_t>(svcError);
+            return std::unexpected(Error{ErrorKind::Server, "sqlcode " + std::to_string(sqlcode) +
+                                                                ": server rejected connection (svcError=" +
+                                                                std::to_string(svcError) + ")"});
         }
         return result;
     } catch (const ProtocolError& e) {

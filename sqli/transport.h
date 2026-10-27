@@ -31,7 +31,18 @@ public:
     TcpSocket(TcpSocket&& other) noexcept;
     TcpSocket& operator=(TcpSocket&& other) noexcept;
 
-    [[nodiscard]] static std::expected<TcpSocket, Error> connect(const std::string& host, int port);
+    // timeoutMs > 0 bounds every blocking connect/send/recv on this socket
+    // (SO_RCVTIMEO/SO_SNDTIMEO); 0 means block indefinitely. A timed-out
+    // read leaves the SQLI stream in an unknown state, so callers must treat
+    // the connection as dead afterward rather than retrying on it.
+    [[nodiscard]] static std::expected<TcpSocket, Error> connect(const std::string& host, int port,
+                                                                  int timeoutMs = 0);
+
+    // Re-applies (or, with 0, clears) the same per-operation send/recv bound
+    // on an open socket. Note it limits each individual wait, so a query the
+    // server spends longer than timeoutMs executing - it sends nothing
+    // meanwhile - fails too, closing the stream the same way.
+    void setTimeouts(int timeoutMs);
 
     [[nodiscard]] std::expected<void, Error> writeAll(std::span<const std::byte> data);
     [[nodiscard]] std::expected<void, Error> readExact(std::span<std::byte> out);

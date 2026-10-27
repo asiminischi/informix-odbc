@@ -1,0 +1,44 @@
+{
+  "name": "@postarodiy/informix-native",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Native Node.js client for IBM Informix: speaks the SQLI wire protocol directly, no JDBC, ODBC or proxy needed",
+  "license": "UNLICENSED",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "engines": {
+    "node": ">=18"
+  },
+  "gypfile": true,
+  "files": [
+    "binding.gyp",
+    "lib/",
+    "src/",
+    "scripts/",
+    "vendor/",
+    "prebuilds/",
+    "README.md"
+  ],
+  "scripts": {
+    "preinstall": "node scripts/vendor.js",
+    "install": "node-gyp-build",
+    "build": "node scripts/vendor.js && node-gyp rebuild",
+    "prepack": "node scripts/vendor.js",
+    "test": "node --test test/",
+    "prebuildify": "node scripts/vendor.js && prebuildify --napi --strip --tag-libc",
+    "prebuild:linux": "sh scripts/prebuild-linux.sh"
+  },
+  "dependencies": {
+    "node-addon-api": "^8.0.0",
+    "node-gyp-build": "^4.8.0"
+  },
+  "devDependencies": {
+    "node-gyp": "^11.0.0",
+    "prebuildify": "^6.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/asiminischi/informix-odbc.git",
+    "directory": "node"
+  }
+}

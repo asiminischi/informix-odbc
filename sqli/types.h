@@ -30,6 +30,10 @@ inline constexpr int kSmallFloat = 4;  // 4-byte IEEE 754 single
 inline constexpr int kDecimal = 5;
 inline constexpr int kSerial = 6;
 inline constexpr int kDate = 7;
+// MONEY(p,s): same packed-decimal wire encoding and DESCRIBE encodedLength
+// packing as DECIMAL(p,s) (confirmed live: splitRow/decodeDecimal handle it
+// unchanged); only the declared type differs.
+inline constexpr int kMoney = 8;
 inline constexpr int kDatetime = 10;
 inline constexpr int kVarchar = 13;
 inline constexpr int kNVarchar = 16;
@@ -259,9 +263,9 @@ inline constexpr std::uint16_t kBooleanBindPrecision = 1;
 // for DATE at all, only that 4 doesn't cause an error or desync.
 [[nodiscard]] std::vector<std::byte> encodeDateUnixDays(std::int32_t unixDays);
 
-// Informix packed-decimal DECIMAL(precision,scale): 1 exponent byte + N
-// mantissa bytes (N = ceil(precision/2)), each mantissa byte a base-100
-// digit pair. Confirmed live for both positive and negative values (four
+// Informix packed-decimal DECIMAL(precision,scale): 1 exponent byte +
+// mantissa bytes (see decimalWireWidth for the exact count), each mantissa
+// byte a base-100 digit pair. Confirmed live for both positive and negative values (four
 // independent negative test points): the exponent's sign bit (0x80) plus a
 // biased 7-bit magnitude for positive values; for negative values the low 7
 // bits of the exponent byte are bitwise-complemented (0x7F - x) and the
@@ -274,8 +278,24 @@ inline constexpr std::uint16_t kBooleanBindPrecision = 1;
 // mantissa (confirmed live), handled as a special case since its magnitude
 // exponent isn't a meaningful digit-placement value. Returns an exact
 // decimal string (no floating-point rounding).
+// `scale` 0xFF means floating DECIMAL(p): the result then carries
+// however many fraction digits the value has (trailing zeros stripped)
+// instead of a fixed count.
 [[nodiscard]] std::expected<std::optional<std::string>, Error> decodeDecimal(std::span<const std::byte> raw,
                                                                                unsigned precision, unsigned scale);
+
+// Total wire width (exponent byte included) of a DECIMAL/MONEY(precision,
+// scale) value in a TUPLE row. The integer and fraction digits pair up
+// separately around the decimal point, so an odd scale costs one extra
+// mantissa byte - ESQL/C's DECLEN(p, s) = (p + (s & 1) + 3) / 2. Floating
+// DECIMAL(p) reports scale 0xFF (odd), and the same formula holds for it.
+// Confirmed live for DECIMAL(12,3)/(11,3)/(12,2)/(11,2)/(16)/(15)/(32,15)
+// followed by further columns (node/test/live.test.js).
+[[nodiscard]] constexpr std::size_t decimalWireWidth(unsigned precision, unsigned scale) {
+    return (precision + (scale & 1u) + 3u) / 2u;
+}
+
+inline constexpr unsigned kFloatingDecimalScale = 0xFF;
 
 // One DECIMAL SQ_BIND value: the encoded bytes (ready to hand to
 // BindParam::data) and the scale to use as precisionField. Bundled

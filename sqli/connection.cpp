@@ -77,6 +77,27 @@ std::expected<Error, Error> readErrorRecord(TcpSocket& sock) {
     return Error{ErrorKind::Server, "sqlcode " + std::to_string(sqlcode) + ": " + message};
 }
 
+// For single-reply exchanges (handshake SQ_INFO, the fastpath RPCs) that
+// bail out as soon as they see SQ_ERROR: reads the error record AND the
+// SQ_EOT that terminates the reply. Returning right after the record left
+// that EOT unread, so the *next* request on the connection read it as its
+// own (empty) reply and every later response was off by one - confirmed
+// live: a failed ifx_lo_create (sqlcode -9814, no sbspace) made every
+// later SELECT on the connection silently return zero rows. Anything other
+// than SQ_EOT after the record has no known length here, so it becomes a
+// Protocol error (the caller must then drop the connection) rather than a
+// guess.
+std::expected<Error, Error> readErrorReply(TcpSocket& sock) {
+    auto err = readErrorRecord(sock);
+    if (!err) return std::unexpected(err.error());
+    auto tag = readU16(sock);
+    if (!tag) return std::unexpected(tag.error());
+    if (*tag != opcode::kEot) {
+        return std::unexpected(Error{ErrorKind::Protocol, "unexpected reply tag after SQ_ERROR (" + err->message + ")"});
+    }
+    return *err;
+}
+
 // Sends SQ_PROTOCOLS(126) right after the handshake, per decompiled
 // IfxSqliConnect.enhancedProtocolMechanism()/IfxSqli.{send,receive}Protocols,
 // cross-checked against the golden capture. Unlike most send* helpers here,
@@ -172,7 +193,7 @@ std::expected<void, Error> sendEnv(TcpSocket& sock) {
     auto tag = readU16(sock);
     if (!tag) return std::unexpected(tag.error());
     if (*tag == opcode::kError) {
-        auto err = readErrorRecord(sock);
+        auto err = readErrorReply(sock);
         if (!err) return std::unexpected(err.error());
         return std::unexpected(*err);
     }
@@ -201,8 +222,23 @@ std::expected<void, Error> selectDatabase(TcpSocket& sock, const std::string& da
     w.u16(kSqEot);
     if (auto r = sock.writeAll(w.view()); !r) return r;
 
+    // A missing database (or no permission) answers with an SQ_ERROR record +
+    // SQ_EOT, confirmed live: sqlcode -329, isamcode -111. This used to be
+    // skimmed by the scan below like any other field, so connecting to a
+    // nonexistent database "succeeded" and every later statement failed with
+    // -349 (no database selected) - and a 0x000C inside the error record
+    // could have ended the scan early and desynced the stream.
+    auto first = readU16(sock);
+    if (!first) return std::unexpected(first.error());
+    if (*first == opcode::kError) {
+        auto err = readErrorReply(sock);
+        if (!err) return std::unexpected(err.error());
+        return std::unexpected(*err);
+    }
+    if (*first == kSqEot) return {};
+
     constexpr int kMaxFields = 256;
-    for (int i = 0; i < kMaxFields; ++i) {
+    for (int i = 1; i < kMaxFields; ++i) {
         auto b = sock.readExactN(2);
         if (!b) return std::unexpected(b.error());
         ByteReader r(*b);
@@ -421,7 +457,7 @@ std::expected<std::pair<std::string, std::int32_t>, Error> getRoutineHandle(TcpS
     auto tag = readU16(sock);
     if (!tag) return std::unexpected(tag.error());
     if (*tag == opcode::kError) {
-        auto err = readErrorRecord(sock);
+        auto err = readErrorReply(sock);
         if (!err) return std::unexpected(err.error());
         return std::unexpected(*err);
     }
@@ -559,7 +595,7 @@ std::expected<std::int32_t, Error> receiveFpRoutineIntReturn(TcpSocket& sock) {
     auto tag = readU16(sock);
     if (!tag) return std::unexpected(tag.error());
     if (*tag == opcode::kError) {
-        auto err = readErrorRecord(sock);
+        auto err = readErrorReply(sock);
         if (!err) return std::unexpected(err.error());
         return std::unexpected(*err);
     }
@@ -653,7 +689,7 @@ std::expected<std::pair<std::vector<std::byte>, std::int32_t>, Error> receiveExt
     auto tag = readU16(sock);
     if (!tag) return std::unexpected(tag.error());
     if (*tag == opcode::kError) {
-        auto err = readErrorRecord(sock);
+        auto err = readErrorReply(sock);
         if (!err) return std::unexpected(err.error());
         return std::unexpected(*err);
     }
@@ -788,7 +824,7 @@ std::expected<void, Error> writeLoData(TcpSocket& sock, std::int32_t fd, std::sp
     auto tag = readU16(sock);
     if (!tag) return std::unexpected(tag.error());
     if (*tag == opcode::kError) {
-        auto err = readErrorRecord(sock);
+        auto err = readErrorReply(sock);
         if (!err) return std::unexpected(err.error());
         return std::unexpected(*err);
     }
@@ -1053,7 +1089,7 @@ std::expected<void, Error> SqliConnection::rollbackTransaction() {
 
 std::expected<SqliConnection, Error> SqliConnection::connect(const std::string& host, int port,
                                                                const ConnectParams& params) {
-    auto sock = TcpSocket::connect(host, port);
+    auto sock = TcpSocket::connect(host, port, params.timeoutMs);
     if (!sock) return std::unexpected(sock.error());
 
     auto info = performHandshake(*sock, params);
@@ -1068,6 +1104,8 @@ std::expected<SqliConnection, Error> SqliConnection::connect(const std::string& 
         if (auto r = selectDatabase(*sock, params.database); !r) return std::unexpected(r.error());
     }
 
+    // params.timeoutMs covers connection setup only (see its doc comment).
+    if (params.timeoutMs > 0) sock->setTimeouts(0);
     return SqliConnection(std::move(*sock), std::move(*info), caps->has4ByteOffsets, caps->namedParametersSupported);
 }
 

@@ -542,6 +542,15 @@ marker (per the decompiled `receiveError`) with a slightly different trailing
 shape — this driver drains it and surfaces it as a distinct error rather than
 trying to auto-resync.
 
+In single-reply exchanges (the handshake's SQ_INFO, every fastpath RPC
+reply: SQ_GETROUTINE, SQ_EXFPROUTINE, SQ_LODATA), `SQ_ERROR` is followed by
+an `SQ_EOT` that must be consumed too - confirmed live (`readErrorReply`,
+sqli/connection.cpp). These readers used to return right after the error
+record, leaving that EOT unread: the next request then read it as its own
+(empty) reply and every later response on the connection was off by one -
+a failed `ifx_lo_create` (sqlcode -9814, no sbspace configured) made every
+subsequent SELECT silently return zero rows.
+
 ## Scalar type wire encodings (MVP set)
 
 **Status: verified** — all eight MVP types (`sqli/types.h`/`types.cpp`) confirmed
@@ -584,6 +593,19 @@ TU qualifier byte, `(startField << 4) | endField` (e.g. `YEAR TO SECOND` →
 **DECIMAL(p,s)** — 1 exponent byte + `ceil(p/2)` mantissa bytes, each mantissa
 byte a base-100 digit (0-99). Confirmed with `precision=10` (6 total bytes)
 across four independent negative test values plus positive/zero/NULL cases:
+
+- **Total width is `(p + (s & 1) + 3) / 2` bytes** (ESQL/C's `DECLEN`), not
+  `1 + ceil(p/2)`: the integer and fraction digits pair up separately around
+  the decimal point, so an odd scale costs one extra mantissa byte. The two
+  formulas agree for every even scale (including the `DECIMAL(10,2)`
+  captures here), which is why the original `ceil(p/2)` reading survived;
+  they differ for even precision + odd scale - `DECIMAL(12,3)` is 8 bytes,
+  not 7, and the old width misaligned every later column in the row.
+  Floating `DECIMAL(p)` reports scale `0xFF` (odd) and follows the same
+  formula. `MONEY(p,s)` (type 8) uses this exact encoding. Confirmed live
+  (node/test/live.test.js and a probe over DECIMAL(12,3)/(11,3)/(12,2)/
+  (11,2)/(16)/(15)/(6,5)/(32,15) and MONEY(12,3)/(11,2), each followed by
+  an INTEGER and a VARCHAR column) - see `sqli::decimalWireWidth`.
 
 - Exponent byte: bit `0x80` is the sign (1 = positive). For positive values,
   the low 7 bits are `64 + trueExp` where `trueExp` is such that

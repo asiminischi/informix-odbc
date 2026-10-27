@@ -196,6 +196,34 @@ TEST_CASE("DECIMAL positive") {
     CHECK(**small == "0.01");
 }
 
+TEST_CASE("DECIMAL wire width depends on scale parity") {
+    // Widths confirmed live by fetching each shape followed by further
+    // columns (node/test/live.test.js) - a wrong width misaligns them.
+    CHECK(decimalWireWidth(10, 2) == 6);
+    CHECK(decimalWireWidth(12, 2) == 7);
+    CHECK(decimalWireWidth(11, 3) == 7);
+    CHECK(decimalWireWidth(12, 3) == 8); // the case 1 + ceil(p/2) got wrong
+    CHECK(decimalWireWidth(32, 15) == 18);
+    CHECK(decimalWireWidth(16, kFloatingDecimalScale) == 10);
+    CHECK(decimalWireWidth(15, kFloatingDecimalScale) == 9);
+
+    // A buffer sized by the old formula is now rejected, not misread.
+    CHECK(!decodeDecimal(fromHex("c301172d4300"), 12, 3).has_value());
+}
+
+TEST_CASE("DECIMAL floating precision keeps the value's own fraction digits") {
+    // Same mantissa as "DECIMAL positive" (12345.67), read as DECIMAL(9):
+    // no declared scale to pad to, so trailing zero digits are dropped.
+    auto v = decodeDecimal(fromHex("c301172d4300"), 9, kFloatingDecimalScale);
+    REQUIRE(v.has_value());
+    REQUIRE(v->has_value());
+    CHECK(**v == "12345.67");
+
+    auto whole = decodeDecimal(fromHex("c30117 2d0000"), 9, kFloatingDecimalScale); // 12345
+    REQUIRE(whole.has_value());
+    CHECK(**whole == "12345");
+}
+
 TEST_CASE("DECIMAL negative") {
     auto v = decodeDecimal(fromHex("3e000100 0000"), 10, 2); // -99.99
     REQUIRE(v.has_value());

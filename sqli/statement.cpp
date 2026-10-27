@@ -127,11 +127,10 @@ std::expected<std::vector<std::vector<std::byte>>, Error> splitRow(std::span<con
                 width = 1 + static_cast<std::size_t>(std::to_integer<unsigned char>(row[offset]));
                 break;
             }
-            case ifxtype::kDecimal: {  // 1 exponent byte + ceil(precision/2) mantissa bytes
-                unsigned precision = (col.encodedLength >> 8) & 0xFF;
-                width = 1 + (precision + 1) / 2;
+            case ifxtype::kDecimal:
+            case ifxtype::kMoney:
+                width = decimalWireWidth((col.encodedLength >> 8) & 0xFF, col.encodedLength & 0xFF);
                 break;
-            }
             case ifxtype::kDatetime: {  // 1 exponent byte + ceil(totalDigits/2) mantissa bytes
                 unsigned totalDigits = (col.encodedLength >> 8) & 0xFF;
                 width = 1 + (totalDigits + 1) / 2;

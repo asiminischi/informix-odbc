@@ -201,8 +201,7 @@ std::expected<std::optional<std::vector<int>>, Error> decodePackedDigits(std::sp
 
 std::expected<std::optional<std::string>, Error> decodeDecimal(std::span<const std::byte> raw, unsigned precision,
                                                                   unsigned scale) {
-    std::size_t expectedMantissa = (precision + 1) / 2;
-    if (raw.size() != 1 + expectedMantissa) {
+    if (raw.size() != decimalWireWidth(precision, scale)) {
         return std::unexpected(Error{ErrorKind::Protocol, "DECIMAL: buffer size doesn't match precision"});
     }
 
@@ -221,7 +220,7 @@ std::expected<std::optional<std::string>, Error> decodeDecimal(std::span<const s
         // confirmed live. trueExp in this case isn't a real digit-placement
         // exponent, so it's not used.
         std::string s = "0";
-        if (scale > 0) s += "." + std::string(scale, '0');
+        if (scale > 0 && scale != kFloatingDecimalScale) s += "." + std::string(scale, '0');
         return s;
     }
 
@@ -249,11 +248,18 @@ std::expected<std::optional<std::string>, Error> decodeDecimal(std::span<const s
     std::size_t firstNonZero = intPart.find_first_not_of('0');
     intPart = (firstNonZero == std::string::npos) ? "0" : intPart.substr(firstNonZero);
 
-    if (fracPart.size() < scale) fracPart += std::string(scale - fracPart.size(), '0');
-    fracPart.resize(scale);
+    if (scale == kFloatingDecimalScale) {
+        // Floating DECIMAL(p): no declared scale to pad/truncate to - keep
+        // the value's own significant fraction digits.
+        std::size_t lastNonZero = fracPart.find_last_not_of('0');
+        fracPart = (lastNonZero == std::string::npos) ? std::string{} : fracPart.substr(0, lastNonZero + 1);
+    } else {
+        if (fracPart.size() < scale) fracPart += std::string(scale - fracPart.size(), '0');
+        fracPart.resize(scale);
+    }
 
     std::string result = (sign < 0 ? "-" : "") + intPart;
-    if (scale > 0) result += "." + fracPart;
+    if (!fracPart.empty()) result += "." + fracPart;
     return result;
 }
 

@@ -29,6 +29,9 @@ dev container.
 - `sqli/`: the SQLI wire protocol implementation (transport, handshake,
   statement protocol, type codecs). No ODBC dependency.
 - `driver/`: the ODBC driver surface (`SQL*` entry points), built on `sqli/`.
+- `node/`: `@postarodiy/informix-native`, a Node.js package (Node-API addon)
+  built directly on `sqli/` - no ODBC Driver Manager needed. See
+  `node/README.md`.
 - `tools/ifx_probe/`: a small CLI for exercising the protocol layer directly,
   without going through ODBC.
 - `tools/odbc_dm_probe/`: a CLI that links against the *real* platform ODBC

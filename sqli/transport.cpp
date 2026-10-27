@@ -13,6 +13,7 @@
 #  include <unistd.h>
 #endif
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -69,6 +70,14 @@ Error lastSocketError(const std::string& what) {
 #else
     int code = errno;
 #endif
+#if defined(_WIN32)
+    bool timedOut = code == WSAETIMEDOUT;
+#else
+    bool timedOut = code == EAGAIN || code == EWOULDBLOCK;
+#endif
+    // Only reachable with a timeout set (see TcpSocket::setTimeouts) - every
+    // socket here is otherwise blocking.
+    if (timedOut) return Error{ErrorKind::Transport, what + ": timed out waiting for the server"};
     return Error{ErrorKind::Transport, what + " (errno " + std::to_string(code) + ")"};
 }
 
@@ -87,7 +96,28 @@ TcpSocket& TcpSocket::operator=(TcpSocket&& other) noexcept {
     return *this;
 }
 
-std::expected<TcpSocket, Error> TcpSocket::connect(const std::string& host, int port) {
+// Bounds every blocking send()/recv() (and, on Linux, connect() itself) to
+// `timeoutMs` (0 clears the bound - a zero timeval/DWORD means "block
+// indefinitely" on both platforms), so a server that stops answering mid-exchange - or a wire
+// desync that leaves this side waiting for bytes that never come - surfaces
+// as a Transport error instead of blocking the calling thread forever.
+static void applyTimeouts(TcpSocket::SocketHandle fd, int timeoutMs) {
+#if defined(_WIN32)
+    DWORD tv = static_cast<DWORD>(timeoutMs);
+#else
+    timeval tv{};
+    tv.tv_sec = timeoutMs / 1000;
+    tv.tv_usec = (timeoutMs % 1000) * 1000;
+#endif
+    setsockopt(toNative(fd), SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+    setsockopt(toNative(fd), SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+}
+
+void TcpSocket::setTimeouts(int timeoutMs) {
+    if (fd_ != kInvalid) applyTimeouts(fd_, timeoutMs);
+}
+
+std::expected<TcpSocket, Error> TcpSocket::connect(const std::string& host, int port, int timeoutMs) {
 #if defined(_WIN32)
     ensureWinsock();
 #endif
@@ -109,6 +139,7 @@ std::expected<TcpSocket, Error> TcpSocket::connect(const std::string& host, int 
 #if defined(_WIN32)
         SOCKET s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (s == INVALID_SOCKET) continue;
+        if (timeoutMs > 0) applyTimeouts(fromNative(s), timeoutMs);
         if (::connect(s, ai->ai_addr, static_cast<int>(ai->ai_addrlen)) == 0) {
             fd = fromNative(s);
             break;
@@ -117,6 +148,7 @@ std::expected<TcpSocket, Error> TcpSocket::connect(const std::string& host, int 
 #else
         int s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (s < 0) continue;
+        if (timeoutMs > 0) applyTimeouts(fromNative(s), timeoutMs);
         if (::connect(s, ai->ai_addr, ai->ai_addrlen) == 0) {
             fd = fromNative(s);
             break;
